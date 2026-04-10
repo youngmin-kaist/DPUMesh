@@ -52,8 +52,9 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
         case COMCH_MSG_TYPE_DMA_COMPLETED:
             struct comch_dma_comp_msg *comp_msg = (struct comch_dma_comp_msg *)msg;
             uint32_t *idx = (uint32_t *)(objs->dma_buffer + comp_msg->pos);
-            // DOCA_LOG_INFO("Received DMA completed message: pos=%u, length=%u, idx: %u",
-            //               comp_msg->pos, comp_msg->length, *idx);
+            (void)idx;
+            // DOCA_LOG_INFO("Received DMA completed message: desc_idx=%lu pos=%u length=%u value=%u",
+            //               comp_msg->idx, comp_msg->pos, comp_msg->length, *idx);
             break;
         default:
             DOCA_LOG_ERR("Received unknown message type: %u", msg->type);
@@ -730,21 +731,24 @@ dmesh_doca_run_dpa_thread(struct objects *objs, struct dmesh_doca_dpa_thread *dp
         DOCA_LOG_ERR("Failed to init thread RPC");
         return result;
     }
+    DOCA_LOG_INFO("thread_init_rpc completed successfully");
 
     result = doca_dpa_h2d_memcpy(dpa_thread->dpa, dpa_thread->arg, 
                                 &arg, sizeof(struct dpa_thread_arg));
     if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to update DPA thread argument - %s",
-			     doca_error_get_name(result));
-		return result;
-	}
+			DOCA_LOG_ERR("Failed to update DPA thread argument - %s",
+				     doca_error_get_name(result));
+			return result;
+		}
+    DOCA_LOG_INFO("Copied DPA thread argument successfully");
 
     result = doca_dpa_thread_run(dpa_thread->thread);
-	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to run DPA thread - %s",
-			     doca_error_get_name(result));
-		return result;
-	}             
+		if (result != DOCA_SUCCESS) {
+			DOCA_LOG_ERR("Failed to run DPA thread - %s",
+				     doca_error_get_name(result));
+			return result;
+		}             
+    DOCA_LOG_INFO("doca_dpa_thread_run returned successfully");
 
     return DOCA_SUCCESS;
 }

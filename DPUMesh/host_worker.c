@@ -13,19 +13,18 @@
 #include "ring.h"
 
 #include <doca_log.h>
-#include <doca_buf_array.h>
-#include <doca_dpa.h>
 #include <time.h>
+#include <assert.h>
 
 #define BUFFER_SIZE (1024 * 1024)
+#define DMA_ADDR_ALIGN 128
 
 DOCA_LOG_REGISTER(HOST_WORKER);
 void 
 run_host_worker(struct objects *objs)
 {
     doca_error_t result;
-    struct timespec last, now, ts = {0, 1000};
-	double elapsed = 0.0;
+    struct timespec ts = {0, 1000};
 
     DOCA_LOG_INFO("Starting Host worker");
 
@@ -111,41 +110,35 @@ run_host_worker(struct objects *objs)
     //     goto argp _cleanup;
     // }
 
-    int idx = 9999;
+    int idx = 0;
     int pos = 0;
     struct dma_desc *desc;
-    // time_t prev, cur;
-    // time(&prev);
-    // desc = get_next_dma_desc(objs->dma_ring);
     doca_dpa_dev_mmap_t local_mmap;
     doca_mmap_dev_get_dpa_handle(objs->local_mmap, objs->dev, &local_mmap);
-    struct timespec cur_ts, prev_ts;
-    // desc->mmap = local_mmap;
-    // desc->addr = (uint64_t)objs->dma_buffer + pos;
-    // desc->size = 64;
-    // desc->idx = idx++;
-    // desc->valid = 1;
-    // pos += 64;
-    clock_gettime(CLOCK_MONOTONIC, &prev_ts);
-    int msg_size = 8192;
+    const int msg_size = 8192;
+    int aligned_msg_size = (msg_size + (DMA_ADDR_ALIGN - 1)) & ~(DMA_ADDR_ALIGN - 1);
+
     while (true) {
         if (doca_pe_progress(objs->pe) == 0)
             nanosleep(&ts, &ts);
 
-        clock_gettime(CLOCK_MONOTONIC, &cur_ts);
         desc = get_next_dma_desc(objs->dma_ring);
-        desc->mmap = local_mmap;
-        desc->addr = (uint64_t)objs->dma_buffer + pos;
-        *(uint32_t *)desc->addr = idx--;
-        desc->size = msg_size;
-        desc->valid = 1;
-        pos += msg_size;
-        if (pos >= BUFFER_SIZE) {
+        while (desc->valid)
+            nanosleep(&ts, &ts);
+
+        if (pos + aligned_msg_size > BUFFER_SIZE) {
             pos = 0;
         }
-        // if (cur_ts.tv_nsec - prev_ts.tv_nsec >= 100) {
-        //     prev_ts = cur_ts;
-        // }
+
+        desc->mmap = local_mmap;
+        desc->addr = (uint64_t)objs->dma_buffer + pos;
+        desc->idx = idx++;
+        desc->size = aligned_msg_size;
+        desc->valid = 1;
+        // DOCA_LOG_INFO("Produced DMA desc - idx: %lu, addr: %p, size: %zu, pos: %d", 
+                    //   desc->idx, (void *)desc->addr, desc->size, pos);
+
+        pos += aligned_msg_size;
     }
 
     DOCA_LOG_INFO("Finished Host worker");

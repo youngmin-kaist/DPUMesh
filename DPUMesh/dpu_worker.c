@@ -100,13 +100,6 @@ run_dpu_worker(struct objects *objs)
         goto argp_cleanup;
     }
 
-    // /* export mmap to DPU */
-    // result = export_mmap_to_remote(objs, objs->local_mmap, objs->dma_buffer, 1024 * 1024, DPU_TO_HOST);
-    // if (result != DOCA_SUCCESS) {
-    //     DOCA_LOG_ERR("Failed to export mmap and buffer to DPU: %s", doca_error_get_descr(result));
-    //     goto argp_cleanup;
-    // }
-
     result = send_dma_request_to_dpa(objs);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to send DMA request to DPA: %s", doca_error_get_descr(result));
@@ -114,32 +107,32 @@ run_dpu_worker(struct objects *objs)
         goto argp_cleanup;
     }
 
+    // while (objs->remote_mmap == NULL) {
+    //     doca_pe_progress(objs->pe);
+    // }
+
+    DOCA_LOG_INFO("Remote mmap is ready, DPU worker setup is complete\n");
+
     /* poll PE */
     clock_gettime(CLOCK_MONOTONIC, &last);
-    int cnt = 0;
     while (true) {
-        doca_pe_progress(objs->consumer_pe);
-        // if (doca_pe_progress(objs->consumer_pe) == 0)
-        //     nanosleep(&ts, &ts);
-        
-        // if (cnt++ % 10 == 0)
-        //     doca_pe_progress(objs->pe);  
+        int progressed = 0;
 
-        // if(objs->dpa_thread->buf) {
-        //     char temp[128];
-        //     result = doca_dpa_d2h_memcpy(objs->dpa_thread->dpa, temp, objs->dpa_thread->buf, 128);
-        //     if (result != DOCA_SUCCESS) {
-        //         DOCA_LOG_ERR("Failed to copy data from DPA memory to host: %s",
-        //             doca_error_get_descr(result));
-        //         goto argp_cleanup;
-        //     }
-        //     DOCA_LOG_INFO("Copied data from DPA memory: %s", temp);
-        // }
+        // DOCA_LOG_INFO("Polling PE for progress...");
+
+        progressed += doca_pe_progress(objs->consumer_pe);
+        progressed += doca_pe_progress(objs->pe);
+
+        // DOCA_LOG_INFO("PE progressed: %d", progressed);
+
+        if (progressed == 0)
+            nanosleep(&ts, &ts);
 
         clock_gettime(CLOCK_MONOTONIC, &now);
-		// elapsed = diff_sec(&last, &now);
         elapsed = (now.tv_sec - last.tv_sec) + 
                   (now.tv_nsec - last.tv_nsec) / 1e9;
+        // DOCA_LOG_INFO("PE progress: %d, elapsed: %.2f, sent: %d, recv:%d\n", progressed, elapsed, objs->sent_msg_cnt, objs->recv_msg_cnt);
+
 		if (elapsed >= 1.0) {
             if (objs->sent_msg_cnt > 0 || objs->recv_msg_cnt > 0)
 			    DOCA_LOG_INFO("elapsed: %.2f, sent: %d/s, recv: %d/s", elapsed, objs->sent_msg_cnt, objs->recv_msg_cnt);

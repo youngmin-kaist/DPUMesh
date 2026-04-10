@@ -3,6 +3,9 @@
 #include "doca_dpa_dev_buf.h"
 #include "dpaintrin.h"
 #include "dpa_common.h"
+
+#define DMA_ADDR_ALIGN 128
+
 /*
  * RPC for initializing DPA IO thread called before running the thread
  *
@@ -131,36 +134,32 @@ static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
     int desc_idx = 0;
     uint32_t ring_size = thread_arg->buf_arr_size;
     uint32_t buf_size = thread_arg->buf_size;
+    uint32_t aligned_size;
 
-    buf = doca_dpa_dev_buf_array_get_buf(thread_arg->dpa_buf_arr, desc_idx);
-    dev_ptr = doca_dpa_dev_buf_get_external_ptr(buf);
-    desc = (struct dma_desc *)dev_ptr;
+    /* polling descriptor ring in host memory */
+    while (1) {
+        buf = doca_dpa_dev_buf_array_get_buf(thread_arg->dpa_buf_arr, desc_idx);
+        dev_ptr = doca_dpa_dev_buf_get_external_ptr(buf);
+        desc = (struct dma_desc *)dev_ptr;
 
-    desc = (struct dma_desc *)dev_ptr;
         while (!desc->valid) {
             __dpa_thread_window_read_inv();
         }
 
-    /* polling descriptor ring in host memory */
-    while (1) {
-
-        // desc = (struct dma_desc *)dev_ptr;
-        // while (!desc->valid) {
-        //     __dpa_thread_window_read_inv();
-        // }
-
         /* if consumer is empty, wait */
         while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, /*consumer_id=*/1) == 1) {
-            DOCA_DPA_DEV_LOG_INFO("Consumer is empty, waiting for messages...\n");
+        }
+
+        aligned_size = (desc->size + (DMA_ADDR_ALIGN - 1)) & ~(DMA_ADDR_ALIGN - 1);
+        if (thread_arg->pos + aligned_size > buf_size) {
+            // DOCA_DPA_DEV_LOG_INFO("Reached end of buffer, resetting position\n");
+            thread_arg->pos = 0;
         }
 
         msg.type = COMCH_MSG_TYPE_DMA_COMPLETED;
         msg.pos = thread_arg->pos;
         msg.length = desc->size;
-
-        if (thread_arg->pos +desc->size > buf_size) {
-            DOCA_DPA_DEV_LOG_INFO("Reached end of buffer, resetting position\n");
-        }
+        msg.idx = desc->idx;
         
         doca_dpa_dev_comch_producer_dma_copy(producer,
                                     /*consumer_id=*/1,
@@ -168,20 +167,17 @@ static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
                                     thread_arg->src_addr + thread_arg->pos,
                                     thread_arg->host_mmap,
                                     desc->addr,
-                                    desc->size,
+                                    aligned_size,
                                     (uint8_t *)&msg,
                                     sizeof(struct comch_dma_comp_msg),
                                     DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS | 
                                     DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
 
-        thread_arg->pos += desc->size;
-        if (thread_arg->pos >= buf_size) {
-            thread_arg->pos = 0;
-        }
-        
-        // desc_idx = (desc_idx + 1) % ring_size;
-        // buf = doca_dpa_dev_buf_array_get_buf(thread_arg->dpa_buf_arr, desc_idx);
-        // dev_ptr = doca_dpa_dev_buf_get_external_ptr(buf);
+        desc->valid = 0;
+        __dpa_thread_window_writeback();
+
+        thread_arg->pos += aligned_size;
+        desc_idx = (desc_idx + 1) % ring_size;
     }
 }
 

@@ -33,6 +33,7 @@ struct comch_dma_comp_msg {
 	enum comch_msg_type type;
 	uint32_t pos;
 	uint32_t length;
+	uint64_t idx;
 };
 
 typedef uint64_t doca_dpa_dev_completion_t;
