@@ -24,8 +24,9 @@ void
 run_host_worker(struct objects *objs)
 {
     doca_error_t result;
-    struct timespec last, now, ts = {0, 1000};
-	double elapsed = 0.0;
+    // struct timespec last, now, ts = {0, 1000};
+    struct timespec ts = {0, 100};
+	// double elapsed = 0.0;
 
     DOCA_LOG_INFO("Starting Host worker");
 
@@ -111,47 +112,55 @@ run_host_worker(struct objects *objs)
     //     goto argp _cleanup;
     // }
 
-    int idx = 9999;
+    int idx = 0;
     int pos = 0;
+    int valid_count = 0;
     struct dma_desc *desc;
-    // time_t prev, cur;
-    // time(&prev);
-    // desc = get_next_dma_desc(objs->dma_ring);
     doca_dpa_dev_mmap_t local_mmap;
     doca_mmap_dev_get_dpa_handle(objs->local_mmap, objs->dev, &local_mmap);
-    struct timespec cur_ts, prev_ts;
-    // desc->mmap = local_mmap;
-    // desc->addr = (uint64_t)objs->dma_buffer + pos;
-    // desc->size = 64;
-    // desc->idx = idx++;
-    // desc->valid = 1;
-    // pos += 64;
-    clock_gettime(CLOCK_MONOTONIC, &prev_ts);
     int msg_size = 8192;
     while (true) {
         if (doca_pe_progress(objs->pe) == 0)
             nanosleep(&ts, &ts);
 
-        clock_gettime(CLOCK_MONOTONIC, &cur_ts);
+        // clock_gettime(CLOCK_MONOTONIC, &cur_ts);
         desc = get_next_dma_desc(objs->dma_ring);
-        desc->mmap = local_mmap;
-        desc->addr = (uint64_t)objs->dma_buffer + pos;
-        *(uint32_t *)desc->addr = idx--;
-        desc->size = msg_size;
-        desc->valid = 1;
-        pos += msg_size;
-        if (pos >= BUFFER_SIZE) {
+        // if (!desc->valid) {
+        //     DOCA_LOG_INFO("DMA descriptor not valid, I fill it... %d\n", valid_count);
+        // }
+        // DOCA_LOG_INFO("Got DMA desc - idx: %lu, valid: %u\n", desc->idx, desc->valid);
+        while (desc->valid) {
+            // valid_count++;
+            // if (valid_count % 10000 == 0) {
+            //     DOCA_LOG_INFO("DMA descriptor still valid after %u polls, waiting...\n", valid_count);
+            // }
+            
+            nanosleep(&ts, &ts);
+        }
+
+        if (pos + msg_size > BUFFER_SIZE) {
             pos = 0;
         }
-        // if (cur_ts.tv_nsec - prev_ts.tv_nsec >= 100) {
-        //     prev_ts = cur_ts;
-        // }
+
+        desc->mmap = local_mmap;
+        desc->addr = (uint64_t)objs->dma_buffer + pos;
+        // *(uint32_t *)desc->addr = idx--;
+        desc->idx = idx;
+        desc->size = msg_size;
+        __sync_synchronize();   /* full fence */
+        desc->valid = 1;
+
+        /* Publish all descriptor fields before valid=1. */
+        // __atomic_store_n(&desc->valid, 1, __ATOMIC_RELEASE);
+        
+        // pos += msg_size;
+        idx = (idx + 1) % DMA_RING_SIZE;
     }
 
     DOCA_LOG_INFO("Finished Host worker");
 
 argp_cleanup:
     clean_argp();
-exit: 
+// exit: 
     return;
 }

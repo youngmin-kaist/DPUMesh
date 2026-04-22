@@ -132,36 +132,38 @@ static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
     uint32_t ring_size = thread_arg->buf_arr_size;
     uint32_t buf_size = thread_arg->buf_size;
 
-    buf = doca_dpa_dev_buf_array_get_buf(thread_arg->dpa_buf_arr, desc_idx);
-    dev_ptr = doca_dpa_dev_buf_get_external_ptr(buf);
-    desc = (struct dma_desc *)dev_ptr;
-
-    desc = (struct dma_desc *)dev_ptr;
-        while (!desc->valid) {
-            __dpa_thread_window_read_inv();
-        }
-
+    // uint32_t valid_count = 0;
     /* polling descriptor ring in host memory */
     while (1) {
+        buf = doca_dpa_dev_buf_array_get_buf(thread_arg->dpa_buf_arr, desc_idx);
+        dev_ptr = doca_dpa_dev_buf_get_external_ptr(buf);
+        desc = (struct dma_desc *)dev_ptr;
 
-        // desc = (struct dma_desc *)dev_ptr;
-        // while (!desc->valid) {
-        //     __dpa_thread_window_read_inv();
-        // }
+        while (!desc->valid) {
+        // while (!__atomic_load_n(&desc->valid, __ATOMIC_ACQUIRE)) {
+            // valid_count++;
+            // if (valid_count % 10000 == 0) {
+            //     DOCA_DPA_DEV_LOG_INFO("Descriptor not valid after %u polls, waiting...\n", valid_count);
+            // }
+
+            __dpa_thread_window_read_inv();
+        }
+        __sync_synchronize();   /* full fence */
 
         /* if consumer is empty, wait */
         while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, /*consumer_id=*/1) == 1) {
             DOCA_DPA_DEV_LOG_INFO("Consumer is empty, waiting for messages...\n");
         }
 
+        if (thread_arg->pos + desc->size > buf_size) {
+            // DOCA_DPA_DEV_LOG_INFO("Reached end of buffer, resetting position\n");
+            thread_arg->pos = 0;
+        }
+
         msg.type = COMCH_MSG_TYPE_DMA_COMPLETED;
         msg.pos = thread_arg->pos;
         msg.length = desc->size;
 
-        if (thread_arg->pos +desc->size > buf_size) {
-            DOCA_DPA_DEV_LOG_INFO("Reached end of buffer, resetting position\n");
-        }
-        
         doca_dpa_dev_comch_producer_dma_copy(producer,
                                     /*consumer_id=*/1,
                                     thread_arg->dpu_mmap,
@@ -173,15 +175,12 @@ static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
                                     sizeof(struct comch_dma_comp_msg),
                                     DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS | 
                                     DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
-
+                                    
         thread_arg->pos += desc->size;
-        if (thread_arg->pos >= buf_size) {
-            thread_arg->pos = 0;
-        }
-        
-        // desc_idx = (desc_idx + 1) % ring_size;
-        // buf = doca_dpa_dev_buf_array_get_buf(thread_arg->dpa_buf_arr, desc_idx);
-        // dev_ptr = doca_dpa_dev_buf_get_external_ptr(buf);
+        desc->valid = 0; // mark desc as consumed
+        __dpa_thread_window_writeback();
+
+        desc_idx = (desc_idx + 1) % ring_size;
     }
 }
 
