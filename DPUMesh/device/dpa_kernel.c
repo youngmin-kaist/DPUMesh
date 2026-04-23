@@ -4,8 +4,6 @@
 #include "dpaintrin.h"
 #include "dpa_common.h"
 
-#define DMA_ADDR_ALIGN 128
-
 /*
  * RPC for initializing DPA IO thread called before running the thread
  *

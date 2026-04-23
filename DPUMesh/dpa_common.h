@@ -4,6 +4,8 @@
 #include <stdint.h>
 #include <doca_mmap.h>
 
+#define DMA_ADDR_ALIGN 128
+
 typedef uint64_t doca_dpa_dev_uintptr_t;
 typedef uint64_t doca_dpa_dev_buf_arr_t;
 

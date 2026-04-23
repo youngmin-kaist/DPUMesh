@@ -17,7 +17,6 @@
 #include <assert.h>
 
 #define BUFFER_SIZE (1024 * 1024)
-#define DMA_ADDR_ALIGN 128
 
 DOCA_LOG_REGISTER(HOST_WORKER);
 void 
@@ -119,8 +118,9 @@ run_host_worker(struct objects *objs)
     int aligned_msg_size = (msg_size + (DMA_ADDR_ALIGN - 1)) & ~(DMA_ADDR_ALIGN - 1);
 
     while (true) {
-        if (doca_pe_progress(objs->pe) == 0)
-            nanosleep(&ts, &ts);
+        // if (doca_pe_progress(objs->pe) == 0)
+        //     nanosleep(&ts, &ts);
+        while (doca_pe_progress(objs->pe) > 0);
 
         desc = get_next_dma_desc(objs->dma_ring);
         while (desc->valid)
