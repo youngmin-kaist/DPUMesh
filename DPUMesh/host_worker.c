@@ -118,6 +118,8 @@ run_host_worker(struct objects *objs)
     const int msg_size = 8192;
     int aligned_msg_size = (msg_size + (DMA_ADDR_ALIGN - 1)) & ~(DMA_ADDR_ALIGN - 1);
 
+    DOCA_LOG_INFO("consumer state magic: 0x%lx\n", objs->dma_ring->consumer_state->consumer_seq);
+
     while (true) {
         int pe_progress;
         while ((pe_progress = doca_pe_progress(objs->pe)) > 0) {
@@ -130,7 +132,7 @@ run_host_worker(struct objects *objs)
                 // objs->dma_ring->observed_consumer_seq, objs->dma_ring->producer_seq);
         }
 
-        if (pos + msg_size > BUFFER_SIZE) {
+        if (pos + aligned_msg_size > BUFFER_SIZE) {
             pos = 0;
         }
 
@@ -138,7 +140,7 @@ run_host_worker(struct objects *objs)
         desc = get_dma_desc_for_seq(objs->dma_ring, producer_seq);
         desc->mmap = local_mmap;
         desc->addr = (uint64_t)objs->dma_buffer + pos;
-        desc->size = msg_size;
+        desc->size = aligned_msg_size;
 
         /*
          * Host owns descriptor writes. seq is the only per-desc publish marker;
@@ -147,7 +149,7 @@ run_host_worker(struct objects *objs)
         // __atomic_store_n(&desc->seq, producer_seq + 1, __ATOMIC_RELEASE);
         desc->seq = producer_seq + 1;
 
-        pos += msg_size;
+        pos += aligned_msg_size;
         objs->dma_ring->producer_seq = producer_seq + 1;
     }
 

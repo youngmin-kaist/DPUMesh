@@ -206,14 +206,9 @@ static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
             thread_arg->pos = 0;
         }
 
-        if (thread_arg->pos + desc_size > buf_size) {
-            // DOCA_DPA_DEV_LOG_INFO("Reached end of buffer, resetting position\n");
-            thread_arg->pos = 0;
-        }
-
         msg.type = COMCH_MSG_TYPE_DMA_COMPLETED;
         msg.pos = thread_arg->pos;
-        msg.length = (uint32_t)desc_size;
+        msg.length = (uint32_t)aligned_size;
 
         doca_dpa_dev_comch_producer_dma_copy(producer,
                                     /*consumer_id=*/1,
@@ -221,7 +216,7 @@ static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
                                     thread_arg->src_addr + thread_arg->pos,
                                     thread_arg->host_mmap,
                                     desc_addr,
-                                    desc_size,
+                                    aligned_size,
                                     (uint8_t *)&msg,
                                     sizeof(struct comch_dma_comp_msg),
                                     DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS | 
@@ -233,7 +228,7 @@ static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
          * its work item; if it only references desc memory, this must move to a
          * producer completion path.
          */
-        thread_arg->pos += desc_size;
+        thread_arg->pos += aligned_size;
         consumer_seq++;
         pending_completions++;
         if (pending_completions >= DMA_COMPLETION_BATCH_SIZE ||
