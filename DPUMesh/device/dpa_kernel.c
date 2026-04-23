@@ -3,6 +3,7 @@
 #include "doca_dpa_dev_buf.h"
 #include "dpaintrin.h"
 #include "dpa_common.h"
+
 /*
  * RPC for initializing DPA IO thread called before running the thread
  *
@@ -121,6 +122,25 @@ static void handle_msgs(struct dpa_thread_arg *thread_arg)
     // DOCA_DPA_DEV_LOG_INFO("Handled %u msgs from host\n", num_msgs);
 }
 
+static inline void
+publish_consumer_seq(struct dpa_thread_arg *thread_arg, uint64_t consumer_seq)
+{
+    doca_dpa_dev_buf_t buf;
+    doca_dpa_dev_uintptr_t dev_ptr;
+    struct dma_ring_consumer_state *consumer_state;
+
+    buf = doca_dpa_dev_buf_array_get_buf(thread_arg->dpa_consumer_state_buf_arr, 0);
+    dev_ptr = doca_dpa_dev_buf_get_external_ptr(buf);   /* switch window */
+    consumer_state = (struct dma_ring_consumer_state *)dev_ptr;
+
+    consumer_state->consumer_seq = consumer_seq;
+    __sync_synchronize();
+    __dpa_thread_window_writeback();
+
+    // DOCA_DPA_DEV_LOG_INFO("Published consumer_seq: %lu, consumer_state->consumer_seq: %lu\n",
+    //     consumer_seq, consumer_state->consumer_seq);
+}
+
 static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
 {
     doca_dpa_dev_comch_producer_t producer = thread_arg->dpa_producer;
@@ -128,59 +148,95 @@ static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
     doca_dpa_dev_uintptr_t dev_ptr;
     doca_dpa_dev_buf_t buf;
     struct dma_desc *desc;
-    int desc_idx = 0;
+    struct dma_ring_consumer_state *consumer_state;
+    uint64_t consumer_seq = 0;
+    uint32_t pending_completions = 0;
+    uint32_t idle_polls = 0;
     uint32_t ring_size = thread_arg->buf_arr_size;
     uint32_t buf_size = thread_arg->buf_size;
 
-    // uint32_t valid_count = 0;
+    buf = doca_dpa_dev_buf_array_get_buf(thread_arg->dpa_consumer_state_buf_arr, 0);
+    dev_ptr = doca_dpa_dev_buf_get_external_ptr(buf);
+    consumer_state = (struct dma_ring_consumer_state *)dev_ptr;
+    DOCA_DPA_DEV_LOG_INFO("consumer state magic: 0x%lx\n", consumer_state->consumer_seq);
+    publish_consumer_seq(thread_arg, consumer_seq);
+
     /* polling descriptor ring in host memory */
     while (1) {
+        uint32_t desc_idx = consumer_seq % ring_size;
+        uint64_t expected_seq = consumer_seq + 1;
+        uint64_t desc_seq;
+        uint64_t desc_addr;
+        uint64_t desc_size;
+
         buf = doca_dpa_dev_buf_array_get_buf(thread_arg->dpa_buf_arr, desc_idx);
         dev_ptr = doca_dpa_dev_buf_get_external_ptr(buf);
         desc = (struct dma_desc *)dev_ptr;
 
-        while (!desc->valid) {
-        // while (!__atomic_load_n(&desc->valid, __ATOMIC_ACQUIRE)) {
-            // valid_count++;
-            // if (valid_count % 10000 == 0) {
-            //     DOCA_DPA_DEV_LOG_INFO("Descriptor not valid after %u polls, waiting...\n", valid_count);
-            // }
-
+        // while ((desc_seq = __atomic_load_n(&desc->seq, __ATOMIC_ACQUIRE)) != expected_seq) {
+        while ((desc_seq = desc->seq) != expected_seq) {
+            // DOCA_DPA_DEV_LOG_INFO("Waiting for producer to publish descriptor, consumer_seq: %lu, desc_idx: %u\n",
+            //                     consumer_seq, desc_idx);
+            // DOCA_DPA_DEV_LOG_INFO("Idle polling for descriptor, desc_seq: %lu, expected_seq: %lu\n", desc_seq, expected_seq);
             __dpa_thread_window_read_inv();
+            if (pending_completions != 0 &&
+                ++idle_polls >= DMA_COMPLETION_IDLE_POLL_LIMIT) {
+                publish_consumer_seq(thread_arg, consumer_seq);
+                pending_completions = 0;
+                idle_polls = 0;
+
+                buf = doca_dpa_dev_buf_array_get_buf(thread_arg->dpa_buf_arr, desc_idx);
+                dev_ptr = doca_dpa_dev_buf_get_external_ptr(buf);
+                desc = (struct dma_desc *)dev_ptr;
+            }
         }
+        idle_polls = 0;
         __sync_synchronize();   /* full fence */
+        desc_addr = desc->addr;
+        desc_size = desc->size;
 
         /* if consumer is empty, wait */
         while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, /*consumer_id=*/1) == 1) {
             DOCA_DPA_DEV_LOG_INFO("Consumer is empty, waiting for messages...\n");
         }
 
-        if (thread_arg->pos + desc->size > buf_size) {
+        if (thread_arg->pos + desc_size > buf_size) {
             // DOCA_DPA_DEV_LOG_INFO("Reached end of buffer, resetting position\n");
             thread_arg->pos = 0;
         }
 
         msg.type = COMCH_MSG_TYPE_DMA_COMPLETED;
         msg.pos = thread_arg->pos;
-        msg.length = desc->size;
+        msg.length = (uint32_t)desc_size;
 
         doca_dpa_dev_comch_producer_dma_copy(producer,
                                     /*consumer_id=*/1,
                                     thread_arg->dpu_mmap,
                                     thread_arg->src_addr + thread_arg->pos,
                                     thread_arg->host_mmap,
-                                    desc->addr,
-                                    desc->size,
+                                    desc_addr,
+                                    desc_size,
                                     (uint8_t *)&msg,
                                     sizeof(struct comch_dma_comp_msg),
                                     DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS | 
                                     DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
-                                    
-        thread_arg->pos += desc->size;
-        desc->valid = 0; // mark desc as consumed
-        __dpa_thread_window_writeback();
 
-        desc_idx = (desc_idx + 1) % ring_size;
+        /*
+         * Descriptor ownership is host-write/DPA-read. Advancing consumer_seq
+         * after submit assumes the DOCA producer copied request arguments into
+         * its work item; if it only references desc memory, this must move to a
+         * producer completion path.
+         */
+        thread_arg->pos += desc_size;
+        consumer_seq++;
+        pending_completions++;
+        if (pending_completions >= DMA_COMPLETION_BATCH_SIZE ||
+            consumer_seq % ring_size == 0) {
+            // DOCA_DPA_DEV_LOG_INFO("Acknowledging %u completed descriptors, consumer_seq: %lu\n",
+            //                     pending_completions, consumer_seq);
+            publish_consumer_seq(thread_arg, consumer_seq);
+            pending_completions = 0;
+        }
     }
 }
 

@@ -92,4 +92,6 @@ dmesh_doca_dpa_msgq_send_bulk(struct dmesh_doca_dpa_msgq *msgq, uint32_t num_msg
 
 doca_error_t
 setup_dpa_buf_array(struct objects *objs, size_t num_elem, struct doca_mmap *mmap);					
+doca_error_t
+setup_dpa_consumer_state_buf_array(struct objects *objs, struct doca_mmap *mmap);
 #endif

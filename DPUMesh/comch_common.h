@@ -21,6 +21,7 @@ enum dmesh_msg_type {
 enum mmap_type {
     DMA_BUFFER = 1,
     DMA_RING = 2,
+    DMA_RING_CONSUMER_STATE = 3,
 };
 
 struct dmesh_mmap_msg {

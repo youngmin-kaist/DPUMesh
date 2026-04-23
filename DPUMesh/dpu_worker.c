@@ -80,6 +80,16 @@ run_dpu_worker(struct objects *objs)
         goto argp_cleanup;
     }
 
+    while (objs->ring_consumer_mmap == NULL) {
+        doca_pe_progress(objs->pe);
+    }
+
+    result = setup_dpa_consumer_state_buf_array(objs, objs->ring_consumer_mmap);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to setup DPA consumer state buffer array: %s", doca_error_get_descr(result));
+        goto argp_cleanup;
+    }
+
     /* allocate local buffer and set mmap for PCI export */
     result = alloc_buffer_and_set_mmap(&objs->local_mmap, objs->dev,
                            &objs->dma_buffer, BUFFER_SIZE,

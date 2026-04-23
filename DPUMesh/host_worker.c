@@ -15,17 +15,15 @@
 #include <doca_log.h>
 #include <doca_buf_array.h>
 #include <doca_dpa.h>
-#include <time.h>
 
 #define BUFFER_SIZE (1024 * 1024)
 
 DOCA_LOG_REGISTER(HOST_WORKER);
+
 void 
 run_host_worker(struct objects *objs)
 {
     doca_error_t result;
-    // struct timespec last, now, ts = {0, 1000};
-    struct timespec ts = {0, 100};
 	// double elapsed = 0.0;
 
     DOCA_LOG_INFO("Starting Host worker");
@@ -112,49 +110,46 @@ run_host_worker(struct objects *objs)
     //     goto argp _cleanup;
     // }
 
-    int idx = 0;
     int pos = 0;
-    int valid_count = 0;
+    uint64_t producer_seq = 0;
     struct dma_desc *desc;
     doca_dpa_dev_mmap_t local_mmap;
     doca_mmap_dev_get_dpa_handle(objs->local_mmap, objs->dev, &local_mmap);
     int msg_size = 8192;
-    while (true) {
-        if (doca_pe_progress(objs->pe) == 0)
-            nanosleep(&ts, &ts);
 
-        // clock_gettime(CLOCK_MONOTONIC, &cur_ts);
-        desc = get_next_dma_desc(objs->dma_ring);
-        // if (!desc->valid) {
-        //     DOCA_LOG_INFO("DMA descriptor not valid, I fill it... %d\n", valid_count);
-        // }
-        // DOCA_LOG_INFO("Got DMA desc - idx: %lu, valid: %u\n", desc->idx, desc->valid);
-        while (desc->valid) {
-            // valid_count++;
-            // if (valid_count % 10000 == 0) {
-            //     DOCA_LOG_INFO("DMA descriptor still valid after %u polls, waiting...\n", valid_count);
-            // }
-            
-            nanosleep(&ts, &ts);
+    DOCA_LOG_INFO("consumer state magic: 0x%lx\n", objs->dma_ring->consumer_state->consumer_seq);
+
+    while (true) {
+        int pe_progress;
+        while ((pe_progress = doca_pe_progress(objs->pe)) > 0) {
+            /* drain completions / keep host side progressing */
+        }
+
+        while (!dma_ring_has_free_slot(objs->dma_ring)) {
+            dma_ring_refresh_consumer(objs->dma_ring);
+            // DOCA_LOG_INFO("No free slot in DMA ring, observed consumer_seq: %lu, producer_seq: %lu\n",
+                // objs->dma_ring->observed_consumer_seq, objs->dma_ring->producer_seq);
         }
 
         if (pos + msg_size > BUFFER_SIZE) {
             pos = 0;
         }
 
+        producer_seq = objs->dma_ring->producer_seq;
+        desc = get_dma_desc_for_seq(objs->dma_ring, producer_seq);
         desc->mmap = local_mmap;
         desc->addr = (uint64_t)objs->dma_buffer + pos;
-        // *(uint32_t *)desc->addr = idx--;
-        desc->idx = idx;
         desc->size = msg_size;
-        __sync_synchronize();   /* full fence */
-        desc->valid = 1;
 
-        /* Publish all descriptor fields before valid=1. */
-        // __atomic_store_n(&desc->valid, 1, __ATOMIC_RELEASE);
-        
-        // pos += msg_size;
-        idx = (idx + 1) % DMA_RING_SIZE;
+        /*
+         * Host owns descriptor writes. seq is the only per-desc publish marker;
+         * DPA consumes it with acquire ordering and never writes this cacheline.
+         */
+        // __atomic_store_n(&desc->seq, producer_seq + 1, __ATOMIC_RELEASE);
+        desc->seq = producer_seq + 1;
+
+        pos += msg_size;
+        objs->dma_ring->producer_seq = producer_seq + 1;
     }
 
     DOCA_LOG_INFO("Finished Host worker");

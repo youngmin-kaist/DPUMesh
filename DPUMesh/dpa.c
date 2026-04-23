@@ -615,8 +615,11 @@ dmesh_fill_dpa_thread_arg(struct objects *objs, struct dpa_thread_arg *arg)
 	doca_dpa_dev_completion_t dpa_producer_comp;
 	doca_dpa_dev_comch_producer_t dpa_producer;
 	doca_dpa_dev_comch_consumer_t dpa_consumer;
+#ifdef DOCA_ARCH_DPU
     doca_dpa_dev_buf_arr_t dpa_buf_arr;
+    doca_dpa_dev_buf_arr_t dpa_consumer_state_buf_arr;
     doca_dpa_dev_mmap_t dpu_mmap, host_mmap;
+#endif
 
     comch = objs->dpa_comch;
 
@@ -655,6 +658,13 @@ dmesh_fill_dpa_thread_arg(struct objects *objs, struct dpa_thread_arg *arg)
         return result;
     }
 
+    result = doca_buf_arr_get_dpa_handle(objs->consumer_state_buf_arr, &dpa_consumer_state_buf_arr);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to get consumer state buf array DPA handle: %s",
+                doca_error_get_name(result));
+        return result;
+    }
+
     result = doca_mmap_dev_get_dpa_handle(objs->local_mmap, objs->dev, &dpu_mmap);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to get mmap DPA handle: %s",
@@ -678,6 +688,7 @@ dmesh_fill_dpa_thread_arg(struct objects *objs, struct dpa_thread_arg *arg)
         .dpa_producer = dpa_producer,
 #ifdef DOCA_ARCH_DPU
         .dpa_buf_arr = dpa_buf_arr,
+        .dpa_consumer_state_buf_arr = dpa_consumer_state_buf_arr,
         .buf_arr_size = DMA_RING_SIZE,
         .host_mmap = host_mmap,
         .dpu_mmap = dpu_mmap,
@@ -831,30 +842,32 @@ dmesh_doca_dpa_msgq_send_bulk(struct dmesh_doca_dpa_msgq *msgq, uint32_t num_msg
 	return DOCA_SUCCESS;
 }
 
-doca_error_t
-setup_dpa_buf_array(struct objects *objs, size_t num_elem, struct doca_mmap *mmap)
+static doca_error_t
+setup_dpa_buf_array_common(struct objects *objs, struct doca_buf_arr **buf_arr,
+                           size_t num_elem, struct doca_mmap *mmap,
+                           size_t elem_size, size_t offset)
 {
     doca_error_t result;
 
-    result = doca_buf_arr_create(num_elem, &objs->buf_arr);
+    result = doca_buf_arr_create(num_elem, buf_arr);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to create buffer array: %s", doca_error_get_descr(result));
         return result;
     }
 
-    result = doca_buf_arr_set_target_dpa(objs->buf_arr, objs->dpa_thread->dpa);
+    result = doca_buf_arr_set_target_dpa(*buf_arr, objs->dpa_thread->dpa);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to set buffer array target DPA: %s", doca_error_get_descr(result));
         goto destroy_buf_arr;
     }
 
-    result = doca_buf_arr_set_params(objs->buf_arr, mmap, sizeof(struct dma_desc), 0);
+    result = doca_buf_arr_set_params(*buf_arr, mmap, elem_size, offset);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to set buffer array params: %s", doca_error_get_descr(result));
         goto destroy_buf_arr;
     }
 
-    result = doca_buf_arr_start(objs->buf_arr);
+    result = doca_buf_arr_start(*buf_arr);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to start buffer array: %s", doca_error_get_descr(result));
         goto destroy_buf_arr;
@@ -862,10 +875,22 @@ setup_dpa_buf_array(struct objects *objs, size_t num_elem, struct doca_mmap *mma
 
     return DOCA_SUCCESS;
 
-stop_buf_arr:
-    doca_buf_arr_stop(objs->buf_arr);
 destroy_buf_arr:
-    doca_buf_arr_destroy(objs->buf_arr);
-    objs->buf_arr = NULL;
+    doca_buf_arr_destroy(*buf_arr);
+    *buf_arr = NULL;
     return result;
+}
+
+doca_error_t
+setup_dpa_buf_array(struct objects *objs, size_t num_elem, struct doca_mmap *mmap)
+{
+    return setup_dpa_buf_array_common(objs, &objs->buf_arr, num_elem, mmap,
+                                      sizeof(struct dma_desc), 0);
+}
+
+doca_error_t
+setup_dpa_consumer_state_buf_array(struct objects *objs, struct doca_mmap *mmap)
+{
+    return setup_dpa_buf_array_common(objs, &objs->consumer_state_buf_arr, 1, mmap,
+                                      sizeof(struct dma_ring_consumer_state), 0);
 }
