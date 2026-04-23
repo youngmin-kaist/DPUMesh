@@ -116,7 +116,7 @@ run_host_worker(struct objects *objs)
     doca_dpa_dev_mmap_t local_mmap;
     doca_mmap_dev_get_dpa_handle(objs->local_mmap, objs->dev, &local_mmap);
     const int msg_size = 8192;
-    int aligned_msg_size = (msg_size + (DMA_ADDR_ALIGN - 1)) & ~(DMA_ADDR_ALIGN - 1);
+    int aligned_msg_size = DMA_ALIGN_UP(msg_size);
 
     DOCA_LOG_INFO("consumer state magic: 0x%lx\n", objs->dma_ring->consumer_state->consumer_seq);
 
@@ -124,6 +124,7 @@ run_host_worker(struct objects *objs)
         int pe_progress;
         while ((pe_progress = doca_pe_progress(objs->pe)) > 0) {
             /* drain completions / keep host side progressing */
+            DOCA_LOG_INFO("Made progress on PE: %d\n", pe_progress);
         }
 
         while (!dma_ring_has_free_slot(objs->dma_ring)) {

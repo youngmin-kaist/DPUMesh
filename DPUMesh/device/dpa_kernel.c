@@ -192,7 +192,7 @@ static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
             }
         }
         idle_polls = 0;
-        __sync_synchronize();   /* full fence */
+        // __sync_synchronize();   /* full fence */
         desc_addr = desc->addr;
         desc_size = desc->size;
 
@@ -200,7 +200,7 @@ static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
         while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, /*consumer_id=*/1) == 1) {
         }
 
-        aligned_size = (desc->size + (DMA_ADDR_ALIGN - 1)) & ~(DMA_ADDR_ALIGN - 1);
+        aligned_size = DMA_ALIGN_UP(desc_size);
         if (thread_arg->pos + aligned_size > buf_size) {
             // DOCA_DPA_DEV_LOG_INFO("Reached end of buffer, resetting position\n");
             thread_arg->pos = 0;

@@ -6,6 +6,7 @@
 #include <doca_mmap.h>
 
 #define DMA_ADDR_ALIGN 128
+#define DMA_ALIGN_UP(size)    (((size) + (DMA_ADDR_ALIGN - 1)) & ~(DMA_ADDR_ALIGN - 1))
 
 typedef uint64_t doca_dpa_dev_uintptr_t;
 typedef uint64_t doca_dpa_dev_buf_arr_t;
