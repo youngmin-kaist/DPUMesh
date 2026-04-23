@@ -19,9 +19,10 @@ int setup_dma_ring(struct objects *objs, size_t size)
 
     ring = objs->dma_ring;
     ring->size = size;
-    ring->head = 0;
-    ring->tail = 0;
+    ring->producer_seq = 0;
+    ring->observed_consumer_seq = 0;
     ring->descs = NULL;
+    ring->consumer_state = NULL;
 
     /* allocate local buffer and set mmap for PCI export */
     result = alloc_buffer_and_set_mmap(&ring->mmap, objs->dev,
@@ -30,6 +31,17 @@ int setup_dma_ring(struct objects *objs, size_t size)
                            DOCA_ACCESS_FLAG_PCI_READ_WRITE);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to allocate DMA resources: %s", doca_error_get_descr(result));
+        free(objs->dma_ring);
+        return result;
+    }
+
+    result = alloc_buffer_and_set_mmap(&ring->consumer_mmap, objs->dev,
+                           (void **)&ring->consumer_state,
+                           sizeof(struct dma_ring_consumer_state),
+                           DOCA_ACCESS_FLAG_PCI_READ_WRITE);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to allocate DMA consumer state: %s", doca_error_get_descr(result));
+        destroy_mmap_and_free_buffer(ring->mmap, ring->descs);
         free(objs->dma_ring);
         return result;
     }
@@ -42,16 +54,46 @@ int setup_dma_ring(struct objects *objs, size_t size)
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to export mmap and buffer to DPU: %s", doca_error_get_descr(result));
         free(objs->dma_ring);
+        destroy_mmap_and_free_buffer(ring->consumer_mmap, ring->consumer_state);
         destroy_mmap_and_free_buffer(ring->mmap, ring->descs);
         return result;
     }
+
+    result = export_mmap_to_remote(objs, ring->consumer_mmap,
+                                   ring->consumer_state,
+                                   sizeof(struct dma_ring_consumer_state),
+                                   DMA_RING_CONSUMER_STATE, HOST_TO_DPU);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to export DMA consumer state to DPU: %s", doca_error_get_descr(result));
+        free(objs->dma_ring);
+        destroy_mmap_and_free_buffer(ring->consumer_mmap, ring->consumer_state);
+        destroy_mmap_and_free_buffer(ring->mmap, ring->descs);
+        return result;
+    }
+
+    ring->consumer_state->consumer_seq = 0x1234; /* for testing */
+
     return 0;
 }
 
-struct dma_desc *get_next_dma_desc(struct dma_ring *ring)
+struct dma_desc *get_dma_desc_for_seq(struct dma_ring *ring, uint64_t producer_seq)
 {
-    struct dma_desc *desc = ring->descs + ring->head;
-    ring->head = (ring->head + 1) % ring->size;
-    // DOCA_LOG_INFO("Get next DMA desc - head: %u, tail: %u, desc: %p", ring->head, ring->tail, desc);
-    return desc;
+    return ring->descs + (producer_seq % ring->size);
+}
+
+bool dma_ring_has_free_slot(const struct dma_ring *ring)
+{
+    return ring->producer_seq - ring->observed_consumer_seq < ring->size;
+}
+
+void dma_ring_refresh_consumer(struct dma_ring *ring)
+{
+    /*
+     * Assumes the host CPU observes DPA PCI writes to this mmap after the DPA
+     * calls __dpa_thread_window_writeback(). If the platform is not coherent,
+     * a DOCA/platform-specific host invalidation step must be added here.
+     */
+
+    ring->observed_consumer_seq =
+        __atomic_load_n(&ring->consumer_state->consumer_seq, __ATOMIC_ACQUIRE);
 }

@@ -62,6 +62,8 @@ process_mmap_msg(struct objects *objs, struct dmesh_mmap_msg *mmap_msg)
         mmap = &objs->remote_mmap;
     } else if (mmap_msg->mmap_type == DMA_RING) {
         mmap = &objs->ring_mmap;
+    } else if (mmap_msg->mmap_type == DMA_RING_CONSUMER_STATE) {
+        mmap = &objs->ring_consumer_mmap;
     } else {
         DOCA_LOG_ERR("Invalid mmap type received: %d", mmap_msg->mmap_type);
         return DOCA_ERROR_INVALID_VALUE;

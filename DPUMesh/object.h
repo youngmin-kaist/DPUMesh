@@ -34,8 +34,10 @@ struct objects {
     size_t remote_buf_size;
     struct dma_ring *dma_ring;
     struct doca_mmap *ring_mmap;    /* used for DMA ring mmap in DPU */
+    struct doca_mmap *ring_consumer_mmap;
 
     struct doca_buf_arr *buf_arr;
+    struct doca_buf_arr *consumer_state_buf_arr;
 
     struct dmesh_doca_dpa_thread *dpa_thread;
 	struct dmesh_doca_dpa_comch *dpa_comch;
