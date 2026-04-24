@@ -1,0 +1,50 @@
+sequenceDiagram
+    autonumber
+    participant App
+    participant Host as host_agent.cc
+    participant Submit as dpa_batch_worker.c
+    participant DPA as DOCA DPA Runtime
+    participant Kernel as grpc_dpa_kernel.c
+    participant ARM as arm_grpc_worker.cc
+
+    App->>Host: Build HelloRequest
+    Host->>Host: flatten_hello_request()\nFlatArena(base-relative refs)
+    Host->>DPA: doca_dpa_mem_alloc(in/out buffers)
+    Host->>Host: build ProtoTask(desc_id, addrs, caps)
+    Host->>Submit: grpc_dpa_submit_batch(task[1])
+
+    Submit->>DPA: H2D memcpy(msg payload)
+    Submit->>DPA: H2D memcpy(task array)
+    Submit->>DPA: doca_dpa_rpc(grpc_dpa_serialize_batch_rpc)
+
+    DPA->>Kernel: grpc_dpa_serialize_batch_rpc(worker_arg, n)
+    loop for each task
+        Kernel->>Kernel: dpa_serialize_one()
+        Kernel->>Kernel: find_desc(desc_id)
+        Kernel->>Kernel: emit_message(out=dpa_out+5)
+        par field encoding
+            Kernel->>Kernel: U32/U64/BOOL -> varint
+        and
+            Kernel->>Kernel: STRING/BYTES -> tag+len(varint)+raw copy
+        and
+            Kernel->>Kernel: PACKED U32/U64 -> 1-pass encode\npayload_len accumulate
+            Kernel->>Kernel: packed len backfill fixed32(4B)
+        and
+            Kernel->>Kernel: MESSAGE(nested) -> recursive encode+len backfill
+        end
+        Kernel->>Kernel: write gRPC 5-byte header\n(compression=0, BE len)
+        Kernel->>Kernel: set ProtoCompletion(status, encoded_len)
+    end
+
+    DPA-->>Submit: RPC return
+    Submit->>DPA: D2H memcpy(completion array)
+    alt status == 0
+        Submit->>DPA: D2H memcpy(encoded bytes)
+        Submit-->>Host: encoded bytes + completion
+        Host->>Host: encoded.resize(encoded_len)
+        Host->>ARM: adopt_grpc_frame()/wrap_grpc_message()
+        ARM-->>App: gRPC TX
+    else status != 0
+        Submit-->>Host: completion(status<0)
+        Host-->>App: DOCA_ERROR_DRIVER
+    end
