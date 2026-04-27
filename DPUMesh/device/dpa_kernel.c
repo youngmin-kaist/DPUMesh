@@ -151,7 +151,6 @@ static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
     struct dma_ring_consumer_state *consumer_state;
     uint64_t consumer_seq = 0;
     uint32_t pending_completions = 0;
-    uint32_t idle_polls = 0;
     uint32_t ring_size = thread_arg->buf_arr_size;
     uint32_t buf_size = thread_arg->buf_size;
 
@@ -173,25 +172,18 @@ static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
         dev_ptr = doca_dpa_dev_buf_get_external_ptr(buf);
         desc = (struct dma_desc *)dev_ptr;
 
-        // while ((desc_seq = __atomic_load_n(&desc->seq, __ATOMIC_ACQUIRE)) != expected_seq) {
         while ((desc_seq = desc->seq) != expected_seq) {
-            // DOCA_DPA_DEV_LOG_INFO("Waiting for producer to publish descriptor, consumer_seq: %lu, desc_idx: %u\n",
-            //                     consumer_seq, desc_idx);
-            // DOCA_DPA_DEV_LOG_INFO("Idle polling for descriptor, desc_seq: %lu, expected_seq: %lu\n", desc_seq, expected_seq);
             __dpa_thread_window_read_inv();
-            if (pending_completions != 0 &&
-                ++idle_polls >= DMA_COMPLETION_IDLE_POLL_LIMIT) {
+
+            if (pending_completions > 0) {
                 publish_consumer_seq(thread_arg, consumer_seq);
                 pending_completions = 0;
-                idle_polls = 0;
 
                 buf = doca_dpa_dev_buf_array_get_buf(thread_arg->dpa_buf_arr, desc_idx);
                 dev_ptr = doca_dpa_dev_buf_get_external_ptr(buf);
                 desc = (struct dma_desc *)dev_ptr;
             }
         }
-        idle_polls = 0;
-        // __sync_synchronize();   /* full fence */
         desc_addr = desc->addr;
         desc_size = desc->size;
 
