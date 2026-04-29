@@ -220,11 +220,9 @@ static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
          */
         thread_arg->pos += desc_size;
         consumer_seq++;
+
         pending_completions++;
-        if (pending_completions >= DMA_COMPLETION_BATCH_SIZE ||
-            consumer_seq % ring_size == 0) {
-            // DOCA_DPA_DEV_LOG_INFO("Acknowledging %u completed descriptors, consumer_seq: %lu\n",
-            //                     pending_completions, consumer_seq);
+        if (pending_completions >= DMA_COMPLETION_BATCH_SIZE) {
             publish_consumer_seq(thread_arg, consumer_seq);
             pending_completions = 0;
         }
