@@ -6,7 +6,7 @@
 
 #include <doca_error.h>
 
-#include "dpa_common.h"
+#include "../dpa_common.h"
 
 struct objects;
 

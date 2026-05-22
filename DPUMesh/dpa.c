@@ -11,7 +11,7 @@
 #include "object.h"
 #include "dpa_common.h"
 #include "ring.h"
-#include "grpc_offload.h"
+#include "grpc/grpc_offload.h"
 #include <arpa/inet.h>
 #include <stdlib.h>
 #include <string.h>

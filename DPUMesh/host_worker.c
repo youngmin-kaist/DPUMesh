@@ -11,7 +11,7 @@
 #include "dpa.h"
 #include "dpa_common.h"
 #include "ring.h"
-#include "grpc_offload.h"
+#include "grpc/grpc_offload.h"
 
 #include <doca_log.h>
 #include <doca_buf_array.h>

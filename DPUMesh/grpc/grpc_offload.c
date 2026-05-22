@@ -7,9 +7,9 @@
 #include <doca_log.h>
 #include <doca_mmap.h>
 
-#include "dpa.h"
-#include "object.h"
-#include "ring.h"
+#include "../dpa.h"
+#include "../object.h"
+#include "../ring.h"
 
 DOCA_LOG_REGISTER(GRPC_OFFLOAD);
 

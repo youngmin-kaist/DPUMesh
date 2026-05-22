@@ -5,7 +5,7 @@
 #include <doca_pe.h>
 #include <doca_comch.h>
 
-#include "grpc_offload.h"
+#include "grpc/grpc_offload.h"
 
 DOCA_LOG_REGISTER(OBJECT);
 

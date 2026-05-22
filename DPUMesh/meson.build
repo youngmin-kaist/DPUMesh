@@ -44,7 +44,7 @@ srcs = [
     'dpu_worker.c',
     'host_worker.c',
     'ring.c',
-    'grpc_offload.c',
+    'grpc/grpc_offload.c',
 ]
 
 # DPA compiler build script
