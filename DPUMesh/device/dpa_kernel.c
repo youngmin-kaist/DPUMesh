@@ -78,12 +78,12 @@ static uint64_t align_up_u64(uint64_t value, uint64_t align)
 static struct comch_grpc_dma_comp_msg grpc_dma_comp_imm[DMESH_GRPC_MAX_PENDING];
 static struct comch_grpc_serialize_comp_msg grpc_serialize_comp_imm[DMESH_GRPC_MAX_PENDING];
 
-static const ProtoDescBlob grpc_hello_desc_blob = {
+static const ProtoSchemaBlob grpc_schema_blob = {
     .msg_count = 1U,
     .field_count = 3U,
     .msgs = {
         {
-            .desc_id = DMESH_GRPC_SCHEMA_HELLO_REQUEST,
+            .schema_id = DMESH_GRPC_SCHEMA_HELLO_REQUEST,
             .field_begin = 0U,
             .field_count = 3U,
             .flat_size = sizeof(HelloRequestFlat),
@@ -94,19 +94,19 @@ static const ProtoDescBlob grpc_hello_desc_blob = {
             .field_no = 1U,
             .kind = FK_U64,
             .offset = (uint32_t)offsetof(HelloRequestFlat, id),
-            .child_desc_id = 0U,
+            .child_schema_id = 0U,
         },
         {
             .field_no = 2U,
             .kind = FK_STRING,
             .offset = (uint32_t)offsetof(HelloRequestFlat, name),
-            .child_desc_id = 0U,
+            .child_schema_id = 0U,
         },
         {
             .field_no = 3U,
             .kind = FK_REPEATED_U32_PACKED,
             .offset = (uint32_t)offsetof(HelloRequestFlat, scores),
-            .child_desc_id = 0U,
+            .child_schema_id = 0U,
         },
     },
 };
@@ -305,9 +305,6 @@ static int enqueue_grpc_serialize_task(struct dpa_thread_arg *thread_arg,
             uint32_t slot = prod % DMESH_GRPC_SERIALIZER_QUEUE_DEPTH;
             struct dpa_grpc_serialize_task *task = &state->serializer_tasks[worker][slot];
 
-            DOCA_DPA_DEV_LOG_INFO("111 Scheduling gRPC serialize task: worker=%u req=%u seq=%lu schema=%u cost=%u deficit=%u\n",
-                                worker, req->request_id, req->ring_seq, req->schema_id, cost, deficit);
-
             task->request_id = req->request_id;
             task->schema_id = req->schema_id;
             task->ring_seq = req->ring_seq;
@@ -316,9 +313,6 @@ static int enqueue_grpc_serialize_task(struct dpa_thread_arg *thread_arg,
             task->flat_len = req->flat_len;
             task->out_cap = req->out_cap;
             task->reserved0 = 0;
-
-            DOCA_DPA_DEV_LOG_INFO("222 Scheduling gRPC serialize task: req=%u seq=%lu schema=%u cost=%u\n",
-                                req->request_id, req->ring_seq, req->schema_id, cost);
 
             deficit -= cost;
             state->serializer_drr_deficit[worker] = deficit;
@@ -365,8 +359,6 @@ static int handle_dpu_msg(struct dpa_thread_arg *thread_arg,
     doca_dpa_dev_comch_producer_t producer = thread_arg->dpa_producer;
     // doca_dpa_dev_comch_producer_t producer;
     enum comch_msg_type msg_type = *(const enum comch_msg_type *)msg_data;
-
-    DOCA_DPA_DEV_LOG_INFO("Received msg from host, type=%d\n", msg_type);
 
     switch(msg_type) {
         case COMCH_MSG_TYPE_DMA_REQ: {
@@ -621,8 +613,6 @@ static void poll_desc_ring_grpc(struct dpa_thread_arg *thread_arg)
             comp_msg = &grpc_serialize_comp_imm[done_idx];
             post_dpu_imm(thread_arg, (const uint8_t *)comp_msg, sizeof(*comp_msg));
 
-            // DOCA_DPA_DEV_LOG_INFO("Post Ser Comp: %lu ", comp_msg->ring_seq, comp_msg->request_id, comp_msg->schema_id);
-
 	        __atomic_store_n(&state->active[done_idx], 0U, __ATOMIC_RELEASE);
 	        __atomic_store_n(&state->completed[done_idx], 0U, __ATOMIC_RELEASE);
 	        consumer_seq++;
@@ -664,7 +654,7 @@ static void poll_desc_ring_grpc(struct dpa_thread_arg *thread_arg)
              * Host arena memory may be DMA source for pointer fields, so
              * consumer_seq advances only when this sequence is completed.
              */
-            if (desc->schema_id == DMESH_GRPC_SCHEMA_HELLO_REQUEST) {
+            if (desc->schema_id <= grpc_schema_blob.msg_count) {
                 init_grpc_dma_comp_msg(&grpc_dma_comp_imm[desc_idx],
                                        desc, next_desc_seq);
                 prep_result = prepare_grpc_hello_request(thread_arg, desc,
@@ -702,7 +692,8 @@ static void poll_desc_ring_grpc(struct dpa_thread_arg *thread_arg)
 }
 
 static void complete_grpc_serialize_task(struct dpa_thread_arg *thread_arg,
-                                         const struct dpa_grpc_serialize_task *task)
+                                         const struct dpa_grpc_serialize_task *task,
+                                         uint8_t reverse)
 {
     struct dpa_grpc_pipeline_state *state = grpc_pipeline_state(thread_arg);
     struct comch_grpc_serialize_comp_msg *comp_msg;
@@ -712,6 +703,7 @@ static void complete_grpc_serialize_task(struct dpa_thread_arg *thread_arg,
     int32_t status = -1;
     uint32_t encoded_len = 0;
     int result = 0;
+    uint64_t out_offset = 0;
 
     __dpa_thread_window_read_inv();
 
@@ -720,7 +712,7 @@ static void complete_grpc_serialize_task(struct dpa_thread_arg *thread_arg,
                             task->request_id, task->ring_seq, task->schema_id);
     }
 
-    if (task->schema_id != DMESH_GRPC_SCHEMA_HELLO_REQUEST) {
+    if (task->schema_id > grpc_schema_blob.msg_count) {
         DOCA_DPA_DEV_LOG_INFO("gRPC serialize unsupported schema: req=%u seq=%lu schema=%u\n",
                               task->request_id, task->ring_seq, task->schema_id);
     } else {
@@ -733,14 +725,22 @@ static void complete_grpc_serialize_task(struct dpa_thread_arg *thread_arg,
             return;
         }
 
-        proto_task.desc_id = task->schema_id;
+        proto_task.schema_id = task->schema_id;
         proto_task.request_id = task->request_id;
         proto_task.dpa_msg_addr = flat;
         proto_task.dpa_out_addr = out;
         proto_task.dpa_out_cap = task->out_cap;
 
-        result = grpc_wire_serialize_one(&grpc_hello_desc_blob, &proto_task, &proto_cpl, NULL);
-        if (result != 0) {
+        if (reverse) {
+            result = grpc_wire_serialize_one_reverse(&grpc_schema_blob, &proto_task, &proto_cpl, NULL);
+            if (result > 0) {
+                out_offset = result;
+            }
+        } else {
+            result = grpc_wire_serialize_one(&grpc_schema_blob, &proto_task, &proto_cpl, NULL);
+        }
+
+        if (result < 0) {
             DOCA_DPA_DEV_LOG_INFO("gRPC serialize failed: req=%u seq=%lu schema=%u error=%d\n",
                                   task->request_id, task->ring_seq, task->schema_id, result);
         }
@@ -759,19 +759,9 @@ static void complete_grpc_serialize_task(struct dpa_thread_arg *thread_arg,
     comp_msg->schema_id = task->schema_id;
     comp_msg->status = status;
     comp_msg->ring_seq = task->ring_seq;
-    comp_msg->out_addr = task->out_addr;
+    comp_msg->out_addr = task->out_addr + out_offset; // the start of the encoded message 
     comp_msg->encoded_len = encoded_len;
     comp_msg->reserved0 = 0;
-
-    /*
-     * Producer posting is shared by main and serializer DPA threads. If DOCA
-     * requires single-thread producer ownership, route this completion through
-     * the msg worker instead of posting here.
-     * Immediate data lifetime is assumed to extend at least until DOCA copies
-     * this per-ring-slot static message; otherwise completed publication must
-     * be delayed until producer completion.
-     */
-    // post_dpu_imm(thread_arg, (const uint8_t *)comp_msg, sizeof(*comp_msg));
 
     uint32_t done_idx = (uint32_t)((task->ring_seq - 1U) % thread_arg->buf_arr_size);
     __atomic_store_n(&state->completed[done_idx], 1U, __ATOMIC_RELEASE);
@@ -831,7 +821,7 @@ static void poll_grpc_serializer_queue(struct dpa_thread_arg *thread_arg)
             continue;
         }
         
-        complete_grpc_serialize_task(thread_arg, task);
+        complete_grpc_serialize_task(thread_arg, task, /*reverse=*/0);
         __atomic_store_n(&task->valid, 0U, __ATOMIC_RELEASE);
         __atomic_store_n(&state->serializer_cons[worker], cons + 1U, __ATOMIC_RELEASE);
     }
@@ -975,8 +965,8 @@ __dpa_global__ void run_grpc_msg_worker(uint64_t arg)
 {
     struct dpa_thread_arg *thread_arg = (struct dpa_thread_arg *)arg;
 
-    DOCA_DPA_DEV_LOG_INFO("Starting gRPC msg worker thread: idx=%u\n",
-                          thread_arg->thread_index);
+    // DOCA_DPA_DEV_LOG_INFO("Starting gRPC msg worker thread: idx=%u\n",
+    //                       thread_arg->thread_index);
     for (;;) {
         if (handle_msgs(thread_arg) == 0) {
             doca_dpa_dev_comch_consumer_completion_request_notification(
@@ -992,7 +982,7 @@ __dpa_global__ void run_grpc_serializer_worker(uint64_t arg)
 {
     struct dpa_thread_arg *thread_arg = (struct dpa_thread_arg *)arg;
 
-    DOCA_DPA_DEV_LOG_INFO("Starting gRPC serializer worker thread: idx=%u serializer=%u\n",
-                          thread_arg->thread_index, thread_arg->serializer_index);
+    // DOCA_DPA_DEV_LOG_INFO("Starting gRPC serializer worker thread: idx=%u serializer=%u\n",
+    //                       thread_arg->thread_index, thread_arg->serializer_index);
     poll_grpc_serializer_queue(thread_arg);
 }

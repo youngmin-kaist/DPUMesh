@@ -70,26 +70,26 @@ run_host_worker(struct objects *objs)
         goto argp_cleanup;
     }
 
-    result = init_dpa_objects(objs);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to init DPA objects: %s", doca_error_get_descr(result));
-        cleanup_objects(objs);
-        goto argp_cleanup;
-    }
+    // result = init_dpa_objects(objs);
+    // if (result != DOCA_SUCCESS) {
+    //     DOCA_LOG_ERR("Failed to init DPA objects: %s", doca_error_get_descr(result));
+    //     cleanup_objects(objs);
+    //     goto argp_cleanup;
+    // }
 
-    result = dmesh_doca_dpa_thread_create(objs->dpa_thread);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to create DPA thread: %s", doca_error_get_descr(result));
-        cleanup_objects(objs);
-        goto argp_cleanup;
-    }
+    // result = dmesh_doca_dpa_thread_create(objs->dpa_thread);
+    // if (result != DOCA_SUCCESS) {
+    //     DOCA_LOG_ERR("Failed to create DPA thread: %s", doca_error_get_descr(result));
+    //     cleanup_objects(objs);
+    //     goto argp_cleanup;
+    // }
 
-    result = init_comch_dpa_msgq(objs, objs->producer_pe);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to init comch DPA datapath: %s", doca_error_get_descr(result));
-        cleanup_objects(objs);
-        goto argp_cleanup;
-    }
+    // result = init_comch_dpa_msgq(objs, objs->producer_pe);
+    // if (result != DOCA_SUCCESS) {
+    //     DOCA_LOG_ERR("Failed to init comch DPA datapath: %s", doca_error_get_descr(result));
+    //     cleanup_objects(objs);
+    //     goto argp_cleanup;
+    // }
 
     // result = setup_dpa_buf_array(objs, DMA_RING_SIZE, objs->local_mmap);
     // if (result != DOCA_SUCCESS) {

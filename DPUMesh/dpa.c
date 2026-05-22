@@ -318,12 +318,70 @@ launch_dpa_kernel(struct dmesh_doca_dpa_thread *dpa_thread)
     return DOCA_SUCCESS;
 }
 
+static doca_error_t
+dmesh_doca_dpa_thread_set_eu_affinity(struct dmesh_doca_dpa_thread *dpa_thread,
+                                      uint32_t tid,
+                                      unsigned int eu_id)
+{
+    doca_error_t result;
+
+    result = doca_dpa_eu_affinity_create(dpa_thread->dpa,
+                                         &dpa_thread->affinities[tid]);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to create DPA EU affinity for thread %u: %s",
+                     tid, doca_error_get_descr(result));
+        return result;
+    }
+
+    result = doca_dpa_eu_affinity_set(dpa_thread->affinities[tid], eu_id);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to set DPA EU affinity for thread %u to EU %u: %s",
+                     tid, eu_id, doca_error_get_descr(result));
+        return result;
+    }
+
+    result = doca_dpa_thread_set_affinity(dpa_thread->threads[tid],
+                                          dpa_thread->affinities[tid]);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to attach DPA EU affinity to thread %u, EU %u: %s",
+                     tid, eu_id, doca_error_get_descr(result));
+        return result;
+    }
+
+    DOCA_LOG_INFO("Pinned DPA thread %u to DPA EU %u", tid, eu_id);
+    return DOCA_SUCCESS;
+}
+
 doca_error_t
 dmesh_doca_dpa_thread_create(struct dmesh_doca_dpa_thread *dpa_thread)
 {
 	doca_error_t result;
 	struct dpa_grpc_pipeline_state *zero_state;
 	uint32_t i;
+
+    uint32_t num_cores = 0;
+    uint32_t eus_per_core = 0;
+    uint32_t total_eus = 0;
+
+    result = doca_dpa_get_core_num(dpa_thread->dpa, &num_cores);
+    if (result != DOCA_SUCCESS)
+        return result;
+
+    result = doca_dpa_get_num_eus_per_core(dpa_thread->dpa, &eus_per_core);
+    if (result != DOCA_SUCCESS)
+        return result;
+
+    result = doca_dpa_get_total_num_eus_available(dpa_thread->dpa, &total_eus);
+    if (result != DOCA_SUCCESS)
+        return result;
+
+    DOCA_LOG_INFO("DPA resources: cores=%u, eus_per_core=%u, total_eus=%u",
+                num_cores, eus_per_core, total_eus);
+
+    if (total_eus < DMESH_DPA_THREAD_COUNT) {
+        DOCA_LOG_WARN("DPA EUs fewer than DPA threads: total_eus=%u, threads=%u",
+                    total_eus, DMESH_DPA_THREAD_COUNT);
+    }
 
 	result = doca_dpa_mem_alloc(dpa_thread->dpa,
 				    sizeof(struct dpa_thread_arg) * DMESH_DPA_THREAD_COUNT,
@@ -374,8 +432,9 @@ dmesh_doca_dpa_thread_create(struct dmesh_doca_dpa_thread *dpa_thread)
 
 //     DOCA_LOG_INFO("Copied data to DPA memory at device pointer: 0x%lx", dpa_thread->buf);
 // #endif
+    uint32_t test_eus[DMESH_DPA_THREAD_COUNT] = {0, 16, 32, 33, 34, 35};
 
-	for (i = 0; i < DMESH_DPA_THREAD_COUNT; ++i) {
+    for (i = 0; i < DMESH_DPA_THREAD_COUNT; ++i) {
 		doca_dpa_func_t *func;
 		doca_dpa_dev_uintptr_t arg_addr =
 			dpa_thread->arg + ((doca_dpa_dev_uintptr_t)i * sizeof(struct dpa_thread_arg));
@@ -415,6 +474,18 @@ dmesh_doca_dpa_thread_create(struct dmesh_doca_dpa_thread *dpa_thread)
 		// 	DOCA_LOG_WARN("Failed to pin DPA thread %u to EU %u: %s",
 		// 		      i, i, doca_error_get_descr(result));
 		// }
+
+        /*
+         * Strict EU affinity.
+         */
+        // if (i < total_eus) {
+        //     result = dmesh_doca_dpa_thread_set_eu_affinity(dpa_thread, i, test_eus[i]);
+        //     if (result != DOCA_SUCCESS)
+        //         return result;
+        // } else {
+        //     DOCA_LOG_WARN("No unique EU for DPA thread %u; leaving affinity unset", i);
+        // }
+
 
 		result = doca_dpa_thread_start(dpa_thread->threads[i]);
 		if (result != DOCA_SUCCESS) {

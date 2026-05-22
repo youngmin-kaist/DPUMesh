@@ -16,7 +16,12 @@ typedef struct {
 
 void grpc_wire_encode_stats_reset(GrpcWireEncodeStats *stats);
 
-int grpc_wire_serialize_one(const ProtoDescBlob *blob,
+int grpc_wire_serialize_one(const ProtoSchemaBlob *blob,
+                            const ProtoTask *task,
+                            ProtoCompletion *cpl,
+                            GrpcWireEncodeStats *stats);
+
+int grpc_wire_serialize_one_reverse(const ProtoSchemaBlob *blob,
                             const ProtoTask *task,
                             ProtoCompletion *cpl,
                             GrpcWireEncodeStats *stats);

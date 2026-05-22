@@ -1,9 +1,0 @@
-syntax = "proto3";
-
-package demo;
-
-message HelloRequest {
-  uint64 id = 1;
-  string name = 2;
-  repeated uint32 scores = 3;   // packed repeated
-}
