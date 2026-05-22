@@ -11,6 +11,7 @@
 struct dmesh_doca_dpa_thread;
 struct dmesh_doca_dpa_comch;
 struct dma_ring;
+struct dmesh_grpc_dpu_state;
 typedef uint64_t doca_dpa_dev_comch_producer_t;
 typedef uint64_t doca_dpa_dev_completion_t;
 typedef uint64_t doca_dpa_dev_buf_arr_t;
@@ -38,9 +39,13 @@ struct objects {
 
     struct doca_buf_arr *buf_arr;
     struct doca_buf_arr *consumer_state_buf_arr;
+    struct doca_buf_arr *host_mmap_buf_arr;
+    struct doca_buf_arr *dpu_mmap_buf_arr;
 
     struct dmesh_doca_dpa_thread *dpa_thread;
 	struct dmesh_doca_dpa_comch *dpa_comch;
+    struct dmesh_grpc_dpu_state *grpc_dpu_state;
+    void *grpc_offload;
     doca_dpa_dev_comch_producer_t remote_dpa_producer;
     doca_dpa_dev_completion_t remote_dpa_producer_comp;
 

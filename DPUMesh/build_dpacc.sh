@@ -43,6 +43,8 @@ DPA_KERNELS_DEVICE_SRC=$3
 PROGRAM_NAME=$4
 DPACC_MCPU_FLAG=$5
 DOCA_LIB_DIR=$6
+OUTPUT_PATH=$7
+DPA_GRPC_WIRE_SRC="${PROJECT_SRC_DIR}/grpc/grpc_wire_encode.c"
 
 # DOCA Configurations
 DOCA_DIR="/opt/mellanox/doca"
@@ -65,13 +67,15 @@ DPA_APP_NAME="DPU_mesh_dpa_app"
 
 # Build directory for the DPA device (kernel) code
 DEVICE_BUILD_DIR="${PROJECT_BUILD_DIR}/device"
+if [ -z "${OUTPUT_PATH}" ]; then
+	OUTPUT_PATH="${DEVICE_BUILD_DIR}/${PROGRAM_NAME}.a"
+fi
 
-rm -rf ${DEVICE_BUILD_DIR}
-mkdir -p ${DEVICE_BUILD_DIR}
+mkdir -p "$(dirname "${OUTPUT_PATH}")"
 
 # Compile the DPA (kernel) device source code using the DPACC
-$DOCA_DPACC $DPA_KERNELS_DEVICE_SRC \
-	-o ${DEVICE_BUILD_DIR}/${PROGRAM_NAME}.a \
+$DOCA_DPACC $DPA_KERNELS_DEVICE_SRC "${DPA_GRPC_WIRE_SRC}" \
+	-o "${OUTPUT_PATH}" \
 	-mcpu=${DPACC_MCPU_FLAG} \
 	-hostcc=gcc \
 	-hostcc-options="${HOST_CC_FLAGS}" \
@@ -81,3 +85,4 @@ $DOCA_DPACC $DPA_KERNELS_DEVICE_SRC \
 	-flto \
 	-I${DOCA_INCLUDE} \
 	-I"${PROJECT_SRC_DIR}/" \
+	-I"${PROJECT_SRC_DIR}/grpc" \

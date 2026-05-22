@@ -44,6 +44,7 @@ srcs = [
     'dpu_worker.c',
     'host_worker.c',
     'ring.c',
+    'grpc_offload.c',
 ]
 
 # DPA compiler build script
@@ -54,16 +55,22 @@ dpacc_mcpu_flag = 'nv-dpa-bf3'
 doca_dep = dependency('doca-dpa')
 doca_lib_dir = doca_dep.get_variable(pkgconfig : 'libdir')
 
-result = run_command(dpacc_build_script, meson.project_build_root(), meson.project_source_root(), device_src,
-        program_name, dpacc_mcpu_flag, doca_lib_dir, check: true)
+dpa_program_lib = custom_target('dpa_kernel_archive',
+  input : device_src,
+  output : program_name + '.a',
+  command : [dpacc_build_script, meson.project_build_root(), meson.project_source_root(),
+             '@INPUT@', program_name, dpacc_mcpu_flag, doca_lib_dir, '@OUTPUT@'],
+  depend_files : [
+    dpacc_build_script,
+    meson.project_source_root() + '/dpa_common.h',
+    meson.project_source_root() + '/grpc/grpc_wire_encode.c',
+    meson.project_source_root() + '/grpc/grpc_wire_encode.h',
+    meson.project_source_root() + '/grpc/proto_meta.h',
+  ],
+  build_by_default : true,
+)
 
-device_build_dir = meson.project_build_root() + '/device'
-dpa_program_lib = meson.get_compiler('c').find_library(program_name, dirs: device_build_dir,
-                  static: true)
-
-sample_dependencies += dpa_program_lib
-
-executable('dpumesh', srcs,
+executable('dpumesh', srcs, dpa_program_lib,
   dependencies : sample_dependencies,
   include_directories : inc_dirs,
   install : false,

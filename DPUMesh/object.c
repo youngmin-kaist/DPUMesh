@@ -5,12 +5,16 @@
 #include <doca_pe.h>
 #include <doca_comch.h>
 
+#include "grpc_offload.h"
+
 DOCA_LOG_REGISTER(OBJECT);
 
 void
 cleanup_objects(struct objects *objs)
 {
     doca_error_t result;
+
+    dmesh_grpc_dpu_state_destroy(objs);
     
     if (objs->cc_server) {
         result = doca_comch_server_destroy(objs->cc_server);

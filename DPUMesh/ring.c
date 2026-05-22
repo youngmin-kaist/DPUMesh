@@ -76,24 +76,33 @@ int setup_dma_ring(struct objects *objs, size_t size)
     return 0;
 }
 
-struct dma_desc *get_dma_desc_for_seq(struct dma_ring *ring, uint64_t producer_seq)
+struct dma_desc inline *get_dma_desc_for_seq(struct dma_ring *ring, uint64_t producer_seq)
 {
     return ring->descs + (producer_seq % ring->size);
 }
 
-bool dma_ring_has_free_slot(const struct dma_ring *ring)
+struct grpc_req_desc inline *get_grpc_req_desc_for_seq(struct dma_ring *ring, uint64_t producer_seq)
+{
+    return (struct grpc_req_desc *)(ring->descs + (producer_seq % ring->size));
+}
+
+bool inline dma_ring_has_free_slot(const struct dma_ring *ring)
 {
     return ring->producer_seq - ring->observed_consumer_seq < ring->size;
 }
 
-void dma_ring_refresh_consumer(struct dma_ring *ring)
+void inline dma_ring_refresh_consumer(struct dma_ring *ring)
 {
     /*
      * Assumes the host CPU observes DPA PCI writes to this mmap after the DPA
      * calls __dpa_thread_window_writeback(). If the platform is not coherent,
      * a DOCA/platform-specific host invalidation step must be added here.
      */
+    ring->observed_consumer_seq = ring->consumer_state->consumer_seq;
+    // if (ring->producer_seq % DEBUG_INTERVAL == 0) {
+    //     DOCA_LOG_INFO("Refreshing consumer seq. Before refresh: observed_consumer_seq=%lu, actual_consumer_seq=%lu\n",
+    //                 ring->observed_consumer_seq, ring->consumer_state->consumer_seq);
+    //     DOCA_LOG_INFO("Producer seq: %lu\n", ring->producer_seq);
+    // }
 
-    ring->observed_consumer_seq =
-        __atomic_load_n(&ring->consumer_state->consumer_seq, __ATOMIC_ACQUIRE);
 }

@@ -11,7 +11,10 @@
 #include "object.h"
 #include "dpa_common.h"
 #include "ring.h"
+#include "grpc_offload.h"
 #include <arpa/inet.h>
+#include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 DOCA_LOG_REGISTER(DPA);
@@ -19,11 +22,54 @@ DOCA_LOG_REGISTER(DPA);
 /* Kernel function declaration */
 extern doca_dpa_func_t hello_world;
 extern doca_dpa_func_t run_dma_manager;
+extern doca_dpa_func_t run_grpc_desc_main;
+extern doca_dpa_func_t run_grpc_msg_worker;
+extern doca_dpa_func_t run_grpc_serializer_worker;
 extern doca_dpa_func_t thread_init_rpc;
 
 extern struct doca_dpa_app *DPU_mesh_dpa_app;
 
 #define TEST_DPA_MEMORY
+
+static doca_error_t
+dmesh_doca_dpa_notification_create(struct dmesh_doca_dpa_thread *dpa_thread,
+				   uint32_t thread_idx)
+{
+	doca_error_t result;
+
+	result = doca_dpa_notification_completion_create(dpa_thread->dpa,
+							 dpa_thread->threads[thread_idx],
+							 &dpa_thread->notify_comps[thread_idx]);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Failed to create DPA notification completion for thread %u: %s",
+			     thread_idx, doca_error_get_descr(result));
+		return result;
+	}
+
+	result = doca_dpa_notification_completion_start(dpa_thread->notify_comps[thread_idx]);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Failed to start DPA notification completion for thread %u: %s",
+			     thread_idx, doca_error_get_descr(result));
+		return result;
+	}
+
+	result = doca_dpa_notification_completion_get_dpa_handle(
+		dpa_thread->notify_comps[thread_idx],
+		&dpa_thread->notify_handles[thread_idx]);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Failed to get DPA notification handle for thread %u: %s",
+			     thread_idx, doca_error_get_descr(result));
+		return result;
+	}
+
+	return DOCA_SUCCESS;
+}
+
+struct dmesh_doca_dpa_msgq_send_ctx {
+    struct dmesh_doca_dpa_msgq *msgq;
+    uint32_t msg_size;
+    uint8_t msg_data[];
+};
 
 /*
  * Callback invoked once a message is received from DPA successfully
@@ -37,9 +83,11 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
 				       union doca_data ctx_user_data)
 {
 	(void)task_user_data;
-
-	doca_error_t result;
+    
+    doca_error_t result;
     uint32_t data_len;
+    const uint8_t *imm_data;
+    enum comch_msg_type msg_type;
     struct comch_msg *msg;
 
 	struct objects *objs = ctx_user_data.ptr;
@@ -49,19 +97,46 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
     msg = (struct comch_msg *)doca_comch_consumer_task_post_recv_get_imm_data(recv_task);
 
     switch (msg->type) {
-        case COMCH_MSG_TYPE_DMA_COMPLETED:
+        case COMCH_MSG_TYPE_DMA_COMPLETED: {
             struct comch_dma_comp_msg *comp_msg = (struct comch_dma_comp_msg *)msg;
             uint32_t *idx = (uint32_t *)(objs->dma_buffer + comp_msg->pos);
-            (void)idx;
             // DOCA_LOG_INFO("Received DMA completed message: desc_idx=%lu pos=%u length=%u value=%u",
             //               comp_msg->idx, comp_msg->pos, comp_msg->length, *idx);
             break;
+        }
+        case COMCH_MSG_TYPE_GRPC_DMA_COMPLETED: {
+            struct comch_grpc_dma_comp_msg *comp_msg = (struct comch_grpc_dma_comp_msg *)msg;
+
+            // if (comp_msg->ring_seq <= 8U || (comp_msg->ring_seq % 64U) == 0U) {
+            //     DOCA_LOG_INFO("gRPC DMA completion received: req=%u seq=%lu status=%u expected_dma=%u flat=0x%lx out=0x%lx",
+            //                     comp_msg->request_id, comp_msg->ring_seq,
+            //                     comp_msg->status, comp_msg->expected_dma,
+            //                     comp_msg->flat_addr, comp_msg->out_addr);
+            // }
+
+            result = dmesh_grpc_handle_dma_completion(objs, comp_msg);
+            if (result != DOCA_SUCCESS) {
+                DOCA_LOG_ERR("Failed to handle gRPC DMA completion: %s",
+                            doca_error_get_name(result));
+            }
+
+            break;
+        }
+        case COMCH_MSG_TYPE_GRPC_SERIALIZE_COMPLETED: {
+            struct comch_grpc_serialize_comp_msg *comp_msg = (struct comch_grpc_serialize_comp_msg *)msg;
+
+            if (comp_msg->ring_seq <= 8U || (comp_msg->ring_seq % DEBUG_INTERVAL) == 0U) {
+                DOCA_LOG_INFO("gRPC serialize complete: request_id=%u status=%d encoded_len=%u out=0x%lx",
+                            comp_msg->request_id, comp_msg->status,
+                            comp_msg->encoded_len, comp_msg->out_addr);
+            }
+            objs->recv_msg_cnt++;
+            break;
+        }
         default:
-            DOCA_LOG_ERR("Received unknown message type: %u", msg->type);
+            DOCA_LOG_ERR("Received unknown message type: %u", msg_type);
             break;
     }
-
-    objs->recv_msg_cnt++;
 
 	result = doca_task_submit(task);
 	if (result != DOCA_SUCCESS) {
@@ -100,16 +175,13 @@ static void dmesh_doca_dpa_msgq_send_cb(struct doca_comch_producer_task_send *se
 				       union doca_data task_user_data,
 				       union doca_data ctx_user_data)
 {
-    doca_error_t result;
-    struct comch_msg msg;
-	(void)task_user_data;
-	
+    struct dmesh_doca_dpa_msgq_send_ctx *send_ctx = task_user_data.ptr;
     
     struct objects *objs = (struct objects *)ctx_user_data.ptr;
-    objs->sent_msg_cnt++;
+    if (objs != NULL)
+        objs->sent_msg_cnt++;
     
     // DOCA_LOG_INFO("Sent msg to DPA successfully, cnt: %d", objs->sent_msg_cnt);
-    doca_comch_producer_task_send_set_imm_data(send_task, (uint8_t *)&msg, sizeof(struct comch_msg));
     
 	struct doca_task *task = doca_comch_producer_task_send_as_task(send_task);
     doca_task_free(task);
@@ -139,7 +211,7 @@ static void dmesh_doca_dpa_msgq_send_error_cb(struct doca_comch_producer_task_se
 					     union doca_data task_user_data,
 					     union doca_data ctx_user_data)
 {
-	(void)task_user_data;
+    struct dmesh_doca_dpa_msgq_send_ctx *send_ctx = task_user_data.ptr;
 	(void)ctx_user_data;
 
 	struct doca_task *task = doca_comch_producer_task_send_as_task(send_task);
@@ -249,14 +321,39 @@ launch_dpa_kernel(struct dmesh_doca_dpa_thread *dpa_thread)
 doca_error_t
 dmesh_doca_dpa_thread_create(struct dmesh_doca_dpa_thread *dpa_thread)
 {
-    doca_error_t result;
+	doca_error_t result;
+	struct dpa_grpc_pipeline_state *zero_state;
+	uint32_t i;
 
-    result = doca_dpa_mem_alloc(dpa_thread->dpa, sizeof(struct dpa_thread_arg), &dpa_thread->arg);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to alloc dpa mem: %s",
-            doca_error_get_descr(result));
-        return result;
-    }
+	result = doca_dpa_mem_alloc(dpa_thread->dpa,
+				    sizeof(struct dpa_thread_arg) * DMESH_DPA_THREAD_COUNT,
+				    &dpa_thread->arg);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Failed to alloc dpa mem: %s",
+		    doca_error_get_descr(result));
+		return result;
+	}
+
+	result = doca_dpa_mem_alloc(dpa_thread->dpa,
+				    sizeof(struct dpa_grpc_pipeline_state),
+				    &dpa_thread->shared_state);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Failed to alloc DPA gRPC pipeline state: %s",
+			     doca_error_get_descr(result));
+		return result;
+	}
+
+	zero_state = calloc(1, sizeof(*zero_state));
+	if (zero_state == NULL)
+		return DOCA_ERROR_NO_MEMORY;
+	result = doca_dpa_h2d_memcpy(dpa_thread->dpa, dpa_thread->shared_state,
+				     zero_state, sizeof(*zero_state));
+	free(zero_state);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Failed to zero DPA gRPC pipeline state: %s",
+			     doca_error_get_descr(result));
+		return result;
+	}
 
 // #ifdef TEST_DPA_MEMORY
 //     result = doca_dpa_mem_alloc(dpa_thread->dpa, 1024, &dpa_thread->buf);
@@ -278,28 +375,64 @@ dmesh_doca_dpa_thread_create(struct dmesh_doca_dpa_thread *dpa_thread)
 //     DOCA_LOG_INFO("Copied data to DPA memory at device pointer: 0x%lx", dpa_thread->buf);
 // #endif
 
-    result = doca_dpa_thread_create(dpa_thread->dpa, &dpa_thread->thread);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to create dpa thread: %s",
-            doca_error_get_descr(result));
-        return result;
-    }
-    
-    result = doca_dpa_thread_set_func_arg(dpa_thread->thread, run_dma_manager, dpa_thread->arg);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to set DPA thread func: %s",
-            doca_error_get_descr(result));
-        return result;
-    }
-    
-    result = doca_dpa_thread_start(dpa_thread->thread);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to start DPA thread: %s",
-            doca_error_get_descr(result));
-        return result;
-    }
+	for (i = 0; i < DMESH_DPA_THREAD_COUNT; ++i) {
+		doca_dpa_func_t *func;
+		doca_dpa_dev_uintptr_t arg_addr =
+			dpa_thread->arg + ((doca_dpa_dev_uintptr_t)i * sizeof(struct dpa_thread_arg));
 
-    return DOCA_SUCCESS;
+        switch (i) {
+            case DMESH_DPA_THREAD_MAIN:
+                func = run_grpc_desc_main;
+                break;
+            case DMESH_DPA_THREAD_MSG:
+                func = run_grpc_msg_worker;
+                break;
+            default:
+                func = run_grpc_serializer_worker;
+        }
+
+		result = doca_dpa_thread_create(dpa_thread->dpa, &dpa_thread->threads[i]);
+		if (result != DOCA_SUCCESS) {
+			DOCA_LOG_ERR("Failed to create DPA thread %u: %s",
+				     i, doca_error_get_descr(result));
+			return result;
+		}
+
+		result = doca_dpa_thread_set_func_arg(dpa_thread->threads[i], func, arg_addr);
+		if (result != DOCA_SUCCESS) {
+			DOCA_LOG_ERR("Failed to set DPA thread %u func: %s",
+				     i, doca_error_get_descr(result));
+			return result;
+		}
+
+		// result = doca_dpa_eu_affinity_create(dpa_thread->dpa, &dpa_thread->affinities[i]);
+		// if (result == DOCA_SUCCESS)
+		// 	result = doca_dpa_eu_affinity_set(dpa_thread->affinities[i], i);
+		// if (result == DOCA_SUCCESS)
+		// 	result = doca_dpa_thread_set_affinity(dpa_thread->threads[i],
+		// 					      dpa_thread->affinities[i]);
+		// if (result != DOCA_SUCCESS) {
+		// 	DOCA_LOG_WARN("Failed to pin DPA thread %u to EU %u: %s",
+		// 		      i, i, doca_error_get_descr(result));
+		// }
+
+		result = doca_dpa_thread_start(dpa_thread->threads[i]);
+		if (result != DOCA_SUCCESS) {
+			DOCA_LOG_ERR("Failed to start DPA thread %u: %s",
+				     i, doca_error_get_descr(result));
+			return result;
+		}
+
+		if (i != DMESH_DPA_THREAD_MSG) {
+			result = dmesh_doca_dpa_notification_create(dpa_thread, i);
+			if (result != DOCA_SUCCESS)
+				return result;
+		}
+	}
+
+	dpa_thread->thread = dpa_thread->threads[DMESH_DPA_THREAD_MAIN];
+
+	return DOCA_SUCCESS;
 }
 
 doca_error_t
@@ -565,7 +698,9 @@ dmesh_doca_dpa_comch_create(struct objects *objs)
         return result;
         }
         
-    result = doca_comch_consumer_completion_set_dpa_thread(comch->consumer_comp, dpa_thread->thread);
+    result = doca_comch_consumer_completion_set_dpa_thread(
+	    comch->consumer_comp,
+	    dpa_thread->threads[DMESH_DPA_THREAD_MSG]);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to set dpa thread - %s",
             doca_error_get_name(result));
@@ -585,7 +720,13 @@ dmesh_doca_dpa_comch_create(struct objects *objs)
                 doca_error_get_name(result));
         return result;
     }
-    result = doca_dpa_completion_set_thread(comch->producer_comp, dpa_thread->thread);
+    /*
+     * One producer completion is currently shared by main and serializer
+     * DPA threads. DOCA producer ownership for cross-thread posts should be
+     * revalidated before adding multiple producer completions.
+     */
+    result = doca_dpa_completion_set_thread(comch->producer_comp,
+					    dpa_thread->threads[DMESH_DPA_THREAD_MSG]);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to set dpa thread to producer completion - %s",
                 doca_error_get_name(result));
@@ -619,6 +760,8 @@ dmesh_fill_dpa_thread_arg(struct objects *objs, struct dpa_thread_arg *arg)
 #ifdef DOCA_ARCH_DPU
     doca_dpa_dev_buf_arr_t dpa_buf_arr;
     doca_dpa_dev_buf_arr_t dpa_consumer_state_buf_arr;
+    doca_dpa_dev_buf_arr_t dpa_host_mmap_buf_arr;
+    doca_dpa_dev_buf_arr_t dpa_dpu_mmap_buf_arr;
     doca_dpa_dev_mmap_t dpu_mmap, host_mmap;
 #endif
 
@@ -666,6 +809,20 @@ dmesh_fill_dpa_thread_arg(struct objects *objs, struct dpa_thread_arg *arg)
         return result;
     }
 
+    result = doca_buf_arr_get_dpa_handle(objs->host_mmap_buf_arr, &dpa_host_mmap_buf_arr);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to get host mmap buf array DPA handle: %s",
+                doca_error_get_name(result));
+        return result;
+    }
+
+    result = doca_buf_arr_get_dpa_handle(objs->dpu_mmap_buf_arr, &dpa_dpu_mmap_buf_arr);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to get DPU mmap buf array DPA handle: %s",
+                doca_error_get_name(result));
+        return result;
+    }
+
     result = doca_mmap_dev_get_dpa_handle(objs->local_mmap, objs->dev, &dpu_mmap);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to get mmap DPA handle: %s",
@@ -682,11 +839,11 @@ dmesh_fill_dpa_thread_arg(struct objects *objs, struct dpa_thread_arg *arg)
 
 #endif
 
-    *arg = (struct dpa_thread_arg) {
-        .dpa_consumer_comp = dpa_consumer_comp,
-        .dpa_producer_comp = dpa_producer_comp,
-        .dpa_consumer = dpa_consumer,
-        .dpa_producer = dpa_producer,
+	    *arg = (struct dpa_thread_arg) {
+	        .dpa_consumer_comp = dpa_consumer_comp,
+	        .dpa_producer_comp = dpa_producer_comp,
+	        .dpa_consumer = dpa_consumer,
+	        .dpa_producer = dpa_producer,
 #ifdef DOCA_ARCH_DPU
         .dpa_buf_arr = dpa_buf_arr,
         .dpa_consumer_state_buf_arr = dpa_consumer_state_buf_arr,
@@ -694,10 +851,22 @@ dmesh_fill_dpa_thread_arg(struct objects *objs, struct dpa_thread_arg *arg)
         .host_mmap = host_mmap,
         .dpu_mmap = dpu_mmap,
         .src_addr = objs->dma_buffer,
-        .buf_size = 1024 * 1024,
+        .buf_size = BUFFER_SIZE,
         .pos = 0,
-#endif
-    };
+        .dpa_host_mmap_buf_arr = dpa_host_mmap_buf_arr,
+        .dpa_dpu_mmap_buf_arr = dpa_dpu_mmap_buf_arr,
+        .host_base_addr = (uint64_t)objs->remote_addr,
+	        .dpu_base_addr = (uint64_t)objs->dma_buffer,
+	        .host_buf_size = (uint32_t)objs->remote_buf_size,
+		#endif
+			.pipeline_state = objs->dpa_thread->shared_state,
+			.main_notify = objs->dpa_thread->notify_handles[DMESH_DPA_THREAD_MAIN],
+		    };
+
+	for (uint32_t i = 0; i < DMESH_GRPC_SERIALIZER_THREADS; ++i) {
+		arg->serializer_notify[i] =
+			objs->dpa_thread->notify_handles[DMESH_DPA_THREAD_SERIALIZER_BASE + i];
+	}
 
     DOCA_LOG_INFO("dpa_consumer_comp: 0x%lx, dpa_producer_comp: 0x%lx, dpa_consumer: 0x%lx, dpa_producer: 0x%lx",
         arg->dpa_consumer_comp,
@@ -715,8 +884,10 @@ dmesh_fill_dpa_thread_arg(struct objects *objs, struct dpa_thread_arg *arg)
 doca_error_t
 dmesh_doca_run_dpa_thread(struct objects *objs, struct dmesh_doca_dpa_thread *dpa_thread, struct dmesh_doca_dpa_comch *comch)
 {
-    doca_error_t result;
-    struct dpa_thread_arg arg;
+	doca_error_t result;
+	struct dpa_thread_arg arg;
+	struct dpa_thread_arg thread_args[DMESH_DPA_THREAD_COUNT];
+	uint32_t i;
 
     result = dmesh_fill_dpa_thread_arg(objs, &arg);
     if (result != DOCA_SUCCESS) {
@@ -725,41 +896,54 @@ dmesh_doca_run_dpa_thread(struct objects *objs, struct dmesh_doca_dpa_thread *dp
         return result;
     }
 
-    uint64_t rpc_ret;
-    uint32_t num_msg = CC_DPA_MAX_MSG_NUM;
-    result = doca_dpa_rpc(dpa_thread->dpa, 
-                        thread_init_rpc,
-                        &rpc_ret,
-                        arg.dpa_consumer,
-                        num_msg);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to issue init thread RPC - %s",
-            doca_error_get_name(result));
-        return result;
-    }
+	uint64_t rpc_ret;
+	uint32_t num_msg = CC_DPA_MAX_MSG_NUM;
 
-    if (rpc_ret != 0) {
-        DOCA_LOG_ERR("Failed to init thread RPC");
-        return result;
-    }
-    DOCA_LOG_INFO("thread_init_rpc completed successfully");
+	for (i = 0; i < DMESH_DPA_THREAD_COUNT; ++i) {
+		thread_args[i] = arg;
+		thread_args[i].thread_index = i;
+		if (i >= DMESH_DPA_THREAD_SERIALIZER_BASE)
+			thread_args[i].serializer_index = i - DMESH_DPA_THREAD_SERIALIZER_BASE;
+		else
+			thread_args[i].serializer_index = UINT32_MAX;
+	}
 
-    result = doca_dpa_h2d_memcpy(dpa_thread->dpa, dpa_thread->arg, 
-                                &arg, sizeof(struct dpa_thread_arg));
-    if (result != DOCA_SUCCESS) {
+	result = doca_dpa_h2d_memcpy(dpa_thread->dpa, dpa_thread->arg,
+				     thread_args, sizeof(thread_args));
+	if (result != DOCA_SUCCESS) {
 			DOCA_LOG_ERR("Failed to update DPA thread argument - %s",
 				     doca_error_get_name(result));
 			return result;
 		}
-    DOCA_LOG_INFO("Copied DPA thread argument successfully");
+	DOCA_LOG_INFO("Copied DPA thread arguments successfully");
 
-    result = doca_dpa_thread_run(dpa_thread->thread);
+	for (i = 0; i < DMESH_DPA_THREAD_COUNT; ++i) {
+		result = doca_dpa_thread_run(dpa_thread->threads[i]);
 		if (result != DOCA_SUCCESS) {
-			DOCA_LOG_ERR("Failed to run DPA thread - %s",
-				     doca_error_get_name(result));
+			DOCA_LOG_ERR("Failed to run DPA thread %u - %s",
+				     i, doca_error_get_name(result));
 			return result;
-		}             
-    DOCA_LOG_INFO("doca_dpa_thread_run returned successfully");
+		}
+	}
+	DOCA_LOG_INFO("doca_dpa_thread_run returned successfully");
+
+	result = doca_dpa_rpc(dpa_thread->dpa,
+			      thread_init_rpc,
+			      &rpc_ret,
+			      arg.dpa_consumer,
+			      num_msg,
+			      arg.main_notify);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Failed to issue init thread RPC - %s",
+			     doca_error_get_name(result));
+		return result;
+	}
+
+	if (rpc_ret != 0) {
+		DOCA_LOG_ERR("Failed to init thread RPC");
+		return result;
+	}
+	DOCA_LOG_INFO("thread_init_rpc completed successfully");
 
     return DOCA_SUCCESS;
 }
@@ -897,4 +1081,18 @@ setup_dpa_consumer_state_buf_array(struct objects *objs, struct doca_mmap *mmap)
 {
     return setup_dpa_buf_array_common(objs, &objs->consumer_state_buf_arr, 1, mmap,
                                       sizeof(struct dma_ring_consumer_state), 0);
+}
+
+doca_error_t
+setup_dpa_host_mmap_buf_array(struct objects *objs, struct doca_mmap *mmap, size_t mmap_size)
+{
+    return setup_dpa_buf_array_common(objs, &objs->host_mmap_buf_arr, 1, mmap,
+                                      mmap_size, 0);
+}
+
+doca_error_t
+setup_dpa_dpu_mmap_buf_array(struct objects *objs, struct doca_mmap *mmap, size_t mmap_size)
+{
+    return setup_dpa_buf_array_common(objs, &objs->dpu_mmap_buf_arr, 1, mmap,
+                                      mmap_size, 0);
 }

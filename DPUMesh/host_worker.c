@@ -11,12 +11,13 @@
 #include "dpa.h"
 #include "dpa_common.h"
 #include "ring.h"
+#include "grpc_offload.h"
 
 #include <doca_log.h>
 #include <doca_buf_array.h>
 #include <doca_dpa.h>
 
-#define BUFFER_SIZE (1024 * 1024)
+#include <stdio.h>
 
 DOCA_LOG_REGISTER(HOST_WORKER);
 
@@ -110,53 +111,90 @@ run_host_worker(struct objects *objs)
     //     goto argp _cleanup;
     // }
 
-    int pos = 0;
-    uint64_t producer_seq = 0;
-    struct dma_desc *desc;
-    doca_dpa_dev_mmap_t local_mmap;
-    doca_mmap_dev_get_dpa_handle(objs->local_mmap, objs->dev, &local_mmap);
-    const int msg_size = 8192;
-    int aligned_msg_size = DMA_ALIGN_UP(msg_size);
+    struct dmesh_grpc_arena app_arena = {0};
+    uint32_t request_id = 1;
 
     DOCA_LOG_INFO("consumer state magic: 0x%lx\n", objs->dma_ring->consumer_state->consumer_seq);
+    result = dmesh_grpc_arena_init(&app_arena, objs->dma_buffer, BUFFER_SIZE);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to initialize gRPC arena: %s", doca_error_get_descr(result));
+        goto argp_cleanup;
+    }
+    objs->grpc_offload = &app_arena;
+    
+    int pe_progress;
+    while ((pe_progress = doca_pe_progress(objs->pe)) > 0) {
+        /* drain completions / keep host side progressing */
+        DOCA_LOG_INFO("Made progress on PE: %d\n", pe_progress);
+    }
 
     while (true) {
-        int pe_progress;
-        while ((pe_progress = doca_pe_progress(objs->pe)) > 0) {
+        struct dmesh_grpc_hello_request *req = NULL;
+        char name[64];
+        uint32_t scores[4];
+        int name_len;
+
+        // while (!dma_ring_has_free_slot(objs->dma_ring)) {
+        //     dma_ring_refresh_consumer(objs->dma_ring);
+        //     // doca_pe_progress(objs->pe);
+        // }
+
+        while (doca_pe_progress(objs->pe)) {
             /* drain completions / keep host side progressing */
-            DOCA_LOG_INFO("Made progress on PE: %d\n", pe_progress);
         }
+        dma_ring_refresh_consumer(objs->dma_ring);
+        dmesh_grpc_arena_reclaim_through(&app_arena,
+                                            objs->dma_ring->observed_consumer_seq);
 
-        while (!dma_ring_has_free_slot(objs->dma_ring)) {
+        name_len = snprintf(name, sizeof(name), "hello-dpumesh-%u", request_id);
+        if (name_len < 0)
+            goto argp_cleanup;
+        if ((size_t)name_len >= sizeof(name))
+            name_len = (int)sizeof(name) - 1;
+
+        scores[0] = request_id;
+        scores[1] = request_id + 1U;
+        scores[2] = request_id + 2U;
+        scores[3] = request_id + 3U;
+
+        result = dmesh_grpc_hello_request_alloc(&app_arena,
+                                                request_id,
+                                                name,
+                                                (uint32_t)name_len,
+                                                scores,
+                                                4,
+                                                &req);
+        if (result == DOCA_ERROR_NO_MEMORY) {
             dma_ring_refresh_consumer(objs->dma_ring);
-            // DOCA_LOG_INFO("No free slot in DMA ring, observed consumer_seq: %lu, producer_seq: %lu\n",
-                // objs->dma_ring->observed_consumer_seq, objs->dma_ring->producer_seq);
+            dmesh_grpc_arena_reclaim_through(&app_arena,
+                                                objs->dma_ring->observed_consumer_seq);
+            (void)doca_pe_progress(objs->producer_pe);
+            continue;
+        }
+        if (result != DOCA_SUCCESS)
+            goto argp_cleanup;
+
+        result = dmesh_grpc_submit_request(objs,
+                                            DMESH_GRPC_SCHEMA_HELLO_REQUEST,
+                                            &app_arena,
+                                            req,
+                                            sizeof(*req),
+                                            request_id);
+        if (result != DOCA_SUCCESS) {
+            DOCA_LOG_ERR("Failed to submit gRPC request descriptor: %s",
+                         doca_error_get_descr(result));
+            goto argp_cleanup;
         }
 
-        if (pos + aligned_msg_size > BUFFER_SIZE) {
-            pos = 0;
-        }
-
-        producer_seq = objs->dma_ring->producer_seq;
-        desc = get_dma_desc_for_seq(objs->dma_ring, producer_seq);
-        desc->mmap = local_mmap;
-        desc->addr = (uint64_t)objs->dma_buffer + pos;
-        desc->size = aligned_msg_size;
-
-        /*
-         * Host owns descriptor writes. seq is the only per-desc publish marker;
-         * DPA consumes it with acquire ordering and never writes this cacheline.
-         */
-        // __atomic_store_n(&desc->seq, producer_seq + 1, __ATOMIC_RELEASE);
-        desc->seq = producer_seq + 1;
-
-        pos += aligned_msg_size;
-        objs->dma_ring->producer_seq = producer_seq + 1;
+        request_id++;
     }
 
     DOCA_LOG_INFO("Finished Host worker");
 
 argp_cleanup:
+    if (objs != NULL && objs->grpc_offload == &app_arena)
+        objs->grpc_offload = NULL;
+    dmesh_grpc_arena_destroy(&app_arena);
     clean_argp();
 // exit: 
     return;

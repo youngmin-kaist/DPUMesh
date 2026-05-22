@@ -5,8 +5,11 @@
 #include <doca_ctx.h>
 #include <doca_pe.h>
 #include <doca_buf_array.h>
+#include <stddef.h>
 // #include <doca_dpa_dev.h>
 // #include <doca_dpa_dev_comch_msgq.h>
+
+#include "dpa_common.h"
 
 #define CC_DPA_MAX_MSG_NUM  512
 
@@ -14,11 +17,16 @@ struct objects;
 
 /* DOCA DPA thread related objects */
 struct dmesh_doca_dpa_thread {
-    struct doca_dpa *dpa;           /* DOCA DPA */
-    struct doca_dpa_thread *thread; /* DPA thread */
-    doca_dpa_dev_uintptr_t arg;     /* argument to be used by DPA thread */
-    doca_dpa_dev_uintptr_t buf;     /* buffer to be used by DPA thread */
-	doca_dpa_dev_buf_arr_t dpa_buf_arr; /* DPA buffer array */
+	    struct doca_dpa *dpa;           /* DOCA DPA */
+	    struct doca_dpa_thread *thread; /* Main DPA thread, kept for legacy call sites */
+	    struct doca_dpa_thread *threads[DMESH_DPA_THREAD_COUNT];
+	    struct doca_dpa_eu_affinity *affinities[DMESH_DPA_THREAD_COUNT];
+	    struct doca_dpa_notification_completion *notify_comps[DMESH_DPA_THREAD_COUNT];
+	    doca_dpa_dev_notification_completion_t notify_handles[DMESH_DPA_THREAD_COUNT];
+	    doca_dpa_dev_uintptr_t arg;     /* first element of dpa_thread_arg[] */
+	    doca_dpa_dev_uintptr_t shared_state;
+	    doca_dpa_dev_uintptr_t buf;     /* buffer to be used by DPA thread */
+		doca_dpa_dev_buf_arr_t dpa_buf_arr; /* DPA buffer array */
 };
 
 struct dmesh_doca_dpa_msgq {
@@ -94,4 +102,8 @@ doca_error_t
 setup_dpa_buf_array(struct objects *objs, size_t num_elem, struct doca_mmap *mmap);					
 doca_error_t
 setup_dpa_consumer_state_buf_array(struct objects *objs, struct doca_mmap *mmap);
+doca_error_t
+setup_dpa_host_mmap_buf_array(struct objects *objs, struct doca_mmap *mmap, size_t mmap_size);
+doca_error_t
+setup_dpa_dpu_mmap_buf_array(struct objects *objs, struct doca_mmap *mmap, size_t mmap_size);
 #endif

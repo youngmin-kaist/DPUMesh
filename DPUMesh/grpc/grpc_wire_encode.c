@@ -31,28 +31,6 @@ static inline uint8_t *put_varint_checked(uint8_t *out, const uint8_t *end, uint
     return out;
 }
 
-static inline uint32_t measure_varint_u32(uint32_t v)
-{
-    uint32_t n = 1U;
-
-    while (v >= 0x80U) {
-        v >>= 7U;
-        ++n;
-    }
-    return n;
-}
-
-static inline uint32_t measure_varint_u64(uint64_t v)
-{
-    uint32_t n = 1U;
-
-    while (v >= 0x80U) {
-        v >>= 7U;
-        ++n;
-    }
-    return n;
-}
-
 static inline uint64_t make_tag(uint32_t field_no, uint8_t wire_type)
 {
     return (((uint64_t)field_no) << 3) | wire_type;
@@ -132,8 +110,8 @@ static uint8_t *emit_hello_request_specialized(const uint8_t *base,
     const HelloRequestFlat *flat = (const HelloRequestFlat *)base;
     const DpaStringRef *name = &flat->name;
     const DpaU32ArrayRef *scores = &flat->scores;
-    uint8_t *name_ptr;
-    uint32_t *score_ptr;
+    const uint8_t *name_ptr;
+    const uint32_t *score_ptr;
     uint8_t *len_pos;
     uint8_t *payload_start;
     uint32_t i;
@@ -161,7 +139,7 @@ static uint8_t *emit_hello_request_specialized(const uint8_t *base,
         for (i = 0; i < name->len; ++i) {
             if (out >= end)
                 return NULL;
-            *(out++) = name_ptr++;
+            *(out++) = *(name_ptr++);
         }
     }
 
@@ -445,8 +423,8 @@ int grpc_wire_serialize_one(const ProtoDescBlob *blob,
         goto error;
     }
 
-    flat_base = task->dpa_msg_addr;
-    out_base = task->dpa_out_addr;
+    flat_base = (const uint8_t *)(uintptr_t)task->dpa_msg_addr;
+    out_base = (uint8_t *)(uintptr_t)task->dpa_out_addr;
     cap_end = out_base + task->dpa_out_cap;
 
     out_end = emit_message_dispatch(blob, desc, flat_base, out_base + 5U, cap_end, stats);

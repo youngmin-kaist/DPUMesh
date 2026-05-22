@@ -7,6 +7,7 @@
 #include "config.h"
 #include "comch_msgq.h"
 #include "ring.h"
+#include "dpa_common.h"
 
 #include <doca_log.h>
 #include <doca_dev.h>
@@ -16,8 +17,6 @@
 #include <time.h>
 
 DOCA_LOG_REGISTER(DPU_WORKER);
-
-#define BUFFER_SIZE 1024 * 1024
 
 void
 run_dpu_worker(struct objects *objs)
@@ -103,6 +102,18 @@ run_dpu_worker(struct objects *objs)
         doca_pe_progress(objs->pe);
     }
 
+    result = setup_dpa_host_mmap_buf_array(objs, objs->remote_mmap, objs->remote_buf_size);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to setup DPA host mmap buffer array: %s", doca_error_get_descr(result));
+        goto argp_cleanup;
+    }
+
+    result = setup_dpa_dpu_mmap_buf_array(objs, objs->local_mmap, BUFFER_SIZE);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to setup DPA DPU private mmap buffer array: %s", doca_error_get_descr(result));
+        goto argp_cleanup;
+    }
+
     /* run DPA thread */
     result = dmesh_doca_run_dpa_thread(objs, objs->dpa_thread, objs->dpa_comch);
     if (result != DOCA_SUCCESS) {
@@ -110,12 +121,12 @@ run_dpu_worker(struct objects *objs)
         goto argp_cleanup;
     }
 
-    result = send_dma_request_to_dpa(objs);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to send DMA request to DPA: %s", doca_error_get_descr(result));
-        cleanup_objects(objs);
-        goto argp_cleanup;
-    }
+    // result = send_dma_request_to_dpa(objs);
+    // if (result != DOCA_SUCCESS) {
+    //     DOCA_LOG_ERR("Failed to send DMA request to DPA: %s", doca_error_get_descr(result));
+    //     cleanup_objects(objs);
+    //     goto argp_cleanup;
+    // }
 
     // while (objs->remote_mmap == NULL) {
     //     doca_pe_progress(objs->pe);
