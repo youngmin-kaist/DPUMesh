@@ -75,7 +75,6 @@ static uint64_t align_up_u64(uint64_t value, uint64_t align)
  * use stack metadata. Make this table per-thread before running multiple DMA
  * managers in one DPA process.
  */
-static struct comch_grpc_dma_comp_msg grpc_dma_comp_imm[DMESH_GRPC_MAX_PENDING];
 static struct comch_grpc_serialize_comp_msg grpc_serialize_comp_imm[DMESH_GRPC_MAX_PENDING];
 
 static const ProtoSchemaBlob grpc_schema_blob = {
@@ -120,7 +119,8 @@ get_dev_ptr(doca_dpa_dev_buf_arr_t buf_arr, uint32_t index)
     return doca_dpa_dev_buf_get_external_ptr(buf);
 }
 
-static doca_dpa_dev_uintptr_t dpa_mmap_ptr(doca_dpa_dev_buf_arr_t buf_arr,
+static doca_dpa_dev_uintptr_t 
+dpa_mmap_ptr(doca_dpa_dev_buf_arr_t buf_arr,
                              uint64_t base_addr,
                              uint32_t buf_size,
                              uint64_t addr,
@@ -136,7 +136,8 @@ static doca_dpa_dev_uintptr_t dpa_mmap_ptr(doca_dpa_dev_buf_arr_t buf_arr,
     return get_dev_ptr(buf_arr, 0) + offset;
 }
 
-static doca_dpa_dev_uintptr_t dpa_host_ptr(struct dpa_thread_arg *thread_arg, uint64_t addr, uint64_t size)
+static doca_dpa_dev_uintptr_t 
+dpa_host_ptr(struct dpa_thread_arg *thread_arg, uint64_t addr, uint64_t size)
 {
     return dpa_mmap_ptr(thread_arg->dpa_host_mmap_buf_arr,
                         thread_arg->host_base_addr,
@@ -145,7 +146,8 @@ static doca_dpa_dev_uintptr_t dpa_host_ptr(struct dpa_thread_arg *thread_arg, ui
                         size);
 }
 
-static doca_dpa_dev_uintptr_t dpa_dpu_ptr(struct dpa_thread_arg *thread_arg, uint64_t addr, uint64_t size)
+static doca_dpa_dev_uintptr_t 
+dpa_dpu_ptr(struct dpa_thread_arg *thread_arg, uint64_t addr, uint64_t size)
 {
     return dpa_mmap_ptr(thread_arg->dpa_dpu_mmap_buf_arr,
                         thread_arg->dpu_base_addr,
@@ -154,9 +156,84 @@ static doca_dpa_dev_uintptr_t dpa_dpu_ptr(struct dpa_thread_arg *thread_arg, uin
                         size);
 }
 
-static struct dpa_grpc_pipeline_state *grpc_pipeline_state(struct dpa_thread_arg *thread_arg)
+static inline struct dpa_grpc_pipeline_state 
+*grpc_pipeline_state(struct dpa_thread_arg *thread_arg)
 {
     return (struct dpa_grpc_pipeline_state *)(uintptr_t)thread_arg->pipeline_state;
+}
+
+struct grpc_desc_timing {
+    uint64_t retire_cycles;
+    uint64_t retire_posts;
+    uint64_t publish_consumer_cycles;
+    uint64_t publish_consumer_calls;
+    uint64_t active_check_cycles;
+    uint64_t desc_lookup_cycles;
+    uint64_t seq_check_cycles;
+    uint64_t active_publish_cycles;
+    uint64_t prepare_cycles;
+    uint64_t prepare_calls;
+    uint64_t idle_cycles;
+    uint64_t idle_calls;
+    uint64_t prepared_total;
+};
+
+static struct grpc_desc_timing grpc_desc_timing_total;
+
+static inline void
+grpc_desc_timing_add(uint64_t *counter, uint64_t value)
+{
+    *counter += value;
+}
+
+static void
+grpc_desc_timing_report(uint64_t next_desc_seq, uint64_t consumer_seq)
+{
+    static struct grpc_desc_timing last;
+    struct grpc_desc_timing cur = grpc_desc_timing_total;
+    uint64_t prepared_delta = cur.prepared_total - last.prepared_total;
+    uint64_t retire_delta = cur.retire_posts - last.retire_posts;
+    uint64_t prepare_delta = cur.prepare_calls - last.prepare_calls;
+    uint64_t idle_delta = cur.idle_calls - last.idle_calls;
+    uint64_t publish_delta = cur.publish_consumer_calls - last.publish_consumer_calls;
+
+    if (prepared_delta == 0U)
+        prepared_delta = 1U;
+    if (retire_delta == 0U)
+        retire_delta = 1U;
+    if (prepare_delta == 0U)
+        prepare_delta = 1U;
+    if (idle_delta == 0U)
+        idle_delta = 1U;
+    if (publish_delta == 0U)
+        publish_delta = 1U;
+
+    DOCA_DPA_DEV_LOG_INFO(
+        "gRPC desc timing delta: prepared=%lu retire_posts=%lu publish_calls=%lu idle_calls=%lu "
+        "retire_cycles=%lu retire_avg=%lu publish_cycles=%lu publish_avg=%lu "
+        "active_check=%lu desc_lookup=%lu seq_check=%lu active_publish=%lu "
+        "prepare_cycles=%lu prepare_avg=%lu idle_cycles=%lu idle_avg=%lu "
+        "next_seq=%lu consumer_seq=%lu\n",
+        cur.prepared_total - last.prepared_total,
+        cur.retire_posts - last.retire_posts,
+        cur.publish_consumer_calls - last.publish_consumer_calls,
+        cur.idle_calls - last.idle_calls,
+        cur.retire_cycles - last.retire_cycles,
+        (cur.retire_cycles - last.retire_cycles) / retire_delta,
+        cur.publish_consumer_cycles - last.publish_consumer_cycles,
+        (cur.publish_consumer_cycles - last.publish_consumer_cycles) / publish_delta,
+        cur.active_check_cycles - last.active_check_cycles,
+        cur.desc_lookup_cycles - last.desc_lookup_cycles,
+        cur.seq_check_cycles - last.seq_check_cycles,
+        cur.active_publish_cycles - last.active_publish_cycles,
+        cur.prepare_cycles - last.prepare_cycles,
+        (cur.prepare_cycles - last.prepare_cycles) / prepare_delta,
+        cur.idle_cycles - last.idle_cycles,
+        (cur.idle_cycles - last.idle_cycles) / idle_delta,
+        next_desc_seq,
+        consumer_seq);
+
+    last = cur;
 }
 
 #define DPA_PRODUCER_DRAIN_BUDGET 64U
@@ -173,17 +250,11 @@ drain_dpa_producer_completions(struct dpa_thread_arg *thread_arg,
 
     while (drained < budget &&
            doca_dpa_dev_get_completion(thread_arg->dpa_producer_comp, &comp) != 0) {
-        /*
-         * Optional diagnostics:
-         * doca_dpa_dev_completion_type_t type =
-         *     doca_dpa_dev_get_completion_type(comp);
-         */
         drained++;
     }
 
     if (drained != 0) {
         doca_dpa_dev_completion_ack(thread_arg->dpa_producer_comp, drained);
-        DOCA_DPA_DEV_LOG_INFO("Drained %u producer completions\n", drained);
     }
 
     return drained;
@@ -191,23 +262,28 @@ drain_dpa_producer_completions(struct dpa_thread_arg *thread_arg,
 
 static void wait_for_dpu_consumer(struct dpa_thread_arg *thread_arg)
 {
-    while (doca_dpa_dev_comch_producer_is_consumer_empty(
-               thread_arg->dpa_producer, /*consumer_id=*/1) == 1) {
+    for (;;) {
         drain_dpa_producer_completions(thread_arg, DPA_PRODUCER_DRAIN_BUDGET);
+
+        if (doca_dpa_dev_comch_producer_is_consumer_empty(
+            thread_arg->dpa_producer, /*consumer_id=*/1) == 0) {
+            break;
+        }
     }
 }
 
-static void post_dpu_imm(struct dpa_thread_arg *thread_arg, const uint8_t *msg, uint32_t msg_len)
+static void post_dpu_imm(struct dpa_thread_arg *thread_arg, 
+                        const uint8_t *msg, 
+                        uint32_t msg_len)
 {
-    drain_dpa_producer_completions(thread_arg, DPA_PRODUCER_DRAIN_BUDGET);
     wait_for_dpu_consumer(thread_arg);
 
     doca_dpa_dev_comch_producer_post_send_imm_only(thread_arg->dpa_producer,
                                                    /*consumer_id=*/1,
                                                    msg,
                                                    msg_len,
-                                                   DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS |
-                                                   DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
+                                                   DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH | DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS);
+
 }
 
 static void post_grpc_ready(struct dpa_thread_arg *thread_arg,
@@ -220,9 +296,9 @@ static void post_grpc_field_dma(struct dpa_thread_arg *thread_arg,
                                 uint64_t dst_addr,
                                 uint64_t src_addr,
                                 uint64_t len,
-                                const struct comch_grpc_dma_comp_msg *msg)
+                                const struct comch_grpc_dma_comp_msg *msg,
+                                enum doca_dpa_dev_submit_flag flags)
 {
-    drain_dpa_producer_completions(thread_arg, DPA_PRODUCER_DRAIN_BUDGET);
     wait_for_dpu_consumer(thread_arg);
 
     doca_dpa_dev_comch_producer_dma_copy(thread_arg->dpa_producer,
@@ -234,8 +310,7 @@ static void post_grpc_field_dma(struct dpa_thread_arg *thread_arg,
                                          len,
                                          (const uint8_t *)msg,
                                          sizeof(*msg),
-                                         DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS |
-                                         DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
+                                         flags);
 }
 
 static uint32_t grpc_serialize_task_cost(const struct comch_grpc_serialize_req_msg *req)
@@ -451,11 +526,11 @@ init_grpc_dma_comp_msg(struct comch_grpc_dma_comp_msg *comp_msg,
                        const struct grpc_req_desc *desc,
                        uint64_t ring_seq)
 {
+    comp_msg->type = COMCH_MSG_TYPE_GRPC_DMA_COMPLETED;
     comp_msg->request_id = desc->req_id;
     comp_msg->schema_id = desc->schema_id;
-    comp_msg->type = COMCH_MSG_TYPE_GRPC_DMA_COMPLETED;
+    comp_msg->expected_dma = 0;
     comp_msg->ring_seq = ring_seq;
-    comp_msg->reserved0 = 0;
     comp_msg->out_cap = DMESH_GRPC_MAX_ENCODED_SIZE;
 }
 
@@ -480,6 +555,7 @@ prepare_grpc_hello_request(struct dpa_thread_arg *thread_arg,
     uint32_t scores_count;
     uint32_t name_off = 0;
     uint32_t scores_off = 0;
+    enum doca_dpa_dev_submit_flag dma_flags;
 
     uint64_t flat_len = align_up_u64(sizeof(struct dmesh_grpc_hello_flat),
                     DMESH_GRPC_ARENA_ADDR_ALIGN);
@@ -504,7 +580,7 @@ prepare_grpc_hello_request(struct dpa_thread_arg *thread_arg,
     name_len = req->name_len;
     scores_addr = (uint64_t)req->scores;
     scores_count = req->scores_count;
-    scores_bytes = (uint64_t)scores_count * sizeof(uint32_t);
+    scores_bytes = (uint64_t)scores_count << 2; // u32
 
     if (name_len != 0U) {
         if ((name_addr & (DMESH_GRPC_ARENA_ADDR_ALIGN - 1U)) != 0 ||
@@ -533,9 +609,8 @@ prepare_grpc_hello_request(struct dpa_thread_arg *thread_arg,
 
     comp_msg->expected_dma = expected_dma;
     comp_msg->flat_addr = flat_addr;
-    comp_msg->flat_len = (uint32_t)flat_len;
     comp_msg->out_addr = out_addr;
-    comp_msg->status = 0;
+    comp_msg->flat_len = (uint32_t)flat_len;
 
     flat = (struct dmesh_grpc_hello_flat *)dpa_dpu_ptr(thread_arg, flat_addr, flat_len);
     if (flat == 0)
@@ -553,20 +628,27 @@ prepare_grpc_hello_request(struct dpa_thread_arg *thread_arg,
         return 1;
     }
 
+    dma_flags = DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS;
     if (name_len != 0U) {
+        if (expected_dma == 1U) {
+            dma_flags |= DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH;
+        }
         post_grpc_field_dma(thread_arg,
                             flat_addr + name_off,
                             name_addr,
                             name_dma_len,
-                            comp_msg);
+                            comp_msg,
+                            dma_flags); 
     }
 
     if (scores_bytes != 0U) {
+        dma_flags |= DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH;
         post_grpc_field_dma(thread_arg,
                             flat_addr + scores_off,
                             scores_addr,
                             scores_dma_len,
-                            comp_msg);
+                            comp_msg,
+                            dma_flags);
     }
 
     return 1;
@@ -581,6 +663,7 @@ static void poll_desc_ring_grpc(struct dpa_thread_arg *thread_arg)
 	struct dpa_grpc_pipeline_state *state = grpc_pipeline_state(thread_arg);
 	uint64_t consumer_seq = 0;
 	uint64_t next_desc_seq = 1;
+	uint64_t next_timing_report_seq = DEBUG_INTERVAL;
 	uint32_t ring_size = thread_arg->buf_arr_size;
 
 	if (state == 0)
@@ -600,26 +683,44 @@ static void poll_desc_ring_grpc(struct dpa_thread_arg *thread_arg)
 	while (1) {
 	    uint32_t prepared = 0;
 	    uint8_t publish_consumer = 0;
+        struct comch_grpc_dma_comp_msg dma_comp_msg;
 
 	    while (next_desc_seq - 1 > consumer_seq) {
+            uint64_t t0 = __dpa_thread_time();
 	        uint32_t done_idx = (uint32_t)(consumer_seq % ring_size);
-	        uint8_t active = __atomic_load_n(&state->active[done_idx], __ATOMIC_ACQUIRE);
-	        uint8_t completed = __atomic_load_n(&state->completed[done_idx], __ATOMIC_ACQUIRE);
+            uint8_t active;
+            uint8_t completed;
             const struct comch_grpc_serialize_comp_msg *comp_msg;
+
+	        active = __atomic_load_n(&state->active[done_idx], __ATOMIC_ACQUIRE);
+	        completed = __atomic_load_n(&state->completed[done_idx], __ATOMIC_ACQUIRE);
+            grpc_desc_timing_add(&grpc_desc_timing_total.active_check_cycles,
+                                 __dpa_thread_time() - t0);
 
 	        if (active == 0 || completed == 0)
 	            break;
 
             comp_msg = &grpc_serialize_comp_imm[done_idx];
+            t0 = __dpa_thread_time();
             post_dpu_imm(thread_arg, (const uint8_t *)comp_msg, sizeof(*comp_msg));
+            grpc_desc_timing_add(&grpc_desc_timing_total.retire_cycles,
+                                 __dpa_thread_time() - t0);
+            grpc_desc_timing_total.retire_posts++;
 
+            t0 = __dpa_thread_time();
 	        __atomic_store_n(&state->active[done_idx], 0U, __ATOMIC_RELEASE);
 	        __atomic_store_n(&state->completed[done_idx], 0U, __ATOMIC_RELEASE);
+            grpc_desc_timing_add(&grpc_desc_timing_total.active_publish_cycles,
+                                 __dpa_thread_time() - t0);
 	        consumer_seq++;
 	        publish_consumer = 1;
 	    }
         if (publish_consumer) {
+            uint64_t t0 = __dpa_thread_time();
             publish_consumer_seq(thread_arg, consumer_seq);
+            grpc_desc_timing_add(&grpc_desc_timing_total.publish_consumer_cycles,
+                                 __dpa_thread_time() - t0);
+            grpc_desc_timing_total.publish_consumer_calls++;
         }
 
 
@@ -627,18 +728,30 @@ static void poll_desc_ring_grpc(struct dpa_thread_arg *thread_arg)
                prepared < DMA_COMPLETION_BATCH_SIZE) {
             uint32_t desc_idx = (uint32_t)((next_desc_seq - 1U) % ring_size);
             int prep_result;
+            uint64_t t0;
 
+            t0 = __dpa_thread_time();
             if (__atomic_load_n(&state->active[desc_idx], __ATOMIC_ACQUIRE) != 0)
                 break;
+            grpc_desc_timing_add(&grpc_desc_timing_total.active_check_cycles,
+                                 __dpa_thread_time() - t0);
 
+            t0 = __dpa_thread_time();
             desc = (struct grpc_req_desc *)get_dev_ptr(thread_arg->dpa_buf_arr, desc_idx);
+            grpc_desc_timing_add(&grpc_desc_timing_total.desc_lookup_cycles,
+                                 __dpa_thread_time() - t0);
+            t0 = __dpa_thread_time();
             if (desc->seq != next_desc_seq) {
                 /*
                 * Host descriptor publish is pure shared-memory polling; no
                 * completion wakes this path when the ring is empty.
                 */
+               grpc_desc_timing_add(&grpc_desc_timing_total.seq_check_cycles,
+                                    __dpa_thread_time() - t0);
                break;
             }
+            grpc_desc_timing_add(&grpc_desc_timing_total.seq_check_cycles,
+                                 __dpa_thread_time() - t0);
 
             if (next_desc_seq <= 8U || (next_desc_seq % DEBUG_INTERVAL) == 0U) {
                 DOCA_DPA_DEV_LOG_INFO("gRPC desc seen: seq=%lu idx=%u schema=%u req=%u addr=0x%lx size=%lu\n",
@@ -646,8 +759,10 @@ static void poll_desc_ring_grpc(struct dpa_thread_arg *thread_arg)
                                       desc->req_id, desc->addr, desc->size);
             }
 
+            t0 = __dpa_thread_time();
             __atomic_store_n(&state->active[desc_idx], 1U, __ATOMIC_RELEASE);
-            __atomic_store_n(&state->completed[desc_idx], 0U, __ATOMIC_RELEASE);
+            grpc_desc_timing_add(&grpc_desc_timing_total.active_publish_cycles,
+                                 __dpa_thread_time() - t0);
 
             /*
              * Descriptor ownership remains with DPA until serialization finishes.
@@ -655,25 +770,28 @@ static void poll_desc_ring_grpc(struct dpa_thread_arg *thread_arg)
              * consumer_seq advances only when this sequence is completed.
              */
             if (desc->schema_id <= grpc_schema_blob.msg_count) {
-                init_grpc_dma_comp_msg(&grpc_dma_comp_imm[desc_idx],
-                                       desc, next_desc_seq);
+                init_grpc_dma_comp_msg(&dma_comp_msg, desc, next_desc_seq);
+
+                t0 = __dpa_thread_time();
                 prep_result = prepare_grpc_hello_request(thread_arg, desc,
-                                                            desc_idx, &grpc_dma_comp_imm[desc_idx]);
-                
+                                                            desc_idx, &dma_comp_msg);
+                grpc_desc_timing_add(&grpc_desc_timing_total.prepare_cycles,
+                                     __dpa_thread_time() - t0);
+                grpc_desc_timing_total.prepare_calls++;
             }
             else
                 prep_result = -1;
 
             if (next_desc_seq <= 8U || (next_desc_seq % DEBUG_INTERVAL) == 0U) {
-                DOCA_DPA_DEV_LOG_INFO("gRPC prepare result: result=%d next_desc_seq=%lu ring_seq=%lu "
+                DOCA_DPA_DEV_LOG_INFO("gRPC prepare result: result=%d next_desc_seq=%lu consumer_seq=%lu ring_seq=%lu "
                                         "schema=%u req=%u expected_dma=%u flat=0x%lx out=0x%lx\n",
-                                        prep_result, next_desc_seq,                 
-                                        grpc_dma_comp_imm[desc_idx].ring_seq, 
-                                        grpc_dma_comp_imm[desc_idx].schema_id,
-                                        grpc_dma_comp_imm[desc_idx].request_id,
-                                        grpc_dma_comp_imm[desc_idx].expected_dma,
-                                        grpc_dma_comp_imm[desc_idx].flat_addr,
-                                        grpc_dma_comp_imm[desc_idx].out_addr);
+                                        prep_result, next_desc_seq, consumer_seq,             
+                                        dma_comp_msg.ring_seq, 
+                                        dma_comp_msg.schema_id,
+                                        dma_comp_msg.request_id,
+                                        dma_comp_msg.expected_dma,
+                                        dma_comp_msg.flat_addr,
+                                        dma_comp_msg.out_addr);
             }
 
             if (prep_result <= 0) {
@@ -683,10 +801,20 @@ static void poll_desc_ring_grpc(struct dpa_thread_arg *thread_arg)
 
             next_desc_seq++;
             prepared++;
+            grpc_desc_timing_total.prepared_total++;
+
+            if (next_desc_seq >= next_timing_report_seq) {
+                grpc_desc_timing_report(next_desc_seq, consumer_seq);
+                next_timing_report_seq += DEBUG_INTERVAL;
+            }
         }
 
         if (prepared == 0) {
+            uint64_t t0 = __dpa_thread_time();
             __dpa_thread_window_read_inv();
+            grpc_desc_timing_add(&grpc_desc_timing_total.idle_cycles,
+                                 __dpa_thread_time() - t0);
+            grpc_desc_timing_total.idle_calls++;
         }
 	}
 }
@@ -727,9 +855,9 @@ static void complete_grpc_serialize_task(struct dpa_thread_arg *thread_arg,
 
         proto_task.schema_id = task->schema_id;
         proto_task.request_id = task->request_id;
-        proto_task.dpa_msg_addr = flat;
-        proto_task.dpa_out_addr = out;
-        proto_task.dpa_out_cap = task->out_cap;
+        proto_task.flat = flat;
+        proto_task.out = out;
+        proto_task.out_cap = task->out_cap;
 
         if (reverse) {
             result = grpc_wire_serialize_one_reverse(&grpc_schema_blob, &proto_task, &proto_cpl, NULL);
@@ -759,10 +887,11 @@ static void complete_grpc_serialize_task(struct dpa_thread_arg *thread_arg,
     comp_msg->schema_id = task->schema_id;
     comp_msg->status = status;
     comp_msg->ring_seq = task->ring_seq;
+    comp_msg->reserved0 = 0;
     comp_msg->out_addr = task->out_addr + out_offset; // the start of the encoded message 
     comp_msg->encoded_len = encoded_len;
-    comp_msg->reserved0 = 0;
-
+    comp_msg->reserved1 = 0;
+    
     uint32_t done_idx = (uint32_t)((task->ring_seq - 1U) % thread_arg->buf_arr_size);
     __atomic_store_n(&state->completed[done_idx], 1U, __ATOMIC_RELEASE);
 

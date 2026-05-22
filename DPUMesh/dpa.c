@@ -86,8 +86,6 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
     
     doca_error_t result;
     uint32_t data_len;
-    const uint8_t *imm_data;
-    enum comch_msg_type msg_type;
     struct comch_msg *msg;
 
 	struct objects *objs = ctx_user_data.ptr;
@@ -108,9 +106,9 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
             struct comch_grpc_dma_comp_msg *comp_msg = (struct comch_grpc_dma_comp_msg *)msg;
 
             // if (comp_msg->ring_seq <= 8U || (comp_msg->ring_seq % 64U) == 0U) {
-            //     DOCA_LOG_INFO("gRPC DMA completion received: req=%u seq=%lu status=%u expected_dma=%u flat=0x%lx out=0x%lx",
+            //     DOCA_LOG_INFO("gRPC DMA completion received: req=%u seq=%lu expected_dma=%u flat=0x%lx out=0x%lx",
             //                     comp_msg->request_id, comp_msg->ring_seq,
-            //                     comp_msg->status, comp_msg->expected_dma,
+            //                     comp_msg->expected_dma,
             //                     comp_msg->flat_addr, comp_msg->out_addr);
             // }
 
@@ -134,7 +132,7 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
             break;
         }
         default:
-            DOCA_LOG_ERR("Received unknown message type: %u", msg_type);
+            DOCA_LOG_ERR("Received unknown message type: %u", msg->type);
             break;
     }
 
@@ -432,6 +430,7 @@ dmesh_doca_dpa_thread_create(struct dmesh_doca_dpa_thread *dpa_thread)
 
 //     DOCA_LOG_INFO("Copied data to DPA memory at device pointer: 0x%lx", dpa_thread->buf);
 // #endif
+
     uint32_t test_eus[DMESH_DPA_THREAD_COUNT] = {0, 16, 32, 33, 34, 35};
 
     for (i = 0; i < DMESH_DPA_THREAD_COUNT; ++i) {
@@ -478,14 +477,15 @@ dmesh_doca_dpa_thread_create(struct dmesh_doca_dpa_thread *dpa_thread)
         /*
          * Strict EU affinity.
          */
-        // if (i < total_eus) {
-        //     result = dmesh_doca_dpa_thread_set_eu_affinity(dpa_thread, i, test_eus[i]);
-        //     if (result != DOCA_SUCCESS)
-        //         return result;
-        // } else {
-        //     DOCA_LOG_WARN("No unique EU for DPA thread %u; leaving affinity unset", i);
-        // }
-
+#ifdef DOCA_ARCH_DPU
+        if (i < total_eus) {
+            result = dmesh_doca_dpa_thread_set_eu_affinity(dpa_thread, i, test_eus[i]);
+            if (result != DOCA_SUCCESS)
+                return result;
+        } else {
+            DOCA_LOG_WARN("No unique EU for DPA thread %u; leaving affinity unset", i);
+        }
+#endif
 
 		result = doca_dpa_thread_start(dpa_thread->threads[i]);
 		if (result != DOCA_SUCCESS) {

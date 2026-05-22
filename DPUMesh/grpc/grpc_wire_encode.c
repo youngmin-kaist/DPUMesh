@@ -418,14 +418,14 @@ int grpc_wire_serialize_one(const ProtoSchemaBlob *blob,
         goto error;
     }
 
-    if (task->dpa_out_cap < 5U) {
+    if (task->out_cap < 5U) {
         cpl->status = -2;
         goto error;
     }
 
-    flat_base = (const uint8_t *)(uintptr_t)task->dpa_msg_addr;
-    out_base = (uint8_t *)(uintptr_t)task->dpa_out_addr;
-    cap_end = out_base + task->dpa_out_cap;
+    flat_base = (const uint8_t *)(uintptr_t)task->flat;
+    out_base = (uint8_t *)(uintptr_t)task->out;
+    cap_end = out_base + task->out_cap;
 
     out_end = emit_message_dispatch(blob, desc, flat_base, out_base + 5U, cap_end, stats);
     if (out_end == NULL) {
@@ -785,15 +785,15 @@ int grpc_wire_serialize_one_reverse(const ProtoSchemaBlob *blob,
         goto error;
     }
 
-    if (task->dpa_out_cap < 5U) {
+    if (task->out_cap < 5U) {
         cpl->status = -2;
         goto error;
     }
 
-    flat_base = (const uint8_t *)(uintptr_t)task->dpa_msg_addr;
-    out_base = (uint8_t *)(uintptr_t)task->dpa_out_addr;
+    flat_base = (const uint8_t *)(uintptr_t)task->flat;
+    out_base = (uint8_t *)(uintptr_t)task->out;
     out_begin = out_base + 5U;
-    out_cap_end = out_base + task->dpa_out_cap;
+    out_cap_end = out_base + task->out_cap;
 
     /*
      * The protobuf payload is first generated from high addresses to low
@@ -809,7 +809,7 @@ int grpc_wire_serialize_one_reverse(const ProtoSchemaBlob *blob,
     }
 
     payload_len = (uint32_t)(out_cap_end - payload_start);
-    if (payload_len > PROTO_MAX_LEN_DELIMITED || payload_len > task->dpa_out_cap - 5U) {
+    if (payload_len > PROTO_MAX_LEN_DELIMITED || payload_len > task->out_cap - 5U) {
         cpl->status = -3;
         goto error;
     }

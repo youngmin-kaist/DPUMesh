@@ -66,7 +66,7 @@ typedef uint64_t doca_dpa_dev_completion_t;
 typedef uint64_t doca_dpa_dev_comch_producer_t;
 
 #define DMA_RING_CACHELINE_SIZE 64
-#define DMA_COMPLETION_BATCH_SIZE 256
+#define DMA_COMPLETION_BATCH_SIZE 128
 #define DMA_MSG_SIZE_LIMIT 8192
 #define DMA_COMPLETION_IDLE_POLL_LIMIT 1024
 
@@ -121,13 +121,13 @@ struct dmesh_grpc_hello_flat {
 
 struct comch_dma_req_msg {
 	enum comch_msg_type type;
+	uint32_t length;
 	doca_dpa_dev_comch_producer_t dpa_producer;
 	doca_dpa_dev_completion_t dpa_producer_comp;
 	doca_dpa_dev_mmap_t src_mmap;
 	doca_dpa_dev_mmap_t dst_mmap;
 	uint64_t src_addr;
 	uint64_t dst_addr;
-	uint32_t length;
 } __attribute__((__packed__, aligned(8)));
 
 struct comch_grpc_dma_comp_msg {
@@ -137,11 +137,9 @@ struct comch_grpc_dma_comp_msg {
 	uint32_t expected_dma;
 	uint64_t ring_seq;
 	uint64_t flat_addr;
-	uint32_t flat_len;
-	uint32_t reserved0;
 	uint64_t out_addr;
+	uint32_t flat_len;
 	uint32_t out_cap;
-	uint32_t status;
 } __attribute__((__packed__, aligned(8)));
 
 struct comch_grpc_serialize_req_msg {
@@ -151,11 +149,9 @@ struct comch_grpc_serialize_req_msg {
 	uint32_t reserved0;
 	uint64_t ring_seq;
 	uint64_t flat_addr;
-	uint32_t flat_len;
-	uint32_t reserved1;
 	uint64_t out_addr;
+	uint32_t flat_len;
 	uint32_t out_cap;
-	uint32_t reserved2;
 } __attribute__((__packed__, aligned(8)));
 
 struct comch_grpc_serialize_comp_msg {
@@ -164,21 +160,22 @@ struct comch_grpc_serialize_comp_msg {
 	uint32_t schema_id;
 	int32_t status;
 	uint64_t ring_seq;
+	uint64_t reserved0;
 	uint64_t out_addr;
 	uint32_t encoded_len;
-	uint32_t reserved0;
+	uint32_t reserved1;
 } __attribute__((__packed__, aligned(8)));
 
 struct dpa_grpc_serialize_task {
+	uint32_t reserved0;
 	uint32_t request_id;
 	uint32_t schema_id;
+	uint32_t valid;
 	uint64_t ring_seq;
 	uint64_t flat_addr;
 	uint64_t out_addr;
 	uint32_t flat_len;
 	uint32_t out_cap;
-	uint32_t valid;
-	uint32_t reserved0;
 } __attribute__((__packed__, aligned(8)));
 
 struct dpa_grpc_pipeline_state {
@@ -194,16 +191,16 @@ struct dpa_grpc_pipeline_state {
 } __attribute__((aligned(DMA_RING_CACHELINE_SIZE)));
 
 struct comch_msg {
-	enum comch_msg_type type;
 	union
 	{
+		enum comch_msg_type type;
 		struct comch_dma_req_msg dma_req_msg;
 		struct comch_dma_comp_msg dma_comp_msg;
-		struct comch_grpc_dma_comp_msg grpc_dma_comp_msg;
-		struct comch_grpc_serialize_req_msg grpc_serialize_req_msg;
-		struct comch_grpc_serialize_comp_msg grpc_serialize_comp_msg;
+		struct comch_grpc_dma_comp_msg grpc_dma_comp;
+		struct comch_grpc_serialize_req_msg grpc_serialize_req;
+		struct comch_grpc_serialize_comp_msg grpc_serialize_comp;
 	};
-} __attribute__((__packed__, aligned(4)));
+} __attribute__((__packed__, aligned(DMA_RING_CACHELINE_SIZE)));
 
 struct dma_desc {
 	doca_dpa_dev_mmap_t mmap;

@@ -79,15 +79,9 @@ typedef struct {
 typedef struct {
     uint32_t schema_id;
     uint32_t request_id;
-
-    const void *host_msg_addr;
-    void *host_out_addr;
-    uint32_t host_msg_len;
-    uint32_t host_out_cap;
-
-    uint64_t dpa_msg_addr;
-    uint64_t dpa_out_addr;
-    uint32_t dpa_out_cap;
+    uint64_t flat;
+    uint64_t out;
+    uint32_t out_cap;
 } ProtoTask;
 
 typedef struct {

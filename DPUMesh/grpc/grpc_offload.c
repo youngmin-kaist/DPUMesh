@@ -16,17 +16,17 @@ DOCA_LOG_REGISTER(GRPC_OFFLOAD);
 #define DMESH_GRPC_ARENA_NO_BLOCK UINT32_MAX
 
 struct dmesh_grpc_pending_entry {
-	bool valid;
+	uint32_t expected_dma;
 	uint32_t request_id;
 	uint32_t schema_id;
-	uint32_t expected_dma;
+	uint32_t valid;
 	uint32_t completed_dma;
 	uint64_t ring_seq;
 	uint64_t flat_addr;
-	uint32_t flat_len;
 	uint64_t out_addr;
+	uint32_t flat_len;
 	uint32_t out_cap;
-};
+} __attribute__((__packed__, aligned(8)));
 
 struct dmesh_grpc_dpu_state {
 	struct dmesh_grpc_pending_entry pending[DMESH_GRPC_MAX_PENDING];
@@ -500,13 +500,6 @@ dmesh_grpc_handle_dma_completion(struct objects *objs,
 		return DOCA_ERROR_INVALID_VALUE;
 	if (comp->ring_seq == 0)
 		return DOCA_ERROR_INVALID_VALUE;
-	if (comp->status != 0) {
-		DOCA_LOG_ERR("gRPC DMA preparation failed: request_id=%u status=%u",
-			     comp->request_id, comp->status);
-		dmesh_grpc_arena_reclaim_ring_seq((struct dmesh_grpc_arena *)objs->grpc_offload,
-						  comp->ring_seq);
-		return DOCA_ERROR_BAD_STATE;
-	}
 
 	result = get_dpu_state(objs, &state);
 	if (result != DOCA_SUCCESS)
@@ -522,8 +515,8 @@ dmesh_grpc_handle_dma_completion(struct objects *objs,
 		entry->expected_dma = comp->expected_dma;
 		entry->ring_seq = comp->ring_seq;
 		entry->flat_addr = comp->flat_addr;
-		entry->flat_len = comp->flat_len;
 		entry->out_addr = comp->out_addr;
+		entry->flat_len = comp->flat_len;
 		entry->out_cap = comp->out_cap;
 	} else if (entry->ring_seq != comp->ring_seq) {
 		/*
@@ -538,18 +531,18 @@ dmesh_grpc_handle_dma_completion(struct objects *objs,
 
 	if (entry->expected_dma > 0) {
 		entry->completed_dma++;
-		if (comp->ring_seq <= 8U || (comp->ring_seq % DEBUG_INTERVAL) == 0U) {
-			DOCA_LOG_INFO("gRPC DMA completed: req=%u seq=%lu completed=%u/%u flat=0x%lx out=0x%lx",
-				      comp->request_id, comp->ring_seq,
-				      entry->completed_dma, entry->expected_dma,
-				      entry->flat_addr, entry->out_addr);
-		}
+		// if (comp->ring_seq <= 8U || (comp->ring_seq % DEBUG_INTERVAL) == 0U) {
+		// 	DOCA_LOG_INFO("gRPC DMA completed: req=%u seq=%lu completed=%u/%u flat=0x%lx out=0x%lx",
+		// 		      comp->request_id, comp->ring_seq,
+		// 		      entry->completed_dma, entry->expected_dma,
+		// 		      entry->flat_addr, entry->out_addr);
+		// }
 		if (entry->completed_dma < entry->expected_dma)
 			return DOCA_SUCCESS;
 	} else if (comp->ring_seq <= 8U || (comp->ring_seq % DEBUG_INTERVAL) == 0U) {
-		DOCA_LOG_INFO("gRPC DMA completed: req=%u seq=%lu completed=0/0 flat=0x%lx out=0x%lx",
-			      comp->request_id, comp->ring_seq,
-			      entry->flat_addr, entry->out_addr);
+		// DOCA_LOG_INFO("gRPC DMA completed: req=%u seq=%lu completed=0/0 flat=0x%lx out=0x%lx",
+		// 	      comp->request_id, comp->ring_seq,
+		// 	      entry->flat_addr, entry->out_addr);
 	}
 
 	result = send_serialize_request(objs, entry);
