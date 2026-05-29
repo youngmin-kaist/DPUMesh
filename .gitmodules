@@ -1,0 +1,3 @@
+[submodule "thrift_dpumesh_extended"]
+	path = thrift_dpumesh_extended
+	url = https://github.com/jukebox03/thrift_dpumesh_extended.git
