@@ -344,9 +344,12 @@ dmesh_grpc_hello_request_alloc(struct dmesh_grpc_arena *arena,
 		}
 		memcpy(name_dst, name, name_len);
 		req->name = name_dst;
-		req->name_len = name_len;
 	}
-
+	else {
+		req->name = NULL;
+	}
+	req->name_len = name_len;
+	
 	if (scores_count != 0) {
 		size_t scores_bytes = (size_t)scores_count * sizeof(uint32_t);
 		uint32_t *scores_dst = dmesh_grpc_arena_alloc(arena, scores_bytes,
@@ -359,8 +362,11 @@ dmesh_grpc_hello_request_alloc(struct dmesh_grpc_arena *arena,
 		}
 		memcpy(scores_dst, scores, scores_bytes);
 		req->scores = scores_dst;
-		req->scores_count = scores_count;
 	}
+	else {
+		req->scores = NULL;
+	}
+	req->scores_count = scores_count;
 
 	*out = req;
 	return DOCA_SUCCESS;

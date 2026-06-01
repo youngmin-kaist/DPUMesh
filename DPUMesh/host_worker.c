@@ -128,16 +128,11 @@ run_host_worker(struct objects *objs)
         DOCA_LOG_INFO("Made progress on PE: %d\n", pe_progress);
     }
 
+    char name[1024];
+    uint32_t scores[4];
+    int name_len;
     while (true) {
         struct dmesh_grpc_hello_request *req = NULL;
-        char name[64];
-        uint32_t scores[4];
-        int name_len;
-
-        // while (!dma_ring_has_free_slot(objs->dma_ring)) {
-        //     dma_ring_refresh_consumer(objs->dma_ring);
-        //     // doca_pe_progress(objs->pe);
-        // }
 
         while (doca_pe_progress(objs->pe)) {
             /* drain completions / keep host side progressing */

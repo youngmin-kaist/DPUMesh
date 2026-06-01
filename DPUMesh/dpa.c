@@ -402,6 +402,11 @@ dmesh_doca_dpa_thread_create(struct dmesh_doca_dpa_thread *dpa_thread)
 	zero_state = calloc(1, sizeof(*zero_state));
 	if (zero_state == NULL)
 		return DOCA_ERROR_NO_MEMORY;
+
+    for (i = 0; i < DMESH_GRPC_SERIALIZER_THREADS; ++i) {
+        zero_state->serializer_drr_deficit[i] = DMESH_GRPC_SERIALIZER_DRR_QUANTUM;
+    }
+
 	result = doca_dpa_h2d_memcpy(dpa_thread->dpa, dpa_thread->shared_state,
 				     zero_state, sizeof(*zero_state));
 	free(zero_state);
@@ -462,17 +467,6 @@ dmesh_doca_dpa_thread_create(struct dmesh_doca_dpa_thread *dpa_thread)
 				     i, doca_error_get_descr(result));
 			return result;
 		}
-
-		// result = doca_dpa_eu_affinity_create(dpa_thread->dpa, &dpa_thread->affinities[i]);
-		// if (result == DOCA_SUCCESS)
-		// 	result = doca_dpa_eu_affinity_set(dpa_thread->affinities[i], i);
-		// if (result == DOCA_SUCCESS)
-		// 	result = doca_dpa_thread_set_affinity(dpa_thread->threads[i],
-		// 					      dpa_thread->affinities[i]);
-		// if (result != DOCA_SUCCESS) {
-		// 	DOCA_LOG_WARN("Failed to pin DPA thread %u to EU %u: %s",
-		// 		      i, i, doca_error_get_descr(result));
-		// }
 
         /*
          * Strict EU affinity.

@@ -16,7 +16,8 @@ typedef uint64_t doca_dpa_dev_buf_arr_t;
 typedef uint64_t doca_dpa_dev_notification_completion_t;
 
 #define DMESH_GRPC_SERIALIZER_THREADS 4U
-#define DEBUG_INTERVAL (1024 * 64)
+// #define DEBUG_INTERVAL (1024 * 64 - 7717)
+#define DEBUG_INTERVAL 0xffffffff
 
 struct dpa_thread_arg {
 	uint64_t dpa_consumer_comp;
@@ -28,8 +29,8 @@ struct dpa_thread_arg {
 	uint32_t buf_arr_size;
 
 	doca_dpa_dev_mmap_t host_mmap;
-		
 	doca_dpa_dev_mmap_t dpu_mmap;
+
 	uint64_t src_addr;
 	uint32_t buf_size;
 	uint32_t pos;
@@ -44,7 +45,6 @@ struct dpa_thread_arg {
 	doca_dpa_dev_notification_completion_t serializer_notify[DMESH_GRPC_SERIALIZER_THREADS];
 	uint32_t serializer_index;
 	uint32_t reserved0;
-
 } __attribute__((__packed__, aligned(8)));
 
 enum comch_msg_type {
@@ -53,6 +53,12 @@ enum comch_msg_type {
 	COMCH_MSG_TYPE_GRPC_DMA_COMPLETED = 3,
 	COMCH_MSG_TYPE_GRPC_SERIALIZE_REQ = 4,
 	COMCH_MSG_TYPE_GRPC_SERIALIZE_COMPLETED = 5,
+};
+
+enum pipeline_task_state {
+	TASK_STATE_IDLE = 0,
+	TASK_STATE_PROCESSING = 1,
+	TASK_STATE_COMPLETED = 2,
 };
 
 struct comch_dma_comp_msg {
@@ -179,15 +185,14 @@ struct dpa_grpc_serialize_task {
 } __attribute__((__packed__, aligned(8)));
 
 struct dpa_grpc_pipeline_state {
-	volatile uint8_t active[DMESH_GRPC_MAX_PENDING];
-	volatile uint8_t completed[DMESH_GRPC_MAX_PENDING];
-	volatile uint32_t serializer_prod[DMESH_GRPC_SERIALIZER_THREADS];
-	volatile uint32_t serializer_cons[DMESH_GRPC_SERIALIZER_THREADS];
 	uint32_t serializer_drr_cursor;
+	uint32_t serializer_prod[DMESH_GRPC_SERIALIZER_THREADS];
+	uint32_t serializer_cons[DMESH_GRPC_SERIALIZER_THREADS];
 	uint32_t serializer_drr_deficit[DMESH_GRPC_SERIALIZER_THREADS];
-	uint8_t serializer_drr_visited[DMESH_GRPC_SERIALIZER_THREADS];
 	struct dpa_grpc_serialize_task
 		serializer_tasks[DMESH_GRPC_SERIALIZER_THREADS][DMESH_GRPC_SERIALIZER_QUEUE_DEPTH];
+	
+	enum pipeline_task_state pipeline_task_state[DMESH_GRPC_MAX_PENDING];
 } __attribute__((aligned(DMA_RING_CACHELINE_SIZE)));
 
 struct comch_msg {
@@ -200,7 +205,7 @@ struct comch_msg {
 		struct comch_grpc_serialize_req_msg grpc_serialize_req;
 		struct comch_grpc_serialize_comp_msg grpc_serialize_comp;
 	};
-} __attribute__((__packed__, aligned(DMA_RING_CACHELINE_SIZE)));
+} __attribute__((aligned(DMA_RING_CACHELINE_SIZE)));
 
 struct dma_desc {
 	doca_dpa_dev_mmap_t mmap;
