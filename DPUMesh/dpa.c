@@ -96,21 +96,14 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
 
     switch (msg->type) {
         case COMCH_MSG_TYPE_DMA_COMPLETED: {
-            struct comch_dma_comp_msg *comp_msg = (struct comch_dma_comp_msg *)msg;
-            uint32_t *idx = (uint32_t *)(objs->dma_buffer + comp_msg->pos);
+            // struct comch_dma_comp_msg *comp_msg = (struct comch_dma_comp_msg *)msg;
+            // uint32_t *idx = (uint32_t *)(objs->dma_buffer + comp_msg->pos);
             // DOCA_LOG_INFO("Received DMA completed message: desc_idx=%lu pos=%u length=%u value=%u",
             //               comp_msg->idx, comp_msg->pos, comp_msg->length, *idx);
             break;
         }
         case COMCH_MSG_TYPE_GRPC_DMA_COMPLETED: {
             struct comch_grpc_dma_comp_msg *comp_msg = (struct comch_grpc_dma_comp_msg *)msg;
-
-            // if (comp_msg->ring_seq <= 8U || (comp_msg->ring_seq % 64U) == 0U) {
-            //     DOCA_LOG_INFO("gRPC DMA completion received: req=%u seq=%lu expected_dma=%u flat=0x%lx out=0x%lx",
-            //                     comp_msg->request_id, comp_msg->ring_seq,
-            //                     comp_msg->expected_dma,
-            //                     comp_msg->flat_addr, comp_msg->out_addr);
-            // }
 
             result = dmesh_grpc_handle_dma_completion(objs, comp_msg);
             if (result != DOCA_SUCCESS) {
@@ -122,13 +115,14 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
         }
         case COMCH_MSG_TYPE_GRPC_SERIALIZE_COMPLETED: {
             struct comch_grpc_serialize_comp_msg *comp_msg = (struct comch_grpc_serialize_comp_msg *)msg;
-
+#if DEBUG_LOG            
             if (comp_msg->ring_seq <= 8U || (comp_msg->ring_seq % DEBUG_INTERVAL) == 0U) {
-                DOCA_LOG_INFO("gRPC serialize complete: request_id=%u status=%d encoded_len=%u out=0x%lx",
-                            comp_msg->request_id, comp_msg->status,
-                            comp_msg->encoded_len, comp_msg->out_addr);
+                DOCA_LOG_INFO("gRPC serialize complete:\nreq=%u completed=%u encoded_len=%u data_len=%u",
+                            comp_msg->request_id, comp_msg->completed, comp_msg->encoded_len, data_len);
             }
-            objs->recv_msg_cnt++;
+#endif
+            // recall that we piggybacked the number of completed descriptors in the status field
+            objs->recv_msg_cnt += comp_msg->completed;
             break;
         }
         default:
@@ -173,7 +167,7 @@ static void dmesh_doca_dpa_msgq_send_cb(struct doca_comch_producer_task_send *se
 				       union doca_data task_user_data,
 				       union doca_data ctx_user_data)
 {
-    struct dmesh_doca_dpa_msgq_send_ctx *send_ctx = task_user_data.ptr;
+    // struct dmesh_doca_dpa_msgq_send_ctx *send_ctx = task_user_data.ptr;
     
     struct objects *objs = (struct objects *)ctx_user_data.ptr;
     if (objs != NULL)
@@ -209,7 +203,7 @@ static void dmesh_doca_dpa_msgq_send_error_cb(struct doca_comch_producer_task_se
 					     union doca_data task_user_data,
 					     union doca_data ctx_user_data)
 {
-    struct dmesh_doca_dpa_msgq_send_ctx *send_ctx = task_user_data.ptr;
+    // struct dmesh_doca_dpa_msgq_send_ctx *send_ctx = task_user_data.ptr;
 	(void)ctx_user_data;
 
 	struct doca_task *task = doca_comch_producer_task_send_as_task(send_task);
@@ -253,7 +247,7 @@ doca_error_t
 init_dpa_objects(struct objects *objs)
 {
     doca_error_t result;
-    struct dmesh_doca_dpa_thread *dpa_thread;
+    // struct dmesh_doca_dpa_thread *dpa_thread;
 
     if (!objs->dpa_thread) {
 		objs->dpa_thread = malloc(sizeof(struct dmesh_doca_dpa_thread));
@@ -416,28 +410,8 @@ dmesh_doca_dpa_thread_create(struct dmesh_doca_dpa_thread *dpa_thread)
 		return result;
 	}
 
-// #ifdef TEST_DPA_MEMORY
-//     result = doca_dpa_mem_alloc(dpa_thread->dpa, 1024, &dpa_thread->buf);
-//     if (result != DOCA_SUCCESS) {
-//         DOCA_LOG_ERR("Failed to alloc dpa mem for buffer: %s",
-//             doca_error_get_descr(result));
-//         return result;
-//     }
-
-//     char *temp = "Hello from Host to DPA via DPA memory!";
-//     result = doca_dpa_h2d_memcpy(dpa_thread->dpa, dpa_thread->buf,
-//                                 temp, strlen(temp) + 1);
-//     if (result != DOCA_SUCCESS) {
-//         DOCA_LOG_ERR("Failed to copy data from host to DPA memory: %s",
-//             doca_error_get_descr(result));
-//         return result;
-//     }
-
-//     DOCA_LOG_INFO("Copied data to DPA memory at device pointer: 0x%lx", dpa_thread->buf);
-// #endif
-
+    /* set EU affinity */
     uint32_t test_eus[DMESH_DPA_THREAD_COUNT] = {0, 16, 32, 33, 34, 35};
-
     for (i = 0; i < DMESH_DPA_THREAD_COUNT; ++i) {
 		doca_dpa_func_t *func;
 		doca_dpa_dev_uintptr_t arg_addr =
@@ -468,17 +442,18 @@ dmesh_doca_dpa_thread_create(struct dmesh_doca_dpa_thread *dpa_thread)
 			return result;
 		}
 
+
+#ifdef DOCA_ARCH_DPU
         /*
          * Strict EU affinity.
          */
-#ifdef DOCA_ARCH_DPU
-        if (i < total_eus) {
-            result = dmesh_doca_dpa_thread_set_eu_affinity(dpa_thread, i, test_eus[i]);
-            if (result != DOCA_SUCCESS)
-                return result;
-        } else {
-            DOCA_LOG_WARN("No unique EU for DPA thread %u; leaving affinity unset", i);
-        }
+        // if (i < total_eus) {
+        //     result = dmesh_doca_dpa_thread_set_eu_affinity(dpa_thread, i, test_eus[i]);
+        //     if (result != DOCA_SUCCESS)
+        //         return result;
+        // } else {
+        //     DOCA_LOG_WARN("No unique EU for DPA thread %u; leaving affinity unset", i);
+        // }
 #endif
 
 		result = doca_dpa_thread_start(dpa_thread->threads[i]);
@@ -735,7 +710,7 @@ dmesh_doca_dpa_comch_create(struct objects *objs)
 {
     struct dmesh_doca_dpa_comch *comch = objs->dpa_comch;
     struct dmesh_doca_dpa_thread *dpa_thread = objs->dpa_thread;
-    uint32_t max_num_recv, imm_data_len;
+    // uint32_t max_num_recv, imm_data_len;
     doca_error_t result;
     
     memset(comch, 0, sizeof(*comch));
@@ -910,20 +885,20 @@ dmesh_fill_dpa_thread_arg(struct objects *objs, struct dpa_thread_arg *arg)
 	        .dpa_consumer = dpa_consumer,
 	        .dpa_producer = dpa_producer,
 #ifdef DOCA_ARCH_DPU
-        .dpa_buf_arr = dpa_buf_arr,
-        .dpa_consumer_state_buf_arr = dpa_consumer_state_buf_arr,
-        .buf_arr_size = DMA_RING_SIZE,
-        .host_mmap = host_mmap,
-        .dpu_mmap = dpu_mmap,
-        .src_addr = objs->dma_buffer,
-        .buf_size = BUFFER_SIZE,
-        .pos = 0,
-        .dpa_host_mmap_buf_arr = dpa_host_mmap_buf_arr,
-        .dpa_dpu_mmap_buf_arr = dpa_dpu_mmap_buf_arr,
-        .host_base_addr = (uint64_t)objs->remote_addr,
-	        .dpu_base_addr = (uint64_t)objs->dma_buffer,
-	        .host_buf_size = (uint32_t)objs->remote_buf_size,
-		#endif
+            .dpa_buf_arr = dpa_buf_arr,
+            .dpa_consumer_state_buf_arr = dpa_consumer_state_buf_arr,
+            .buf_arr_size = DMA_RING_SIZE,
+            .host_mmap = host_mmap,
+            .dpu_mmap = dpu_mmap,
+            .src_addr = (uint64_t)objs->dma_buffer,
+            .buf_size = BUFFER_SIZE,
+            .pos = 0,
+            .dpa_host_mmap_buf_arr = dpa_host_mmap_buf_arr,
+            .dpa_dpu_mmap_buf_arr = dpa_dpu_mmap_buf_arr,
+            .host_base_addr = (uint64_t)objs->remote_addr,
+            .dpu_base_addr = (uint64_t)objs->dma_buffer,
+            .host_buf_size = (uint32_t)objs->remote_buf_size,
+#endif
 			.pipeline_state = objs->dpa_thread->shared_state,
 			.main_notify = objs->dpa_thread->notify_handles[DMESH_DPA_THREAD_MAIN],
 		    };
@@ -1013,6 +988,150 @@ dmesh_doca_run_dpa_thread(struct objects *objs, struct dmesh_doca_dpa_thread *dp
     return DOCA_SUCCESS;
 }
 
+
+doca_error_t
+dmesh_doca_dpa_msgq_pending_push(struct dmesh_doca_dpa_msgq *msgq,
+				 struct comch_grpc_dma_comp_msg *comp)
+{
+    struct comch_grpc_serialize_req_msg *req_msg;
+
+	if (msgq == NULL || comp == NULL)
+		return DOCA_ERROR_INVALID_VALUE;
+
+	if (msgq->pending_count >= DMESH_DPA_MSGQ_PENDING_SEND_DEPTH) {
+		DOCA_LOG_ERR("DPA MsgQ pending send queue full: depth=%u",
+			     DMESH_DPA_MSGQ_PENDING_SEND_DEPTH);
+		return DOCA_ERROR_NO_MEMORY;
+	}
+
+	req_msg = (struct comch_grpc_serialize_req_msg *)&msgq->pending_sends[msgq->pending_tail];
+    memcpy(req_msg, comp, sizeof(struct comch_grpc_serialize_req_msg));
+    req_msg->type = COMCH_MSG_TYPE_GRPC_SERIALIZE_REQ;
+
+	msgq->pending_tail =
+		(msgq->pending_tail + 1U) % DMESH_DPA_MSGQ_PENDING_SEND_DEPTH;
+	msgq->pending_count++;
+
+#if DEBUG_LOG
+	if (msgq->pending_count > msgq->pending_high_watermark)
+		msgq->pending_high_watermark = msgq->pending_count;
+#endif
+
+	return DOCA_SUCCESS;
+}
+
+static void
+dmesh_doca_dpa_msgq_pending_pop(struct dmesh_doca_dpa_msgq *msgq)
+{
+	if (msgq == NULL || msgq->pending_count == 0)
+		return;
+
+	msgq->pending_head =
+		(msgq->pending_head + 1U) % DMESH_DPA_MSGQ_PENDING_SEND_DEPTH;
+	msgq->pending_count--;
+}
+
+static doca_error_t
+dmesh_doca_dpa_msgq_submit_once(struct dmesh_doca_dpa_msgq *msgq,
+				void *msg,
+				uint32_t msg_size)
+{
+	struct doca_comch_producer_task_send *send_task;
+	struct doca_task *task;
+	union doca_data user_data;
+	doca_error_t result;
+
+	if (msgq == NULL || msgq->producer == NULL || msg == NULL || msg_size == 0)
+		return DOCA_ERROR_INVALID_VALUE;
+
+	result = doca_comch_producer_task_send_alloc_init(msgq->producer,
+							  NULL,
+							  msg,
+							  msg_size,
+							  /*consumer_id=*/1,
+							  &send_task);
+	if (result != DOCA_SUCCESS)
+		return result;
+
+	task = doca_comch_producer_task_send_as_task(send_task);
+	user_data.ptr = msgq;
+	doca_task_set_user_data(task, user_data);
+
+	result = doca_task_submit(task);
+	if (result != DOCA_SUCCESS)
+		doca_task_free(task);
+
+	return result;
+}
+
+// /*
+//  * Send message to DPA using NVMf DOCA DPA MsgQ.
+//  *
+//  * This function can run from a PE callback. It must not spin on
+//  * DOCA_ERROR_AGAIN because the same PE may need to run send-completion
+//  * callbacks to release the credits that make the submit possible.
+//  * Keep submission ownership in the DPU worker main loop so callbacks only
+//  * copy the message into the pending queue.
+//  */
+// doca_error_t
+// dmesh_doca_dpa_msgq_send(struct dmesh_doca_dpa_msgq *msgq, void *msg, uint32_t msg_size)
+// {
+// 	if (msgq == NULL || msg == NULL)
+// 		return DOCA_ERROR_INVALID_VALUE;
+
+// 	return dmesh_doca_dpa_msgq_pending_push(msgq, msg, msg_size);
+// }
+
+#define DMESH_DPA_MSGQ_DRAIN_LOG_MIN_HIGH_WATERMARK 64U
+
+doca_error_t
+dmesh_doca_dpa_msgq_drain_pending(struct dmesh_doca_dpa_msgq *msgq,
+				  uint32_t budget,
+				  uint32_t *submitted)
+{
+	uint32_t local_submitted = 0;
+	doca_error_t result = DOCA_SUCCESS;
+
+	if (msgq == NULL)
+		return DOCA_ERROR_INVALID_VALUE;
+	if (budget == 0)
+		budget = DMESH_DPA_MSGQ_PENDING_SEND_DEPTH;
+
+	while (msgq->pending_count != 0 && local_submitted < budget) {
+		struct comch_grpc_serialize_req_msg *entry =
+			(struct comch_grpc_serialize_req_msg *)&msgq->pending_sends[msgq->pending_head];
+
+		result = dmesh_doca_dpa_msgq_submit_once(msgq,
+							 entry,
+							 sizeof(struct comch_grpc_serialize_req_msg));
+		if (result != DOCA_SUCCESS) {
+			if (result != DOCA_ERROR_AGAIN && result != DOCA_ERROR_NO_MEMORY)
+				DOCA_LOG_ERR("Failed to drain pending DPA MsgQ send - %s",
+					     doca_error_get_name(result));
+			break;
+		}
+
+		dmesh_doca_dpa_msgq_pending_pop(msgq);
+		local_submitted++;
+	}
+
+	if (submitted != NULL)
+		*submitted = local_submitted;
+
+#if DEBUG_LOG
+	if (local_submitted != 0 && msgq->pending_count == 0 &&
+	    msgq->pending_high_watermark > 0) {
+		if (msgq->pending_high_watermark >= DMESH_DPA_MSGQ_DRAIN_LOG_MIN_HIGH_WATERMARK)
+			DOCA_LOG_INFO("DPA MsgQ pending send queue drained: submitted=%u high_watermark=%u",
+				      local_submitted, msgq->pending_high_watermark);
+                      
+        msgq->pending_high_watermark = 0;
+    }
+#endif
+
+	return result;
+}
+
 /*
  * Send message to DPA using NVMf DOCA DPA MsgQ
  *
@@ -1045,9 +1164,21 @@ dmesh_doca_dpa_msgq_send(struct dmesh_doca_dpa_msgq *msgq, void *msg, uint32_t m
     user_data.ptr = msgq;
     doca_task_set_user_data(task, user_data);
 
+    int attempt = 0;
     do {
         result = doca_task_submit(task);
+        attempt++;
+        if (attempt > 4096 * 4096) {
+            DOCA_LOG_ERR("Failed to send msg using NVMf DOCA DPA MsgQ: Failed to submit send task after %d attempts - %s",
+                         attempt, doca_error_get_name(result));
+            doca_task_free(task);
+            return result;
+        }
     } while (result == DOCA_ERROR_AGAIN);
+
+    if (attempt > 50000) {
+        DOCA_LOG_INFO("Submitted send task after %d attempts", attempt);
+    }
     
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to send msg using NVMf DOCA DPA MsgQ: Failed to submit send task - %s",
@@ -1067,7 +1198,7 @@ dmesh_doca_dpa_msgq_send_bulk(struct dmesh_doca_dpa_msgq *msgq, uint32_t num_msg
     struct doca_task *task;
 	doca_error_t result;
     int i;
-    struct comch_msg *comch_msg = (struct comch_msg *)msg;
+    // struct comch_msg *comch_msg = (struct comch_msg *)msg;
 
     for (i = 0; i < num_msg; i++) {
         result = doca_comch_producer_task_send_alloc_init(msgq->producer,

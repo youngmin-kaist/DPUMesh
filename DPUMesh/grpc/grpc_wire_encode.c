@@ -418,14 +418,9 @@ int grpc_wire_serialize_one(const ProtoSchemaBlob *blob,
         goto error;
     }
 
-    if (task->out_cap < 5U) {
-        cpl->status = -2;
-        goto error;
-    }
-
     flat_base = (const uint8_t *)(uintptr_t)task->flat;
     out_base = (uint8_t *)(uintptr_t)task->out;
-    cap_end = out_base + task->out_cap;
+    cap_end = out_base + MAX_ENCODED_SIZE;
 
     out_end = emit_message_dispatch(blob, desc, flat_base, out_base + 5U, cap_end, stats);
     if (out_end == NULL) {
@@ -446,7 +441,7 @@ int grpc_wire_serialize_one(const ProtoSchemaBlob *blob,
 
 error:
     cpl->encoded_len = 0U;
-    return -1;
+    return cpl->status;
 }
 
 
@@ -785,15 +780,10 @@ int grpc_wire_serialize_one_reverse(const ProtoSchemaBlob *blob,
         goto error;
     }
 
-    if (task->out_cap < 5U) {
-        cpl->status = -2;
-        goto error;
-    }
-
     flat_base = (const uint8_t *)(uintptr_t)task->flat;
     out_base = (uint8_t *)(uintptr_t)task->out;
     out_begin = out_base + 5U;
-    out_cap_end = out_base + task->out_cap;
+    out_cap_end = out_base + MAX_ENCODED_SIZE;
 
     /*
      * The protobuf payload is first generated from high addresses to low
@@ -809,7 +799,7 @@ int grpc_wire_serialize_one_reverse(const ProtoSchemaBlob *blob,
     }
 
     payload_len = (uint32_t)(out_cap_end - payload_start);
-    if (payload_len > PROTO_MAX_LEN_DELIMITED || payload_len > task->out_cap - 5U) {
+    if (payload_len > PROTO_MAX_LEN_DELIMITED || payload_len > MAX_ENCODED_SIZE - 5U) {
         cpl->status = -3;
         goto error;
     }
@@ -822,5 +812,5 @@ int grpc_wire_serialize_one_reverse(const ProtoSchemaBlob *blob,
 
 error:
     cpl->encoded_len = 0U;
-    return -1;
+    return cpl->status;
 }

@@ -13,25 +13,6 @@
 
 DOCA_LOG_REGISTER(GRPC_OFFLOAD);
 
-#define DMESH_GRPC_ARENA_NO_BLOCK UINT32_MAX
-
-struct dmesh_grpc_pending_entry {
-	uint32_t expected_dma;
-	uint32_t request_id;
-	uint32_t schema_id;
-	uint32_t valid;
-	uint32_t completed_dma;
-	uint64_t ring_seq;
-	uint64_t flat_addr;
-	uint64_t out_addr;
-	uint32_t flat_len;
-	uint32_t out_cap;
-} __attribute__((__packed__, aligned(8)));
-
-struct dmesh_grpc_dpu_state {
-	struct dmesh_grpc_pending_entry pending[DMESH_GRPC_MAX_PENDING];
-};
-
 static size_t
 align_up_size(size_t value, size_t align)
 {
@@ -189,13 +170,16 @@ dmesh_grpc_arena_alloc(struct dmesh_grpc_arena *arena, size_t size, size_t align
 
 	if (arena == NULL || arena->base == NULL || arena->blocks == NULL)
 		return NULL;
+
 	if (align < DMESH_GRPC_ARENA_ADDR_ALIGN)
 		align = DMESH_GRPC_ARENA_ADDR_ALIGN;
+
 	if (arena->current_block == DMESH_GRPC_ARENA_NO_BLOCK) {
 		arena->current_block = dmesh_grpc_arena_pop_block(arena);
 		if (arena->current_block == DMESH_GRPC_ARENA_NO_BLOCK)
 			return NULL;
 	}
+
 	if (arena->current_block >= arena->block_count)
 		return NULL;
 
@@ -207,16 +191,14 @@ dmesh_grpc_arena_alloc(struct dmesh_grpc_arena *arena, size_t size, size_t align
 	block = &arena->blocks[arena->current_block];
 	block_base_off = (size_t)arena->current_block * arena->block_size;
 	base_addr = (uintptr_t)(arena->base + block_base_off);
-	if (block->offset > UINTPTR_MAX - base_addr)
-		return NULL;
 	raw_addr = base_addr + block->offset;
 	aligned_addr = align_up_uintptr(raw_addr, align);
-	if (aligned_addr == UINTPTR_MAX || aligned_addr < base_addr)
+	if (aligned_addr < base_addr)
 		return NULL;
+
 	off = (size_t)(aligned_addr - base_addr);
 	alloc_size = align_up_size(size, DMESH_GRPC_DMA_MSG_ALIGN);
-	if (off == SIZE_MAX || alloc_size == SIZE_MAX ||
-	    off > arena->block_size || alloc_size > arena->block_size - off)
+	if (off + alloc_size > arena->block_size)
 		return NULL;
 
 	block->offset = off + alloc_size;
@@ -372,6 +354,69 @@ dmesh_grpc_hello_request_alloc(struct dmesh_grpc_arena *arena,
 	return DOCA_SUCCESS;
 }
 
+doca_error_t
+dmesh_grpc_hello_flat_alloc(struct dmesh_grpc_arena *arena,
+			    uint64_t id,
+			    const char *name,
+			    uint32_t name_len,
+			    const uint32_t *scores,
+			    uint32_t scores_count,
+			    struct dmesh_grpc_hello_flat **out,
+			    size_t *flat_len_out)
+{
+	struct dmesh_grpc_hello_flat *flat;
+	size_t flat_len;
+	size_t scores_bytes = 0;
+	uint32_t name_off = 0;
+	uint32_t scores_off = 0;
+
+	if (arena == NULL || out == NULL || flat_len_out == NULL)
+		return DOCA_ERROR_INVALID_VALUE;
+	if ((name_len != 0 && name == NULL) || (scores_count != 0 && scores == NULL))
+		return DOCA_ERROR_INVALID_VALUE;
+
+	*out = NULL;
+	*flat_len_out = 0;
+
+	flat_len = sizeof(*flat);
+
+	if (name_len != 0) {
+		name_off = (uint32_t)flat_len;
+		flat_len += name_len;
+	}
+
+	if (scores_count != 0) {
+		scores_bytes = (size_t)scores_count * sizeof(uint32_t);
+		scores_off = (uint32_t)flat_len;
+		flat_len += scores_bytes;
+	}
+
+	flat_len = align_up_size(flat_len, DMESH_GRPC_DMA_MSG_ALIGN);
+	if (flat_len > DMESH_GRPC_MAX_FLAT_SIZE) {
+		DOCA_LOG_INFO("flat_len %zu exceeds max limit %u", flat_len, DMESH_GRPC_MAX_FLAT_SIZE);
+		return DOCA_ERROR_INVALID_VALUE;
+	}
+
+	flat = dmesh_grpc_arena_alloc(arena, flat_len, DMESH_GRPC_ARENA_ADDR_ALIGN);
+	if (flat == NULL)
+		return DOCA_ERROR_NO_MEMORY;
+
+	flat->id = id;
+	flat->name.offset = name_off;
+	flat->name.len = name_len;
+	flat->scores.offset = scores_off;
+	flat->scores.count = scores_count;
+
+	if (name_len != 0)
+		memcpy((uint8_t *)flat + name_off, name, name_len);
+	if (scores_bytes != 0)
+		memcpy((uint8_t *)flat + scores_off, scores, scores_bytes);
+
+	*out = flat;
+	*flat_len_out = flat_len;
+	return DOCA_SUCCESS;
+}
+
 static bool
 ptr_in_dma_buffer(const struct objects *objs, const void *ptr, size_t size)
 {
@@ -397,7 +442,7 @@ dmesh_grpc_submit_request(struct objects *objs,
 {
 	struct grpc_req_desc *desc;
 	struct dma_ring *ring;
-	uint64_t producer_seq;
+	uint64_t next_producer_seq;
 	doca_dpa_dev_mmap_t local_mmap;
 	doca_error_t result;
 
@@ -412,8 +457,6 @@ dmesh_grpc_submit_request(struct objects *objs,
 	ring = objs->dma_ring;
 	while (!dma_ring_has_free_slot(ring)) {
 		dma_ring_refresh_consumer(ring);
-		dmesh_grpc_arena_reclaim_through(arena, ring->observed_consumer_seq);
-		(void)doca_pe_progress(objs->producer_pe);
 	}
 
 	result = doca_mmap_dev_get_dpa_handle(objs->local_mmap, objs->dev, &local_mmap);
@@ -424,57 +467,46 @@ dmesh_grpc_submit_request(struct objects *objs,
 
 
 	// get new request descriptor and fill it out
-	producer_seq = ring->producer_seq;
-	desc = get_grpc_req_desc_for_seq(ring, producer_seq);
+	desc = get_grpc_req_desc_for_seq(ring, ring->producer_seq);
 	memset(desc, 0, sizeof(*desc));
-	desc->mmap = local_mmap;
 	desc->addr = (uint64_t)(uintptr_t)rpc_obj;
 	desc->size = rpc_obj_size;
-	desc->schema_id = schema_id;
 	desc->req_id = request_id;
+	desc->mmap = local_mmap;
+	desc->schema_id = (uint16_t)schema_id;
 
-	result = dmesh_grpc_arena_finish_request(arena, rpc_obj, producer_seq + 1U);
+	next_producer_seq = ring->producer_seq + 1;
+	result = dmesh_grpc_arena_finish_request(arena, rpc_obj, next_producer_seq);
 	if (result != DOCA_SUCCESS) {
 		dmesh_grpc_arena_abort_request(arena, rpc_obj);
 		return result;
 	}
 
-	/*
-	 * Host owns descriptor writes until seq is published. DPA polls seq with
-	 * acquire semantics and may DMA pointer fields after reading this object.
+	/* Publish the descriptor by advancing producer_seq. DPA will observe the new
+	 * producer_seq and read the descriptor after it reads the updated ring tail.
+	 * Host must ensure all descriptor writes are visible before updating producer_seq
+	 * and the producer_seq update is visible before DPA observes it.
 	 */
-	// __atomic_store_n(&desc->seq, producer_seq + 1U, __ATOMIC_RELEASE);
-	desc->seq = producer_seq + 1U;
-	ring->producer_seq = producer_seq + 1U;
+	desc->seq = next_producer_seq;
+	ring->producer_seq = next_producer_seq;
 	return DOCA_SUCCESS;
 }
 
+/* DPU */ 
 static doca_error_t
-send_serialize_request(struct objects *objs, const struct dmesh_grpc_pending_entry *entry)
+send_serialize_request(struct objects *objs, struct comch_grpc_dma_comp_msg *comp)
 {
-	struct comch_grpc_serialize_req_msg msg;
-
-	if (objs == NULL || objs->dpa_comch == NULL || entry == NULL)
+	if (objs == NULL || objs->dpa_comch == NULL || comp == NULL)
 		return DOCA_ERROR_INVALID_VALUE;
 
-	memset(&msg, 0, sizeof(msg));
-	msg.type = COMCH_MSG_TYPE_GRPC_SERIALIZE_REQ;
-	msg.request_id = entry->request_id;
-	msg.schema_id = entry->schema_id;
-	msg.ring_seq = entry->ring_seq;
-	msg.flat_addr = entry->flat_addr;
-	msg.flat_len = entry->flat_len;
-	msg.out_addr = entry->out_addr;
-	msg.out_cap = entry->out_cap;
-
-	if (entry->ring_seq <= 8U || (entry->ring_seq % DEBUG_INTERVAL) == 0U) {
-		DOCA_LOG_INFO("gRPC sending serialize req: req=%u seq=%lu schema=%u flat=0x%lx len=%u out=0x%lx cap=%u",
-			      entry->request_id, entry->ring_seq, entry->schema_id,
-			      entry->flat_addr, entry->flat_len,
-			      entry->out_addr, entry->out_cap);
+#if DEBUG_LOG
+	if (comp->ring_seq <= 8U || (comp->ring_seq % DEBUG_INTERVAL) == 0U) {
+		DOCA_LOG_INFO("gRPC serialize request: req=%u seq=%lu schema=%u len=%u expected_dma=%u",
+			      comp->request_id, comp->ring_seq, comp->schema_id, comp->len, comp->expected_dma);
 	}
+#endif
 
-	return dmesh_doca_dpa_msgq_send(&objs->dpa_comch->send, &msg, sizeof(msg));
+	return dmesh_doca_dpa_msgq_pending_push(&objs->dpa_comch->send, comp);
 }
 
 static doca_error_t
@@ -495,7 +527,7 @@ get_dpu_state(struct objects *objs, struct dmesh_grpc_dpu_state **state)
 
 doca_error_t
 dmesh_grpc_handle_dma_completion(struct objects *objs,
-				 const struct comch_grpc_dma_comp_msg *comp)
+				 struct comch_grpc_dma_comp_msg *comp)
 {
 	struct dmesh_grpc_dpu_state *state;
 	struct dmesh_grpc_pending_entry *entry;
@@ -511,52 +543,30 @@ dmesh_grpc_handle_dma_completion(struct objects *objs,
 	if (result != DOCA_SUCCESS)
 		return result;
 
-	slot = (uint32_t)((comp->ring_seq - 1U) % DMESH_GRPC_MAX_PENDING);
-	entry = &state->pending[slot];
-	if (!entry->valid) {
-		memset(entry, 0, sizeof(*entry));
-		entry->valid = true;
-		entry->request_id = comp->request_id;
-		entry->schema_id = comp->schema_id;
-		entry->expected_dma = comp->expected_dma;
-		entry->ring_seq = comp->ring_seq;
-		entry->flat_addr = comp->flat_addr;
-		entry->out_addr = comp->out_addr;
-		entry->flat_len = comp->flat_len;
-		entry->out_cap = comp->out_cap;
-	} else if (entry->ring_seq != comp->ring_seq) {
-		/*
-		 * The pending table is ring_seq modulo a fixed size. This assumes
-		 * DPA never has more than DMESH_GRPC_MAX_PENDING prepared descriptors
-		 * whose serialization has not completed.
-		 */
-		DOCA_LOG_ERR("gRPC pending slot collision: slot=%u old_seq=%lu new_seq=%lu",
-			     slot, entry->ring_seq, comp->ring_seq);
-		return DOCA_ERROR_AGAIN;
+#if DEBUG_LOG
+	if (comp->ring_seq <= 8U || (comp->ring_seq % DEBUG_INTERVAL) == 0U) {
+		DOCA_LOG_INFO("gRPC DMA completed: req=%u seq=%lu schema=%u len=%u expected_dma=%u",
+			      comp->request_id, comp->ring_seq, comp->schema_id, comp->len,
+			      comp->expected_dma);
 	}
+#endif
 
-	if (entry->expected_dma > 0) {
-		entry->completed_dma++;
-		// if (comp->ring_seq <= 8U || (comp->ring_seq % DEBUG_INTERVAL) == 0U) {
-		// 	DOCA_LOG_INFO("gRPC DMA completed: req=%u seq=%lu completed=%u/%u flat=0x%lx out=0x%lx",
-		// 		      comp->request_id, comp->ring_seq,
-		// 		      entry->completed_dma, entry->expected_dma,
-		// 		      entry->flat_addr, entry->out_addr);
-		// }
-		if (entry->completed_dma < entry->expected_dma)
+	if (comp->expected_dma > 1) {
+		slot = (uint32_t)((comp->ring_seq - 1U) % DMESH_GRPC_MAX_PENDING);
+		entry = &state->pending[slot];
+
+		if (entry->ring_seq != comp->ring_seq) {
+			entry->ring_seq = comp->ring_seq;
+			entry->request_id = comp->request_id;
+			entry->completed_dma = 0;
+			entry->expected_dma = comp->expected_dma;
+		}
+
+		if (++entry->completed_dma < comp->expected_dma)
 			return DOCA_SUCCESS;
-	} else if (comp->ring_seq <= 8U || (comp->ring_seq % DEBUG_INTERVAL) == 0U) {
-		// DOCA_LOG_INFO("gRPC DMA completed: req=%u seq=%lu completed=0/0 flat=0x%lx out=0x%lx",
-		// 	      comp->request_id, comp->ring_seq,
-		// 	      entry->flat_addr, entry->out_addr);
 	}
 
-	result = send_serialize_request(objs, entry);
-	entry->valid = false;
-
-	dmesh_grpc_arena_reclaim_ring_seq((struct dmesh_grpc_arena *)objs->grpc_offload,
-					  comp->ring_seq);
-	return result;
+	return send_serialize_request(objs, comp);
 }
 
 void

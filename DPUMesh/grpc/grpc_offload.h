@@ -8,6 +8,8 @@
 
 #include "../dpa_common.h"
 
+#define DMESH_GRPC_ARENA_NO_BLOCK UINT32_MAX
+
 struct objects;
 
 struct dmesh_grpc_arena_block {
@@ -29,6 +31,17 @@ struct dmesh_grpc_arena {
 	struct dmesh_grpc_arena_block *blocks;
 };
 
+struct dmesh_grpc_pending_entry {
+	uint64_t ring_seq;
+	uint32_t request_id;
+	uint16_t completed_dma;
+	uint16_t expected_dma;
+} __attribute__((aligned(16)));
+
+struct dmesh_grpc_dpu_state {
+	struct dmesh_grpc_pending_entry pending[DMESH_GRPC_MAX_PENDING];
+};
+
 doca_error_t dmesh_grpc_arena_init(struct dmesh_grpc_arena *arena, void *base, size_t capacity);
 void dmesh_grpc_arena_destroy(struct dmesh_grpc_arena *arena);
 void dmesh_grpc_arena_reset(struct dmesh_grpc_arena *arena);
@@ -48,6 +61,14 @@ doca_error_t dmesh_grpc_hello_request_alloc(struct dmesh_grpc_arena *arena,
 					    const uint32_t *scores,
 					    uint32_t scores_count,
 					    struct dmesh_grpc_hello_request **out);
+doca_error_t dmesh_grpc_hello_flat_alloc(struct dmesh_grpc_arena *arena,
+					 uint64_t id,
+					 const char *name,
+					 uint32_t name_len,
+					 const uint32_t *scores,
+					 uint32_t scores_count,
+					 struct dmesh_grpc_hello_flat **out,
+					 size_t *flat_len);
 
 doca_error_t dmesh_grpc_submit_request(struct objects *objs,
 				       uint32_t schema_id,
@@ -57,7 +78,7 @@ doca_error_t dmesh_grpc_submit_request(struct objects *objs,
 				       uint32_t request_id);
 
 doca_error_t dmesh_grpc_handle_dma_completion(struct objects *objs,
-					      const struct comch_grpc_dma_comp_msg *comp);
+					      struct comch_grpc_dma_comp_msg *comp);
 void dmesh_grpc_dpu_state_destroy(struct objects *objs);
 
 #endif /* GRPC_OFFLOAD_H */

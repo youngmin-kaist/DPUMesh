@@ -8,6 +8,8 @@
 extern "C" {
 #endif
 
+#define MAX_ENCODED_SIZE 8192U
+
 typedef struct {
     uint32_t specialized_attempts;
     uint32_t specialized_hits;

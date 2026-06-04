@@ -77,11 +77,10 @@ typedef struct {
 } HelloRequestFlat;
 
 typedef struct {
-    uint32_t schema_id;
     uint32_t request_id;
+    uint32_t schema_id;
     uint64_t flat;
     uint64_t out;
-    uint32_t out_cap;
 } ProtoTask;
 
 typedef struct {

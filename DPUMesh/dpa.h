@@ -12,6 +12,7 @@
 #include "dpa_common.h"
 
 #define CC_DPA_MAX_MSG_NUM  512
+#define DMESH_DPA_MSGQ_PENDING_SEND_DEPTH (CC_DPA_MAX_MSG_NUM * 4)
 
 struct objects;
 
@@ -42,6 +43,18 @@ struct dmesh_doca_dpa_msgq {
 	int msg_cnt;
 	uint64_t total_ns;
 	bool completed;
+
+	/*
+	 * DPU-side deferred sends. The current DPU worker progresses this MsgQ
+	 * and invokes its callbacks on one thread, so this queue is intentionally
+	 * lock-free. Add synchronization if a future worker drains it from another
+	 * thread.
+	 */
+	uint32_t pending_head;
+	uint32_t pending_tail;
+	uint32_t pending_count;
+	uint32_t pending_high_watermark;
+	struct comch_msg pending_sends[DMESH_DPA_MSGQ_PENDING_SEND_DEPTH];
 };
 
 struct dmesh_doca_dpa_comch {
@@ -91,8 +104,16 @@ dmesh_doca_dpa_comch_create(struct objects *objs);
 doca_error_t
 dmesh_doca_run_dpa_thread(struct objects *objs, struct dmesh_doca_dpa_thread *dpa_thread, struct dmesh_doca_dpa_comch *comch);
 
+doca_error_t
+dmesh_doca_dpa_msgq_pending_push(struct dmesh_doca_dpa_msgq *msgq, struct comch_grpc_dma_comp_msg *comp);
+
 doca_error_t 
 dmesh_doca_dpa_msgq_send(struct dmesh_doca_dpa_msgq *msgq, void *msg, uint32_t msg_size);
+
+doca_error_t
+dmesh_doca_dpa_msgq_drain_pending(struct dmesh_doca_dpa_msgq *msgq,
+				  uint32_t budget,
+				  uint32_t *submitted);
 
 doca_error_t 
 dmesh_doca_dpa_msgq_send_bulk(struct dmesh_doca_dpa_msgq *msgq, uint32_t num_msg,

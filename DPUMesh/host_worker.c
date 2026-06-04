@@ -17,9 +17,90 @@
 #include <doca_buf_array.h>
 #include <doca_dpa.h>
 
+#include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
 
 DOCA_LOG_REGISTER(HOST_WORKER);
+
+static inline uint64_t
+random_chars_next(uint64_t *state)
+{
+    uint64_t x = *state;
+
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *state = x;
+
+    return x * UINT64_C(2685821657736338717);
+}
+
+static inline uint64_t
+random_chars_seed(void)
+{
+    uint64_t seed = (uint64_t)time(NULL);
+
+    seed ^= (uint64_t)clock() << 32;
+    seed ^= (uint64_t)(uintptr_t)&seed;
+
+    if (seed == 0)
+        seed = UINT64_C(0x9e3779b97f4a7c15);
+
+    return seed;
+}
+
+static inline void
+fill_random_chars(char *buf, size_t len)
+{
+    static _Thread_local uint64_t state;
+    size_t offset = 0;
+
+    if (buf == NULL || len == 0)
+        return;
+
+    if (state == 0)
+        state = random_chars_seed();
+
+    while (len - offset >= sizeof(uint64_t)) {
+        uint64_t value = random_chars_next(&state);
+
+        memcpy(buf + offset, &value, sizeof(value));
+        offset += sizeof(value);
+    }
+
+    if (offset < len) {
+        uint64_t value = random_chars_next(&state);
+
+        memcpy(buf + offset, &value, len - offset);
+    }
+}
+
+static inline void
+fill_random_numbers(uint32_t *buf, int count)
+{
+    static _Thread_local uint64_t state;
+    int i = 0;
+
+    if (buf == NULL || count <= 0)
+        return;
+
+    if (state == 0)
+        state = random_chars_seed();
+
+    while (i + 1 < count) {
+        uint64_t value = random_chars_next(&state);
+
+        buf[i++] = (uint32_t)value;
+        buf[i++] = (uint32_t)(value >> 32);
+    }
+
+    if (i < count)
+        buf[i] = (uint32_t)random_chars_next(&state);
+}
 
 void 
 run_host_worker(struct objects *objs)
@@ -122,48 +203,56 @@ run_host_worker(struct objects *objs)
     }
     objs->grpc_offload = &app_arena;
     
-    int pe_progress;
-    while ((pe_progress = doca_pe_progress(objs->pe)) > 0) {
+    while (doca_pe_progress(objs->pe) > 0) {
         /* drain completions / keep host side progressing */
-        DOCA_LOG_INFO("Made progress on PE: %d\n", pe_progress);
     }
 
-    char name[1024];
-    uint32_t scores[4];
-    int name_len;
-    while (true) {
-        struct dmesh_grpc_hello_request *req = NULL;
-
-        while (doca_pe_progress(objs->pe)) {
-            /* drain completions / keep host side progressing */
-        }
-        dma_ring_refresh_consumer(objs->dma_ring);
-        dmesh_grpc_arena_reclaim_through(&app_arena,
-                                            objs->dma_ring->observed_consumer_seq);
-
-        name_len = snprintf(name, sizeof(name), "hello-dpumesh-%u", request_id);
-        if (name_len < 0)
+    char *name;
+    int name_len = 8;
+    if (name_len > 0) {
+        name = (char *)malloc((size_t)name_len + 1);
+        if (name == NULL) {
+            DOCA_LOG_ERR("Failed to allocate name buffer");
             goto argp_cleanup;
-        if ((size_t)name_len >= sizeof(name))
-            name_len = (int)sizeof(name) - 1;
+        }
+        fill_random_chars(name, name_len);
+    }
 
-        scores[0] = request_id;
-        scores[1] = request_id + 1U;
-        scores[2] = request_id + 2U;
-        scores[3] = request_id + 3U;
+    uint32_t *scores = NULL;
+    int scores_count = 0;
+    if (scores_count > 0) {
+        scores = (uint32_t *)malloc((size_t)scores_count * sizeof(uint32_t));
+        if (scores == NULL) {
+            DOCA_LOG_ERR("Failed to allocate scores buffer");
+            goto argp_cleanup;
+        }
+        fill_random_numbers(scores, scores_count);
+    }
 
-        result = dmesh_grpc_hello_request_alloc(&app_arena,
-                                                request_id,
-                                                name,
-                                                (uint32_t)name_len,
-                                                scores,
-                                                4,
-                                                &req);
+    while (true) {
+        struct dmesh_grpc_hello_flat *flat = NULL;
+        size_t flat_len = 0;
+        // struct dmesh_grpc_hello_request *req;
+        // result = dmesh_grpc_hello_request_alloc(&app_arena,
+        //                                         request_id,
+        //                                         name,
+        //                                         (uint32_t)name_len,
+        //                                         scores,
+        //                                         (uint32_t)scores_count,
+        //                                         &req);
+        result = dmesh_grpc_hello_flat_alloc(&app_arena,
+                                             request_id,
+                                             name,
+                                             (uint32_t)name_len,
+                                             scores,
+                                             (uint32_t)scores_count,
+                                             &flat,
+                                             &flat_len);
+
         if (result == DOCA_ERROR_NO_MEMORY) {
             dma_ring_refresh_consumer(objs->dma_ring);
             dmesh_grpc_arena_reclaim_through(&app_arena,
                                                 objs->dma_ring->observed_consumer_seq);
-            (void)doca_pe_progress(objs->producer_pe);
             continue;
         }
         if (result != DOCA_SUCCESS)
@@ -172,8 +261,8 @@ run_host_worker(struct objects *objs)
         result = dmesh_grpc_submit_request(objs,
                                             DMESH_GRPC_SCHEMA_HELLO_REQUEST,
                                             &app_arena,
-                                            req,
-                                            sizeof(*req),
+                                            flat,
+                                            flat_len,
                                             request_id);
         if (result != DOCA_SUCCESS) {
             DOCA_LOG_ERR("Failed to submit gRPC request descriptor: %s",
@@ -181,7 +270,7 @@ run_host_worker(struct objects *objs)
             goto argp_cleanup;
         }
 
-        request_id++;
+        request_id = (request_id + 1) % 10000000;
     }
 
     DOCA_LOG_INFO("Finished Host worker");
@@ -189,6 +278,7 @@ run_host_worker(struct objects *objs)
 argp_cleanup:
     if (objs != NULL && objs->grpc_offload == &app_arena)
         objs->grpc_offload = NULL;
+    free(scores);
     dmesh_grpc_arena_destroy(&app_arena);
     clean_argp();
 // exit: 
