@@ -42,7 +42,7 @@ srcs = [
     'dpa.c',
     'dma.c',
     'dpu_worker.c',
-    'host_worker.c',
+    get_option('host_worker_bench') ? 'host_worker_bench.c' : 'host_worker.c',
     'ring.c',
     'grpc/grpc_offload.c',
 ]

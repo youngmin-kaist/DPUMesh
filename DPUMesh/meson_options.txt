@@ -1,0 +1,4 @@
+option('host_worker_bench',
+       type : 'boolean',
+       value : false,
+       description : 'Build host_worker_bench.c instead of host_worker.c')
