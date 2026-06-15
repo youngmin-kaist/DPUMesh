@@ -13,6 +13,13 @@
 
 DOCA_LOG_REGISTER(GRPC_OFFLOAD);
 
+struct dmesh_grpc_arena_txn {
+	struct dmesh_grpc_arena *arena;
+	uint32_t block_idx;
+	size_t offset;
+	bool committed;
+};
+
 static size_t
 align_up_size(size_t value, size_t align)
 {
@@ -34,7 +41,7 @@ align_up_uintptr(uintptr_t value, size_t align)
 }
 
 static void
-dmesh_grpc_arena_release_block(struct dmesh_grpc_arena *arena, uint32_t block_idx)
+dmesh_grpc_arena_link_free_block(struct dmesh_grpc_arena *arena, uint32_t block_idx)
 {
 	struct dmesh_grpc_arena_block *block;
 
@@ -48,6 +55,22 @@ dmesh_grpc_arena_release_block(struct dmesh_grpc_arena *arena, uint32_t block_id
 	block->active = 0;
 	block->next_free = arena->free_head;
 	arena->free_head = block_idx;
+	arena->free_count++;
+}
+
+static void
+dmesh_grpc_arena_release_block(struct dmesh_grpc_arena *arena, uint32_t block_idx)
+{
+	struct dmesh_grpc_arena_block *block;
+
+	if (arena == NULL || arena->blocks == NULL || block_idx >= arena->block_count)
+		return;
+
+	block = &arena->blocks[block_idx];
+	if (block->in_use == 0 && block->active == 0)
+		return;
+
+	dmesh_grpc_arena_link_free_block(arena, block_idx);
 }
 
 static uint32_t
@@ -62,12 +85,20 @@ dmesh_grpc_arena_pop_block(struct dmesh_grpc_arena *arena)
 	block_idx = arena->free_head;
 	block = &arena->blocks[block_idx];
 	arena->free_head = block->next_free;
+	if (arena->free_count != 0)
+		arena->free_count--;
 	block->offset = 0;
 	block->owner_ring_seq = 0;
 	block->in_use = 1;
 	block->active = 0;
 	block->next_free = DMESH_GRPC_ARENA_NO_BLOCK;
 	return block_idx;
+}
+
+static size_t
+dmesh_grpc_arena_active_slot(const struct dmesh_grpc_arena *arena, uint64_t ring_seq)
+{
+	return (size_t)(ring_seq % arena->active_count);
 }
 
 static uint32_t
@@ -92,6 +123,102 @@ dmesh_grpc_arena_block_for_ptr(const struct dmesh_grpc_arena *arena, const void 
 	return block_idx;
 }
 
+static doca_error_t
+dmesh_grpc_arena_txn_begin(struct dmesh_grpc_arena *arena,
+			   struct dmesh_grpc_arena_txn *txn)
+{
+	uint32_t block_idx;
+
+	if (arena == NULL || arena->base == NULL || arena->blocks == NULL ||
+	    txn == NULL)
+		return DOCA_ERROR_INVALID_VALUE;
+
+	block_idx = dmesh_grpc_arena_pop_block(arena);
+	if (block_idx == DMESH_GRPC_ARENA_NO_BLOCK)
+		return DOCA_ERROR_NO_MEMORY;
+
+	*txn = (struct dmesh_grpc_arena_txn){
+		.arena = arena,
+		.block_idx = block_idx,
+		.offset = 0,
+		.committed = false,
+	};
+	return DOCA_SUCCESS;
+}
+
+static void *
+dmesh_grpc_arena_txn_alloc(struct dmesh_grpc_arena_txn *txn, size_t size,
+			   size_t align, bool zero_padding)
+{
+	struct dmesh_grpc_arena *arena;
+	struct dmesh_grpc_arena_block *block;
+	size_t off;
+	size_t alloc_size;
+	size_t block_base_off;
+	uintptr_t base_addr;
+	uintptr_t raw_addr;
+	uintptr_t aligned_addr;
+
+	if (txn == NULL || txn->arena == NULL || txn->committed || size == 0)
+		return NULL;
+
+	arena = txn->arena;
+	if (txn->block_idx >= arena->block_count)
+		return NULL;
+
+	if (align < DMESH_GRPC_ARENA_ADDR_ALIGN)
+		align = DMESH_GRPC_ARENA_ADDR_ALIGN;
+
+	block = &arena->blocks[txn->block_idx];
+	if (block->in_use == 0 || block->active != 0)
+		return NULL;
+
+	block_base_off = (size_t)txn->block_idx * arena->block_size;
+	base_addr = (uintptr_t)(arena->base + block_base_off);
+	raw_addr = base_addr + txn->offset;
+	aligned_addr = align_up_uintptr(raw_addr, align);
+	if (aligned_addr < base_addr)
+		return NULL;
+
+	off = (size_t)(aligned_addr - base_addr);
+	alloc_size = align_up_size(size, DMESH_GRPC_DMA_MSG_ALIGN);
+	if (alloc_size == SIZE_MAX || off > arena->block_size ||
+	    alloc_size > arena->block_size - off)
+		return NULL;
+
+	txn->offset = off + alloc_size;
+	block->offset = txn->offset;
+	if (zero_padding && alloc_size > size)
+		memset((uint8_t *)aligned_addr + size, 0, alloc_size - size);
+	return (void *)aligned_addr;
+}
+
+static doca_error_t
+dmesh_grpc_arena_txn_commit(struct dmesh_grpc_arena_txn *txn, const void *request)
+{
+	struct dmesh_grpc_arena *arena;
+
+	if (txn == NULL || txn->arena == NULL || request == NULL)
+		return DOCA_ERROR_INVALID_VALUE;
+
+	arena = txn->arena;
+	if (dmesh_grpc_arena_block_for_ptr(arena, request) != txn->block_idx)
+		return DOCA_ERROR_BAD_STATE;
+
+	txn->committed = true;
+	return DOCA_SUCCESS;
+}
+
+static void
+dmesh_grpc_arena_txn_abort(struct dmesh_grpc_arena_txn *txn)
+{
+	if (txn == NULL || txn->arena == NULL || txn->committed)
+		return;
+
+	dmesh_grpc_arena_release_block(txn->arena, txn->block_idx);
+	txn->committed = true;
+}
+
 doca_error_t
 dmesh_grpc_arena_init(struct dmesh_grpc_arena *arena, void *base, size_t capacity)
 {
@@ -106,15 +233,24 @@ dmesh_grpc_arena_init(struct dmesh_grpc_arena *arena, void *base, size_t capacit
 	arena->base = (uint8_t *)base;
 	arena->block_size = DMA_MSG_SIZE_LIMIT;
 	arena->block_count = capacity / DMA_MSG_SIZE_LIMIT;
+	if (arena->block_count > UINT32_MAX)
+		return DOCA_ERROR_INVALID_VALUE;
 	arena->capacity = capacity;
 	arena->free_head = DMESH_GRPC_ARENA_NO_BLOCK;
-	arena->current_block = DMESH_GRPC_ARENA_NO_BLOCK;
 	arena->blocks = calloc(arena->block_count, sizeof(*arena->blocks));
 	if (arena->blocks == NULL)
 		return DOCA_ERROR_NO_MEMORY;
+	arena->active_count = arena->block_count;
+	arena->active = calloc(arena->active_count, sizeof(*arena->active));
+	if (arena->active == NULL) {
+		free(arena->blocks);
+		memset(arena, 0, sizeof(*arena));
+		arena->free_head = DMESH_GRPC_ARENA_NO_BLOCK;
+		return DOCA_ERROR_NO_MEMORY;
+	}
 
 	for (i = 0; i < arena->block_count; ++i)
-		dmesh_grpc_arena_release_block(arena, arena->block_count - 1U - i);
+		dmesh_grpc_arena_link_free_block(arena, arena->block_count - 1U - i);
 	return DOCA_SUCCESS;
 }
 
@@ -124,9 +260,9 @@ dmesh_grpc_arena_destroy(struct dmesh_grpc_arena *arena)
 	if (arena == NULL)
 		return;
 	free(arena->blocks);
+	free(arena->active);
 	memset(arena, 0, sizeof(*arena));
 	arena->free_head = DMESH_GRPC_ARENA_NO_BLOCK;
-	arena->current_block = DMESH_GRPC_ARENA_NO_BLOCK;
 }
 
 void
@@ -137,87 +273,38 @@ dmesh_grpc_arena_reset(struct dmesh_grpc_arena *arena)
 	if (arena == NULL)
 		return;
 	arena->free_head = DMESH_GRPC_ARENA_NO_BLOCK;
-	arena->current_block = DMESH_GRPC_ARENA_NO_BLOCK;
+	arena->free_count = 0;
+	arena->reclaimed_seq = 0;
+	if (arena->blocks != NULL)
+		memset(arena->blocks, 0, arena->block_count * sizeof(*arena->blocks));
+	if (arena->active != NULL)
+		memset(arena->active, 0, arena->active_count * sizeof(*arena->active));
 	for (i = 0; i < arena->block_count; ++i)
-		dmesh_grpc_arena_release_block(arena, arena->block_count - 1U - i);
+		dmesh_grpc_arena_link_free_block(arena, arena->block_count - 1U - i);
 }
 
 size_t
 dmesh_grpc_arena_available(const struct dmesh_grpc_arena *arena)
 {
-	size_t count = 0;
-	uint32_t block_idx;
-
 	if (arena == NULL || arena->blocks == NULL)
 		return 0;
-	for (block_idx = arena->free_head;
-	     block_idx != DMESH_GRPC_ARENA_NO_BLOCK && block_idx < arena->block_count;
-	     block_idx = arena->blocks[block_idx].next_free)
-		count++;
-	return count * arena->block_size;
-}
-
-void *
-dmesh_grpc_arena_alloc(struct dmesh_grpc_arena *arena, size_t size, size_t align)
-{
-	size_t off;
-	size_t alloc_size;
-	size_t block_base_off;
-	uintptr_t base_addr;
-	uintptr_t raw_addr;
-	uintptr_t aligned_addr;
-	struct dmesh_grpc_arena_block *block;
-
-	if (arena == NULL || arena->base == NULL || arena->blocks == NULL)
-		return NULL;
-
-	if (align < DMESH_GRPC_ARENA_ADDR_ALIGN)
-		align = DMESH_GRPC_ARENA_ADDR_ALIGN;
-
-	if (arena->current_block == DMESH_GRPC_ARENA_NO_BLOCK) {
-		arena->current_block = dmesh_grpc_arena_pop_block(arena);
-		if (arena->current_block == DMESH_GRPC_ARENA_NO_BLOCK)
-			return NULL;
-	}
-
-	if (arena->current_block >= arena->block_count)
-		return NULL;
-
-	/*
-	 * Pointer fields are DMA sources. Keep every returned address 64B
-	 * aligned and reserve zero-filled 128B chunks so DPA can round DMA copy
-	 * sizes without reading another object's contents.
-	 */
-	block = &arena->blocks[arena->current_block];
-	block_base_off = (size_t)arena->current_block * arena->block_size;
-	base_addr = (uintptr_t)(arena->base + block_base_off);
-	raw_addr = base_addr + block->offset;
-	aligned_addr = align_up_uintptr(raw_addr, align);
-	if (aligned_addr < base_addr)
-		return NULL;
-
-	off = (size_t)(aligned_addr - base_addr);
-	alloc_size = align_up_size(size, DMESH_GRPC_DMA_MSG_ALIGN);
-	if (off + alloc_size > arena->block_size)
-		return NULL;
-
-	block->offset = off + alloc_size;
-	memset((void *)aligned_addr, 0, alloc_size);
-	return (void *)aligned_addr;
+	return arena->free_count * arena->block_size;
 }
 
 void
 dmesh_grpc_arena_abort_request(struct dmesh_grpc_arena *arena, const void *request)
 {
 	uint32_t block_idx;
+	struct dmesh_grpc_arena_block *block;
 
 	block_idx = dmesh_grpc_arena_block_for_ptr(arena, request);
 	if (block_idx == DMESH_GRPC_ARENA_NO_BLOCK)
 		return;
-	if (arena->blocks[block_idx].active != 0)
+	block = &arena->blocks[block_idx];
+	if (block->active != 0)
 		return;
-	if (arena->current_block == block_idx)
-		arena->current_block = DMESH_GRPC_ARENA_NO_BLOCK;
+	if (block->in_use == 0)
+		return;
 	dmesh_grpc_arena_release_block(arena, block_idx);
 }
 
@@ -228,9 +315,15 @@ dmesh_grpc_arena_finish_request(struct dmesh_grpc_arena *arena,
 {
 	uint32_t block_idx;
 	struct dmesh_grpc_arena_block *block;
+	struct dmesh_grpc_arena_active *entry;
+	size_t slot;
 
-	if (ring_seq == 0)
+	if (arena == NULL || arena->active == NULL || arena->active_count == 0 ||
+	    ring_seq == 0)
 		return DOCA_ERROR_INVALID_VALUE;
+	if (ring_seq <= arena->reclaimed_seq)
+		return DOCA_ERROR_BAD_STATE;
+
 	block_idx = dmesh_grpc_arena_block_for_ptr(arena, request);
 	if (block_idx == DMESH_GRPC_ARENA_NO_BLOCK)
 		return DOCA_ERROR_INVALID_VALUE;
@@ -240,51 +333,83 @@ dmesh_grpc_arena_finish_request(struct dmesh_grpc_arena *arena,
 		return DOCA_ERROR_BAD_STATE;
 
 	/*
-	 * Ownership assumption: DPA may keep DMA reads against this host block
-	 * until it reports GRPC_DMA_COMPLETED for ring_seq. Host must not recycle
-	 * the block before that completion path calls reclaim_ring_seq().
+	 * Ownership assumption: one host worker owns this arena metadata. DPA may
+	 * keep DMA reads against this host block until it publishes consumer_seq
+	 * past ring_seq; host must not recycle the block before reclaim observes
+	 * that sequence. Add locking/atomics here if multiple host workers share an
+	 * arena.
 	 */
+	slot = dmesh_grpc_arena_active_slot(arena, ring_seq);
+	entry = &arena->active[slot];
+	if (entry->ring_seq != 0)
+		return DOCA_ERROR_BAD_STATE;
+
+	entry->ring_seq = ring_seq;
+	entry->block_idx = block_idx;
 	block->owner_ring_seq = ring_seq;
 	block->active = 1;
-	if (arena->current_block == block_idx)
-		arena->current_block = DMESH_GRPC_ARENA_NO_BLOCK;
 	return DOCA_SUCCESS;
 }
 
 void
 dmesh_grpc_arena_reclaim_ring_seq(struct dmesh_grpc_arena *arena, uint64_t ring_seq)
 {
-	uint32_t i;
+	struct dmesh_grpc_arena_active *entry;
+	size_t slot;
+	uint32_t block_idx;
 
-	if (arena == NULL || arena->blocks == NULL || ring_seq == 0)
+	if (arena == NULL || arena->blocks == NULL || arena->active == NULL ||
+	    arena->active_count == 0 || ring_seq == 0)
+		return;
+	if (ring_seq <= arena->reclaimed_seq)
 		return;
 
-	for (i = 0; i < arena->block_count; ++i) {
-		if (arena->blocks[i].active != 0 &&
-		    arena->blocks[i].owner_ring_seq == ring_seq) {
-			dmesh_grpc_arena_release_block(arena, i);
-			return;
-		}
-	}
+	slot = dmesh_grpc_arena_active_slot(arena, ring_seq);
+	entry = &arena->active[slot];
+	if (entry->ring_seq != ring_seq)
+		return;
+
+	block_idx = entry->block_idx;
+	entry->ring_seq = 0;
+	entry->block_idx = DMESH_GRPC_ARENA_NO_BLOCK;
+	dmesh_grpc_arena_release_block(arena, block_idx);
+	if (ring_seq == arena->reclaimed_seq + 1U)
+		arena->reclaimed_seq = ring_seq;
 }
 
 void
 dmesh_grpc_arena_reclaim_through(struct dmesh_grpc_arena *arena, uint64_t consumer_seq)
 {
-	uint32_t i;
+	struct dmesh_grpc_arena_active *entry;
+	uint64_t seq;
+	size_t slot;
+	uint32_t block_idx;
 
-	if (arena == NULL || arena->blocks == NULL || consumer_seq == 0)
+	if (arena == NULL || arena->blocks == NULL || arena->active == NULL ||
+	    arena->active_count == 0 || consumer_seq == 0)
+		return;
+	if (consumer_seq <= arena->reclaimed_seq)
 		return;
 
 	/*
 	 * consumer_seq is published by DPA only after the serialize completion
 	 * message is posted and the descriptor slot is released. This assumes the
 	 * host observes that PCI write before reclaiming owner_ring_seq blocks.
+	 * Only advance reclaimed_seq over active entries we registered locally; the
+	 * host can briefly observe non-zero initial/test consumer_seq values before
+	 * the DPA thread resets the shared consumer state.
 	 */
-	for (i = 0; i < arena->block_count; ++i) {
-		if (arena->blocks[i].active != 0 &&
-		    arena->blocks[i].owner_ring_seq <= consumer_seq)
-			dmesh_grpc_arena_release_block(arena, i);
+	for (seq = arena->reclaimed_seq + 1U; seq <= consumer_seq; ++seq) {
+		slot = dmesh_grpc_arena_active_slot(arena, seq);
+		entry = &arena->active[slot];
+		if (entry->ring_seq != seq)
+			break;
+
+		block_idx = entry->block_idx;
+		entry->ring_seq = 0;
+		entry->block_idx = DMESH_GRPC_ARENA_NO_BLOCK;
+		dmesh_grpc_arena_release_block(arena, block_idx);
+		arena->reclaimed_seq = seq;
 	}
 }
 
@@ -297,8 +422,9 @@ dmesh_grpc_hello_request_alloc(struct dmesh_grpc_arena *arena,
 			       uint32_t scores_count,
 			       struct dmesh_grpc_hello_request **out)
 {
+	struct dmesh_grpc_arena_txn txn = {0};
 	struct dmesh_grpc_hello_request *req;
-	uint32_t saved_block;
+	doca_error_t result;
 
 	if (arena == NULL || out == NULL)
 		return DOCA_ERROR_INVALID_VALUE;
@@ -306,24 +432,25 @@ dmesh_grpc_hello_request_alloc(struct dmesh_grpc_arena *arena,
 		return DOCA_ERROR_INVALID_VALUE;
 
 	*out = NULL;
-	saved_block = arena->current_block;
-	req = dmesh_grpc_arena_alloc(arena, sizeof(*req), DMESH_GRPC_ARENA_ADDR_ALIGN);
-	if (req == NULL)
-		return DOCA_ERROR_NO_MEMORY;
-	if (saved_block == DMESH_GRPC_ARENA_NO_BLOCK)
-		saved_block = arena->current_block;
 
+	result = dmesh_grpc_arena_txn_begin(arena, &txn);
+	if (result != DOCA_SUCCESS)
+		return result;
+
+	req = dmesh_grpc_arena_txn_alloc(&txn, sizeof(*req),
+					 DMESH_GRPC_ARENA_ADDR_ALIGN, true);
+	if (req == NULL)
+		goto no_memory;
+
+	memset(req, 0, sizeof(*req));
 	req->id = id;
 
 	if (name_len != 0) {
-		char *name_dst = dmesh_grpc_arena_alloc(arena, name_len,
-							DMESH_GRPC_ARENA_ADDR_ALIGN);
-		if (name_dst == NULL) {
-			if (saved_block < arena->block_count)
-				dmesh_grpc_arena_release_block(arena, saved_block);
-			arena->current_block = DMESH_GRPC_ARENA_NO_BLOCK;
-			return DOCA_ERROR_NO_MEMORY;
-		}
+		char *name_dst = dmesh_grpc_arena_txn_alloc(&txn, name_len,
+							    DMESH_GRPC_ARENA_ADDR_ALIGN,
+							    true);
+		if (name_dst == NULL)
+			goto no_memory;
 		memcpy(name_dst, name, name_len);
 		req->name = name_dst;
 	}
@@ -333,15 +460,14 @@ dmesh_grpc_hello_request_alloc(struct dmesh_grpc_arena *arena,
 	req->name_len = name_len;
 	
 	if (scores_count != 0) {
+		if (scores_count > SIZE_MAX / sizeof(uint32_t))
+			goto invalid_value;
 		size_t scores_bytes = (size_t)scores_count * sizeof(uint32_t);
-		uint32_t *scores_dst = dmesh_grpc_arena_alloc(arena, scores_bytes,
-							      DMESH_GRPC_ARENA_ADDR_ALIGN);
-		if (scores_dst == NULL) {
-			if (saved_block < arena->block_count)
-				dmesh_grpc_arena_release_block(arena, saved_block);
-			arena->current_block = DMESH_GRPC_ARENA_NO_BLOCK;
-			return DOCA_ERROR_NO_MEMORY;
-		}
+		uint32_t *scores_dst = dmesh_grpc_arena_txn_alloc(&txn, scores_bytes,
+								  DMESH_GRPC_ARENA_ADDR_ALIGN,
+								  true);
+		if (scores_dst == NULL)
+			goto no_memory;
 		memcpy(scores_dst, scores, scores_bytes);
 		req->scores = scores_dst;
 	}
@@ -350,8 +476,22 @@ dmesh_grpc_hello_request_alloc(struct dmesh_grpc_arena *arena,
 	}
 	req->scores_count = scores_count;
 
+	result = dmesh_grpc_arena_txn_commit(&txn, req);
+	if (result != DOCA_SUCCESS) {
+		dmesh_grpc_arena_txn_abort(&txn);
+		return result;
+	}
+
 	*out = req;
 	return DOCA_SUCCESS;
+
+no_memory:
+	dmesh_grpc_arena_txn_abort(&txn);
+	return DOCA_ERROR_NO_MEMORY;
+
+invalid_value:
+	dmesh_grpc_arena_txn_abort(&txn);
+	return DOCA_ERROR_INVALID_VALUE;
 }
 
 doca_error_t
@@ -364,11 +504,14 @@ dmesh_grpc_hello_flat_alloc(struct dmesh_grpc_arena *arena,
 			    struct dmesh_grpc_hello_flat **out,
 			    size_t *flat_len_out)
 {
+	struct dmesh_grpc_arena_txn txn = {0};
 	struct dmesh_grpc_hello_flat *flat;
+	size_t raw_len;
 	size_t flat_len;
 	size_t scores_bytes = 0;
 	uint32_t name_off = 0;
 	uint32_t scores_off = 0;
+	doca_error_t result;
 
 	if (arena == NULL || out == NULL || flat_len_out == NULL)
 		return DOCA_ERROR_INVALID_VALUE;
@@ -378,28 +521,43 @@ dmesh_grpc_hello_flat_alloc(struct dmesh_grpc_arena *arena,
 	*out = NULL;
 	*flat_len_out = 0;
 
-	flat_len = sizeof(*flat);
+	raw_len = sizeof(*flat);
 
 	if (name_len != 0) {
-		name_off = (uint32_t)flat_len;
-		flat_len += name_len;
+		name_off = (uint32_t)raw_len;
+		if ((size_t)name_len > SIZE_MAX - raw_len)
+			return DOCA_ERROR_INVALID_VALUE;
+		raw_len += name_len;
 	}
 
 	if (scores_count != 0) {
+		if (scores_count > SIZE_MAX / sizeof(uint32_t))
+			return DOCA_ERROR_INVALID_VALUE;
 		scores_bytes = (size_t)scores_count * sizeof(uint32_t);
-		scores_off = (uint32_t)flat_len;
-		flat_len += scores_bytes;
+		scores_off = (uint32_t)raw_len;
+		if (scores_bytes > SIZE_MAX - raw_len)
+			return DOCA_ERROR_INVALID_VALUE;
+		raw_len += scores_bytes;
 	}
 
-	flat_len = align_up_size(flat_len, DMESH_GRPC_DMA_MSG_ALIGN);
+	flat_len = align_up_size(raw_len, DMESH_GRPC_DMA_MSG_ALIGN);
+	if (flat_len == SIZE_MAX)
+		return DOCA_ERROR_INVALID_VALUE;
 	if (flat_len > DMESH_GRPC_MAX_FLAT_SIZE) {
 		DOCA_LOG_INFO("flat_len %zu exceeds max limit %u", flat_len, DMESH_GRPC_MAX_FLAT_SIZE);
 		return DOCA_ERROR_INVALID_VALUE;
 	}
 
-	flat = dmesh_grpc_arena_alloc(arena, flat_len, DMESH_GRPC_ARENA_ADDR_ALIGN);
-	if (flat == NULL)
+	result = dmesh_grpc_arena_txn_begin(arena, &txn);
+	if (result != DOCA_SUCCESS)
+		return result;
+
+	flat = dmesh_grpc_arena_txn_alloc(&txn, flat_len,
+					  DMESH_GRPC_ARENA_ADDR_ALIGN, false);
+	if (flat == NULL) {
+		dmesh_grpc_arena_txn_abort(&txn);
 		return DOCA_ERROR_NO_MEMORY;
+	}
 
 	flat->id = id;
 	flat->name.offset = name_off;
@@ -411,6 +569,14 @@ dmesh_grpc_hello_flat_alloc(struct dmesh_grpc_arena *arena,
 		memcpy((uint8_t *)flat + name_off, name, name_len);
 	if (scores_bytes != 0)
 		memcpy((uint8_t *)flat + scores_off, scores, scores_bytes);
+	if (flat_len > raw_len)
+		memset((uint8_t *)flat + raw_len, 0, flat_len - raw_len);
+
+	result = dmesh_grpc_arena_txn_commit(&txn, flat);
+	if (result != DOCA_SUCCESS) {
+		dmesh_grpc_arena_txn_abort(&txn);
+		return result;
+	}
 
 	*out = flat;
 	*flat_len_out = flat_len;

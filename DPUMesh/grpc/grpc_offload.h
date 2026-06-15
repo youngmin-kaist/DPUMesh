@@ -21,14 +21,23 @@ struct dmesh_grpc_arena_block {
 	uint8_t reserved[2];
 };
 
+struct dmesh_grpc_arena_active {
+	uint64_t ring_seq;
+	uint32_t block_idx;
+	uint32_t reserved;
+};
+
 struct dmesh_grpc_arena {
 	uint8_t *base;
 	size_t capacity;
 	size_t block_size;
 	size_t block_count;
+	size_t free_count;
+	size_t active_count;
+	uint64_t reclaimed_seq;
 	uint32_t free_head;
-	uint32_t current_block;
 	struct dmesh_grpc_arena_block *blocks;
+	struct dmesh_grpc_arena_active *active;
 };
 
 struct dmesh_grpc_pending_entry {
@@ -46,7 +55,6 @@ doca_error_t dmesh_grpc_arena_init(struct dmesh_grpc_arena *arena, void *base, s
 void dmesh_grpc_arena_destroy(struct dmesh_grpc_arena *arena);
 void dmesh_grpc_arena_reset(struct dmesh_grpc_arena *arena);
 size_t dmesh_grpc_arena_available(const struct dmesh_grpc_arena *arena);
-void *dmesh_grpc_arena_alloc(struct dmesh_grpc_arena *arena, size_t size, size_t align);
 void dmesh_grpc_arena_abort_request(struct dmesh_grpc_arena *arena, const void *request);
 doca_error_t dmesh_grpc_arena_finish_request(struct dmesh_grpc_arena *arena,
 					     const void *request,

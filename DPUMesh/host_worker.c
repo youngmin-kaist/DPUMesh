@@ -208,7 +208,7 @@ run_host_worker(struct objects *objs)
     }
 
     char *name;
-    int name_len = 0;
+    int name_len = 8000;
     if (name_len > 0) {
         name = (char *)malloc((size_t)name_len + 1);
         if (name == NULL) {
@@ -219,7 +219,7 @@ run_host_worker(struct objects *objs)
     }
 
     uint32_t *scores = NULL;
-    int scores_count = 200;
+    int scores_count = 0;
     if (scores_count > 0) {
         scores = (uint32_t *)malloc((size_t)scores_count * sizeof(uint32_t));
         if (scores == NULL) {
