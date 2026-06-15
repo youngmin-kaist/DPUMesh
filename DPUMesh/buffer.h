@@ -37,9 +37,16 @@ void clean_local_mem_bufs(struct local_mem_bufs *local);
 
 doca_error_t
 alloc_buffer_and_set_mmap(struct doca_mmap **mmap, struct doca_dev *dev,
-                        void **buffer, size_t buffer_size, uint32_t access_mask);
-						
+	                        void **buffer, size_t buffer_size, uint32_t access_mask);
+
+doca_error_t
+alloc_hugepage_buffer_and_set_mmap(struct doca_mmap **mmap, struct doca_dev *dev,
+				   void **buffer, size_t buffer_size, uint32_t access_mask);
+							
 doca_error_t
 destroy_mmap_and_free_buffer(struct doca_mmap *mmap, void *buffer);
+
+doca_error_t
+destroy_mmap_and_unmap_hugepage_buffer(struct doca_mmap *mmap, void *buffer, size_t buffer_size);
 
 #endif // BUFFER_H

@@ -134,7 +134,7 @@ run_host_worker(struct objects *objs)
     }
 
     /* allocate local buffer and set mmap for PCI export */
-    result = alloc_buffer_and_set_mmap(&objs->local_mmap, objs->dev,
+    result = alloc_hugepage_buffer_and_set_mmap(&objs->local_mmap, objs->dev,
                             &objs->dma_buffer, BUFFER_SIZE,
                            DOCA_ACCESS_FLAG_PCI_READ_WRITE);
     if (result != DOCA_SUCCESS) {
@@ -208,7 +208,7 @@ run_host_worker(struct objects *objs)
     }
 
     char *name;
-    int name_len = 8;
+    int name_len = 0;
     if (name_len > 0) {
         name = (char *)malloc((size_t)name_len + 1);
         if (name == NULL) {
@@ -219,7 +219,7 @@ run_host_worker(struct objects *objs)
     }
 
     uint32_t *scores = NULL;
-    int scores_count = 0;
+    int scores_count = 200;
     if (scores_count > 0) {
         scores = (uint32_t *)malloc((size_t)scores_count * sizeof(uint32_t));
         if (scores == NULL) {
@@ -280,6 +280,11 @@ argp_cleanup:
         objs->grpc_offload = NULL;
     free(scores);
     dmesh_grpc_arena_destroy(&app_arena);
+    if (objs != NULL) {
+        destroy_mmap_and_unmap_hugepage_buffer(objs->local_mmap, objs->dma_buffer, BUFFER_SIZE);
+        objs->local_mmap = NULL;
+        objs->dma_buffer = NULL;
+    }
     clean_argp();
 // exit: 
     return;

@@ -4,7 +4,26 @@
 #include <doca_dev.h>
 #include <doca_mmap.h>
 
+#include <assert.h>
+#include <errno.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+
 DOCA_LOG_REGISTER(BUFFER);
+
+#define DMESH_HUGEPAGE_SIZE (2UL * 1024UL * 1024UL)
+
+static size_t
+round_up_size(size_t value, size_t align)
+{
+	if (align == 0)
+		return value;
+	if (value > SIZE_MAX - (align - 1U))
+		return SIZE_MAX;
+	return (value + align - 1U) & ~(align - 1U);
+}
 
 void clean_local_mem_bufs(struct local_mem_bufs *local)
 {
@@ -208,12 +227,89 @@ alloc_buffer_and_set_mmap(struct doca_mmap **mmap, struct doca_dev *dev,
 
 free_buffer:
     free(*buffer);
-    buffer = NULL;
+    *buffer = NULL;
 destroy_mmap:
     doca_mmap_destroy(*mmap);
     *mmap = NULL;
 
     return result;
+}
+
+doca_error_t
+alloc_hugepage_buffer_and_set_mmap(struct doca_mmap **mmap_out, struct doca_dev *dev,
+				   void **buffer, size_t buffer_size, uint32_t access_mask)
+{
+	doca_error_t result;
+	size_t map_size;
+
+	if (mmap_out == NULL || buffer == NULL || buffer_size == 0)
+		return DOCA_ERROR_INVALID_VALUE;
+
+	*mmap_out = NULL;
+	*buffer = NULL;
+	map_size = round_up_size(buffer_size, DMESH_HUGEPAGE_SIZE);
+	if (map_size == SIZE_MAX)
+		return DOCA_ERROR_INVALID_VALUE;
+
+	result = doca_mmap_create(mmap_out);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Failed to create local mmap - %s",
+			     doca_error_get_name(result));
+		return result;
+	}
+
+	result = doca_mmap_add_dev(*mmap_out, dev);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Failed to add device to mmap - %s",
+			     doca_error_get_name(result));
+		goto destroy_mmap;
+	}
+
+	result = doca_mmap_set_permissions(*mmap_out, access_mask);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Failed to set mmap permissions - %s",
+			     doca_error_get_name(result));
+		goto destroy_mmap;
+	}
+
+	*buffer = mmap(NULL, map_size, PROT_READ | PROT_WRITE,
+		       MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+	if (*buffer == MAP_FAILED) {
+		DOCA_LOG_ERR("Failed to allocate hugepage buffer (%zu bytes): %s",
+			     map_size, strerror(errno));
+		*buffer = NULL;
+		result = DOCA_ERROR_NO_MEMORY;
+		goto destroy_mmap;
+	}
+
+	memset(*buffer, 0, map_size);
+	DOCA_LOG_INFO("Allocated hugepage buffer at address %p with mmap size %zu and DOCA size %zu",
+		      *buffer, map_size, buffer_size);
+
+	result = doca_mmap_set_memrange(*mmap_out, *buffer, buffer_size);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Failed to set mmap memrange - %s",
+			     doca_error_get_name(result));
+		goto unmap_buffer;
+	}
+
+	result = doca_mmap_start(*mmap_out);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Failed to start mmap - %s",
+			     doca_error_get_name(result));
+		goto unmap_buffer;
+	}
+
+	return DOCA_SUCCESS;
+
+unmap_buffer:
+	munmap(*buffer, map_size);
+	*buffer = NULL;
+destroy_mmap:
+	doca_mmap_destroy(*mmap_out);
+	*mmap_out = NULL;
+
+	return result;
 }
 
 doca_error_t
@@ -231,4 +327,30 @@ destroy_mmap_and_free_buffer(struct doca_mmap *mmap, void *buffer)
     free(buffer);
 
     return DOCA_SUCCESS;
+}
+
+doca_error_t
+destroy_mmap_and_unmap_hugepage_buffer(struct doca_mmap *mmap, void *buffer, size_t buffer_size)
+{
+	doca_error_t result = DOCA_SUCCESS;
+	size_t map_size;
+
+	if (mmap != NULL) {
+		result = doca_mmap_destroy(mmap);
+		if (result != DOCA_SUCCESS) {
+			DOCA_LOG_ERR("Failed to destroy mmap - %s",
+				     doca_error_get_name(result));
+			return result;
+		}
+	}
+
+	if (buffer != NULL && buffer_size != 0) {
+		map_size = round_up_size(buffer_size, DMESH_HUGEPAGE_SIZE);
+		if (map_size == SIZE_MAX || munmap(buffer, map_size) != 0) {
+			DOCA_LOG_ERR("Failed to unmap hugepage buffer: %s", strerror(errno));
+			return DOCA_ERROR_DRIVER;
+		}
+	}
+
+	return DOCA_SUCCESS;
 }

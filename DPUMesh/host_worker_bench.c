@@ -541,9 +541,9 @@ run_host_worker(struct objects *objs)
 		goto argp_cleanup;
 	}
 
-	result = alloc_buffer_and_set_mmap(&objs->local_mmap, objs->dev,
-					   &objs->dma_buffer, BUFFER_SIZE,
-					   DOCA_ACCESS_FLAG_PCI_READ_WRITE);
+	result = alloc_hugepage_buffer_and_set_mmap(&objs->local_mmap, objs->dev,
+						    &objs->dma_buffer, BUFFER_SIZE,
+						    DOCA_ACCESS_FLAG_PCI_READ_WRITE);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to allocate DMA resources: %s", doca_error_get_descr(result));
 		goto argp_cleanup;
@@ -636,6 +636,11 @@ argp_cleanup:
 		objs->grpc_offload = NULL;
 	free(scores);
 	dmesh_grpc_arena_destroy(&app_arena);
+	if (objs != NULL) {
+		destroy_mmap_and_unmap_hugepage_buffer(objs->local_mmap, objs->dma_buffer, BUFFER_SIZE);
+		objs->local_mmap = NULL;
+		objs->dma_buffer = NULL;
+	}
 	clean_argp();
 	return;
 }

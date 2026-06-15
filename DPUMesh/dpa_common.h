@@ -15,7 +15,7 @@ typedef uint64_t doca_dpa_dev_uintptr_t;
 typedef uint64_t doca_dpa_dev_buf_arr_t;
 typedef uint64_t doca_dpa_dev_notification_completion_t;
 
-#define DMESH_GRPC_SERIALIZER_THREADS 4U
+#define DMESH_GRPC_SERIALIZER_THREADS 16U
 #define DEBUG_INTERVAL (1024 * 128 + 7717)
 // #define DEBUG_INTERVAL 0xffffffff
 #define DEBUG_LOG 0
