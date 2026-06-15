@@ -23,7 +23,11 @@ struct dmesh_doca_dpa_thread {
 	    struct doca_dpa_thread *threads[DMESH_DPA_THREAD_COUNT];
 	    struct doca_dpa_eu_affinity *affinities[DMESH_DPA_THREAD_COUNT];
 	    struct doca_dpa_notification_completion *notify_comps[DMESH_DPA_THREAD_COUNT];
+	    struct doca_dpa_completion *copy_comps[DMESH_GRPC_SERIALIZER_THREADS];
+	    struct doca_dpa_async_ops *copy_async_ops[DMESH_GRPC_SERIALIZER_THREADS];
 	    doca_dpa_dev_notification_completion_t notify_handles[DMESH_DPA_THREAD_COUNT];
+	    doca_dpa_dev_completion_t copy_comp_handles[DMESH_GRPC_SERIALIZER_THREADS];
+	    doca_dpa_dev_async_ops_t copy_async_ops_handles[DMESH_GRPC_SERIALIZER_THREADS];
 	    doca_dpa_dev_uintptr_t arg;     /* first element of dpa_thread_arg[] */
 	    doca_dpa_dev_uintptr_t shared_state;
 	    doca_dpa_dev_uintptr_t buf;     /* buffer to be used by DPA thread */

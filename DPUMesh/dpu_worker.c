@@ -8,6 +8,7 @@
 #include "comch_msgq.h"
 #include "ring.h"
 #include "dpa_common.h"
+#include "buffer.h"
 
 #include <doca_log.h>
 #include <doca_dev.h>
@@ -227,7 +228,7 @@ run_dpu_worker(struct objects *objs)
     }
 
     /* allocate local buffer and set mmap for PCI export */
-    result = alloc_buffer_and_set_mmap(&objs->local_mmap, objs->dev,
+    result = alloc_hugepage_buffer_and_set_mmap(&objs->local_mmap, objs->dev,
                            &objs->dma_buffer, BUFFER_SIZE,
                            DOCA_ACCESS_FLAG_PCI_READ_WRITE);
     if (result != DOCA_SUCCESS) {
@@ -322,5 +323,8 @@ run_dpu_worker(struct objects *objs)
     }
 
 argp_cleanup:
+    destroy_mmap_and_unmap_hugepage_buffer(objs->local_mmap, objs->dma_buffer, BUFFER_SIZE);
+    objs->local_mmap = NULL;
+    objs->dma_buffer = NULL;
     clean_argp();
 }

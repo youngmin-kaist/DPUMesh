@@ -16,6 +16,11 @@ typedef struct {
     uint32_t generic_fallbacks;
 } GrpcWireEncodeStats;
 
+typedef int (*GrpcWireCopySubmitFn)(void *ctx,
+                                    uint64_t dst_addr,
+                                    uint64_t src_addr,
+                                    uint32_t len);
+
 void grpc_wire_encode_stats_reset(GrpcWireEncodeStats *stats);
 
 int grpc_wire_serialize_one(const ProtoSchemaBlob *blob,
@@ -27,6 +32,12 @@ int grpc_wire_serialize_one_reverse(const ProtoSchemaBlob *blob,
                             const ProtoTask *task,
                             ProtoCompletion *cpl,
                             GrpcWireEncodeStats *stats);
+
+int grpc_wire_serialize_one_copy(const ProtoTask *task,
+                                 uint32_t flat_len,
+                                 ProtoCompletion *cpl,
+                                 GrpcWireCopySubmitFn copy_submit,
+                                 void *copy_ctx);
 
 #ifdef __cplusplus
 }

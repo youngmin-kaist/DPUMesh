@@ -208,7 +208,7 @@ run_host_worker(struct objects *objs)
     }
 
     char *name;
-    int name_len = 8000;
+    int name_len = 8;
     if (name_len > 0) {
         name = (char *)malloc((size_t)name_len + 1);
         if (name == NULL) {
@@ -270,7 +270,10 @@ run_host_worker(struct objects *objs)
             goto argp_cleanup;
         }
 
-        request_id = (request_id + 1) % 10000000;
+        request_id = (request_id + 1) % 1000000;
+        if (request_id == 1) {
+            DOCA_LOG_INFO("%lu %lu\n", objs->dma_ring->producer_seq, objs->dma_ring->observed_consumer_seq);
+        }
     }
 
     DOCA_LOG_INFO("Finished Host worker");

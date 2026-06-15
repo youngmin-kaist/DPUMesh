@@ -444,6 +444,56 @@ error:
     return cpl->status;
 }
 
+int grpc_wire_serialize_one_copy(const ProtoTask *task,
+                                 uint32_t flat_len,
+                                 ProtoCompletion *cpl,
+                                 GrpcWireCopySubmitFn copy_submit,
+                                 void *copy_ctx)
+{
+    const uint8_t *flat_base;
+    uint8_t *out_base;
+    uint32_t i;
+    int result;
+
+    if (task == NULL || cpl == NULL)
+        return -1;
+
+    cpl->request_id = task->request_id;
+    if (flat_len > MAX_ENCODED_SIZE) {
+        cpl->status = -3;
+        cpl->encoded_len = 0U;
+        return cpl->status;
+    }
+
+    if (copy_submit != NULL) {
+        result = copy_submit(copy_ctx, task->out, task->flat, flat_len);
+        if (result < 0) {
+            cpl->status = result;
+            cpl->encoded_len = 0U;
+            return cpl->status;
+        }
+
+        cpl->encoded_len = flat_len;
+        cpl->status = 0;
+        return 0;
+    }
+
+    flat_base = (const uint8_t *)(uintptr_t)task->flat;
+    out_base = (uint8_t *)(uintptr_t)task->out;
+    if (flat_base == NULL || out_base == NULL) {
+        cpl->status = -1;
+        cpl->encoded_len = 0U;
+        return cpl->status;
+    }
+
+    for (i = 0; i < flat_len; ++i)
+        out_base[i] = flat_base[i];
+
+    cpl->encoded_len = flat_len;
+    cpl->status = 0;
+    return 0;
+}
+
 
 /* Reverse field number order encoding implementation */
 /*

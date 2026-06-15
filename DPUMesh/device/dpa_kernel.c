@@ -7,6 +7,15 @@
 
 #include <stddef.h>
 
+#define DMESH_GRPC_SERIALIZE_MODE_GRPC 0U
+#define DMESH_GRPC_SERIALIZE_MODE_GRPC_REVERSE 1U
+#define DMESH_GRPC_SERIALIZE_MODE_COPY 2U
+#define DMESH_GRPC_SERIALIZE_MODE_DMA_COPY 3U
+
+#ifndef DMESH_GRPC_SERIALIZE_DEFAULT_MODE
+#define DMESH_GRPC_SERIALIZE_DEFAULT_MODE DMESH_GRPC_SERIALIZE_MODE_GRPC_REVERSE
+#endif
+
 /*
  * RPC for initializing DPA IO thread called before running the thread
  *
@@ -71,6 +80,7 @@ static void send_msgs(struct dpa_thread_arg *thread_arg, int num_msg)
  * managers in one DPA process.
  */
 static struct comch_grpc_dma_comp_msg grpc_dma_comp_imm[DMESH_GRPC_MAX_PENDING];
+static struct comch_dma_comp_msg grpc_copy_dma_comp_imm[DMESH_GRPC_MAX_PENDING];
 
 #define DMESH_GRPC_STALL_LOG_POLL_INTERVAL 65536U
 
@@ -202,6 +212,151 @@ post_grpc_field_dma(struct dpa_thread_arg *thread_arg,
                                          (uint8_t *)msg,
                                          sizeof(*msg),
                                          flags);
+}
+
+struct grpc_dpa_copy_ctx {
+    struct dpa_thread_arg *thread_arg;
+    uint32_t done_idx;
+};
+
+static uint32_t
+drain_dpa_copy_completions(struct dpa_thread_arg *thread_arg)
+{
+    doca_dpa_dev_completion_element_t comp;
+    uint32_t drained = 0;
+
+    if (thread_arg->dpa_copy_comp == 0)
+        return 0;
+
+    while (doca_dpa_dev_get_completion(thread_arg->dpa_copy_comp, &comp) != 0) {
+        drained++;
+    }
+
+    if (drained != 0) {
+        doca_dpa_dev_completion_ack(thread_arg->dpa_copy_comp, drained);
+    }
+
+    return drained;
+}
+
+static int
+wait_for_dpa_copy_completion(struct dpa_thread_arg *thread_arg)
+{
+    doca_dpa_dev_completion_element_t comp;
+    doca_dpa_dev_completion_type_t type;
+
+    if (thread_arg->dpa_copy_comp == 0)
+        return -5;
+
+    while (doca_dpa_dev_get_completion(thread_arg->dpa_copy_comp, &comp) == 0) {
+        __dpa_thread_window_read_inv();
+    }
+
+    type = doca_dpa_dev_get_completion_type(comp);
+    doca_dpa_dev_completion_ack(thread_arg->dpa_copy_comp, 1);
+
+    if (type == DOCA_DPA_DEV_COMP_SEND_ERR || type == DOCA_DPA_DEV_COMP_RECV_ERR)
+        return -5;
+
+    return 0;
+}
+
+static int
+wait_for_dpa_producer_completion(struct dpa_thread_arg *thread_arg)
+{
+    doca_dpa_dev_completion_element_t comp;
+    doca_dpa_dev_completion_type_t type;
+
+    if (thread_arg->dpa_producer_comp == 0)
+        return -5;
+
+    while (doca_dpa_dev_get_completion(thread_arg->dpa_producer_comp, &comp) == 0) {
+        __dpa_thread_window_read_inv();
+    }
+
+    type = doca_dpa_dev_get_completion_type(comp);
+    doca_dpa_dev_completion_ack(thread_arg->dpa_producer_comp, 1);
+
+    if (type == DOCA_DPA_DEV_COMP_SEND_ERR || type == DOCA_DPA_DEV_COMP_RECV_ERR)
+        return -5;
+
+    return 0;
+}
+
+static int
+submit_grpc_post_copy(void *opaque,
+                      uint64_t dst_addr,
+                      uint64_t src_addr,
+                      uint32_t len)
+{
+    struct grpc_dpa_copy_ctx *ctx = (struct grpc_dpa_copy_ctx *)opaque;
+    struct dpa_thread_arg *thread_arg;
+
+    if (ctx == 0 || ctx->thread_arg == 0)
+        return -1;
+
+    thread_arg = ctx->thread_arg;
+    if (len == 0U)
+        return 0;
+
+    if (thread_arg->dpa_copy_async_ops == 0 || thread_arg->dpa_copy_comp == 0)
+        return -5;
+
+    drain_dpa_copy_completions(thread_arg);
+    doca_dpa_dev_post_memcpy(thread_arg->dpa_copy_async_ops,
+                             thread_arg->dpu_mmap,
+                             dst_addr,
+                             thread_arg->dpu_mmap,
+                             src_addr,
+                             len,
+                             DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
+
+    return wait_for_dpa_copy_completion(thread_arg);
+}
+
+static int
+submit_grpc_dma_copy(void *opaque,
+                     uint64_t dst_addr,
+                     uint64_t src_addr,
+                     uint32_t len)
+{
+    struct grpc_dpa_copy_ctx *ctx = (struct grpc_dpa_copy_ctx *)opaque;
+    struct dpa_thread_arg *thread_arg;
+    struct comch_dma_comp_msg *msg;
+
+    if (ctx == 0 || ctx->thread_arg == 0 || ctx->done_idx >= DMESH_GRPC_MAX_PENDING)
+        return -1;
+
+    thread_arg = ctx->thread_arg;
+    if (len == 0U)
+        return 0;
+
+    msg = &grpc_copy_dma_comp_imm[ctx->done_idx];
+    msg->type = COMCH_MSG_TYPE_DMA_COMPLETED;
+    msg->pos = 0U;
+    msg->length = len;
+    msg->idx = ctx->done_idx;
+    __sync_synchronize();
+
+    wait_for_dpu_consumer(thread_arg);
+
+    /*
+     * DMA copy mode shares the existing Comch producer completion with the
+     * main/msg workers. Use this mode as an isolated comparison path unless
+     * producer completions are split per serializer.
+     */
+    doca_dpa_dev_comch_producer_dma_copy(thread_arg->dpa_producer,
+                                         /*consumer_id=*/1,
+                                         thread_arg->dpu_mmap,
+                                         dst_addr,
+                                         thread_arg->dpu_mmap,
+                                         src_addr,
+                                         len,
+                                         (uint8_t *)msg,
+                                         sizeof(*msg),
+                                         DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
+
+    return wait_for_dpa_producer_completion(thread_arg);
 }
 
 static inline uint32_t 
@@ -831,11 +986,12 @@ poll_desc_ring_grpc(struct dpa_thread_arg *thread_arg)
 static void 
 complete_grpc_serialize_task(struct dpa_thread_arg *thread_arg,
                             struct dpa_grpc_serialize_task *task,
-                            uint8_t reverse)
+                            uint8_t mode)
 {
     struct dpa_grpc_pipeline_state *state = grpc_pipeline_state(thread_arg);
     ProtoTask proto_task = {0};
     ProtoCompletion proto_cpl = {0};
+    struct grpc_dpa_copy_ctx copy_ctx;
     int result = 0;
     uint64_t out_offset = 0;
     struct comch_grpc_serialize_comp_msg *comp_msg;
@@ -853,6 +1009,7 @@ complete_grpc_serialize_task(struct dpa_thread_arg *thread_arg,
     uint64_t slot_idx = (task->ring_seq - 1) % DMESH_GRPC_MAX_PENDING;
     uint64_t flat_addr = thread_arg->dpu_base_addr + (slot_idx * DMESH_GRPC_PRIVATE_SLOT_SIZE);
     uint64_t out_addr = flat_addr + DMA_ALIGN_UP(DMESH_GRPC_MAX_FLAT_SIZE);
+    done_idx = (uint32_t)((task->ring_seq - 1U) % DMESH_GRPC_MAX_PENDING);
 
     uint64_t flat = (uint64_t)dpa_dpu_ptr(thread_arg, flat_addr, task->len);
     uint64_t out = (uint64_t)dpa_dpu_ptr(thread_arg, out_addr, DMESH_GRPC_MAX_ENCODED_SIZE);
@@ -867,19 +1024,42 @@ complete_grpc_serialize_task(struct dpa_thread_arg *thread_arg,
     proto_task.schema_id = task->schema_id;
     proto_task.flat = flat;
     proto_task.out = out;
+    copy_ctx.thread_arg = thread_arg;
+    copy_ctx.done_idx = done_idx;
 
-    if (reverse) {
+    switch (mode) {
+    case DMESH_GRPC_SERIALIZE_MODE_GRPC:
+        result = grpc_wire_serialize_one(&grpc_schema_blob, &proto_task, &proto_cpl, NULL);
+        break;
+    case DMESH_GRPC_SERIALIZE_MODE_GRPC_REVERSE:
         result = grpc_wire_serialize_one_reverse(&grpc_schema_blob, &proto_task, &proto_cpl, NULL);
         if (result > 0) {
             out_offset = result;
         }
-    } else {
-        result = grpc_wire_serialize_one(&grpc_schema_blob, &proto_task, &proto_cpl, NULL);
+        break;
+    case DMESH_GRPC_SERIALIZE_MODE_COPY:
+        proto_task.flat = flat_addr;
+        proto_task.out = out_addr;
+        result = grpc_wire_serialize_one_copy(&proto_task, task->len,
+                                              &proto_cpl, submit_grpc_post_copy,
+                                              &copy_ctx);
+        break;
+    case DMESH_GRPC_SERIALIZE_MODE_DMA_COPY:
+        proto_task.flat = flat_addr;
+        proto_task.out = out_addr;
+        result = grpc_wire_serialize_one_copy(&proto_task, task->len,
+                                              &proto_cpl, submit_grpc_dma_copy,
+                                              &copy_ctx);
+        break;
+    default:
+        proto_cpl.status = -4;
+        proto_cpl.encoded_len = 0U;
+        result = proto_cpl.status;
+        break;
     }
     __dpa_thread_window_writeback();
 
 
-    done_idx = (uint32_t)((task->ring_seq - 1U) % DMESH_GRPC_MAX_PENDING);
     comp_msg = (struct comch_grpc_serialize_comp_msg *)&grpc_dma_comp_imm[done_idx];
     comp_msg->completed = 0;
     comp_msg->encoded_len = proto_cpl.encoded_len;
@@ -946,7 +1126,7 @@ poll_grpc_serializer_queue(struct dpa_thread_arg *thread_arg)
             continue;
         }
 
-        complete_grpc_serialize_task(thread_arg, task, /*reverse=*/1);
+        complete_grpc_serialize_task(thread_arg, task, DMESH_GRPC_SERIALIZE_MODE_COPY);
 
         __atomic_store_n(&task->valid, 0U, __ATOMIC_RELEASE);
         __atomic_store_n(&state->serializer_cons[worker], cons + 1U, __ATOMIC_RELEASE);

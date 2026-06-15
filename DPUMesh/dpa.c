@@ -65,6 +65,85 @@ dmesh_doca_dpa_notification_create(struct dmesh_doca_dpa_thread *dpa_thread,
 	return DOCA_SUCCESS;
 }
 
+static doca_error_t
+dmesh_doca_dpa_copy_async_create(struct dmesh_doca_dpa_thread *dpa_thread,
+				 uint32_t serializer_idx,
+				 uint32_t thread_idx)
+{
+	doca_error_t result;
+
+	result = doca_dpa_completion_create(dpa_thread->dpa,
+					    DMESH_GRPC_SERIALIZER_QUEUE_DEPTH,
+					    &dpa_thread->copy_comps[serializer_idx]);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Failed to create DPA copy completion for serializer %u: %s",
+			     serializer_idx, doca_error_get_descr(result));
+		return result;
+	}
+
+	result = doca_dpa_completion_set_thread(dpa_thread->copy_comps[serializer_idx],
+						dpa_thread->threads[thread_idx]);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Failed to set DPA copy completion thread for serializer %u: %s",
+			     serializer_idx, doca_error_get_descr(result));
+		return result;
+	}
+
+	result = doca_dpa_completion_start(dpa_thread->copy_comps[serializer_idx]);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Failed to start DPA copy completion for serializer %u: %s",
+			     serializer_idx, doca_error_get_descr(result));
+		return result;
+	}
+
+	/*
+	 * Each serializer owns one async-ops queue and waits on its own
+	 * completion before publishing TASK_STATE_COMPLETED.
+	 */
+	result = doca_dpa_async_ops_create(dpa_thread->dpa,
+					   DMESH_GRPC_SERIALIZER_QUEUE_DEPTH,
+					   serializer_idx,
+					   &dpa_thread->copy_async_ops[serializer_idx]);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Failed to create DPA copy async ops for serializer %u: %s",
+			     serializer_idx, doca_error_get_descr(result));
+		return result;
+	}
+
+	result = doca_dpa_async_ops_attach(dpa_thread->copy_async_ops[serializer_idx],
+					   dpa_thread->copy_comps[serializer_idx]);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Failed to attach DPA copy async ops for serializer %u: %s",
+			     serializer_idx, doca_error_get_descr(result));
+		return result;
+	}
+
+	result = doca_dpa_async_ops_start(dpa_thread->copy_async_ops[serializer_idx]);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Failed to start DPA copy async ops for serializer %u: %s",
+			     serializer_idx, doca_error_get_descr(result));
+		return result;
+	}
+
+	result = doca_dpa_completion_get_dpa_handle(dpa_thread->copy_comps[serializer_idx],
+						   &dpa_thread->copy_comp_handles[serializer_idx]);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Failed to get DPA copy completion handle for serializer %u: %s",
+			     serializer_idx, doca_error_get_descr(result));
+		return result;
+	}
+
+	result = doca_dpa_async_ops_get_dpa_handle(dpa_thread->copy_async_ops[serializer_idx],
+						  &dpa_thread->copy_async_ops_handles[serializer_idx]);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Failed to get DPA copy async ops handle for serializer %u: %s",
+			     serializer_idx, doca_error_get_descr(result));
+		return result;
+	}
+
+	return DOCA_SUCCESS;
+}
+
 struct dmesh_doca_dpa_msgq_send_ctx {
     struct dmesh_doca_dpa_msgq *msgq;
     uint32_t msg_size;
@@ -461,6 +540,16 @@ dmesh_doca_dpa_thread_create(struct dmesh_doca_dpa_thread *dpa_thread)
 			DOCA_LOG_ERR("Failed to start DPA thread %u: %s",
 				     i, doca_error_get_descr(result));
 			return result;
+		}
+
+		if (i >= DMESH_DPA_THREAD_SERIALIZER_BASE) {
+			uint32_t serializer_idx = i - DMESH_DPA_THREAD_SERIALIZER_BASE;
+
+			result = dmesh_doca_dpa_copy_async_create(dpa_thread,
+								  serializer_idx,
+								  i);
+			if (result != DOCA_SUCCESS)
+				return result;
 		}
 
 		if (i != DMESH_DPA_THREAD_MSG) {
@@ -942,10 +1031,18 @@ dmesh_doca_run_dpa_thread(struct objects *objs, struct dmesh_doca_dpa_thread *dp
 	for (i = 0; i < DMESH_DPA_THREAD_COUNT; ++i) {
 		thread_args[i] = arg;
 		thread_args[i].thread_index = i;
-		if (i >= DMESH_DPA_THREAD_SERIALIZER_BASE)
-			thread_args[i].serializer_index = i - DMESH_DPA_THREAD_SERIALIZER_BASE;
-		else
+		if (i >= DMESH_DPA_THREAD_SERIALIZER_BASE) {
+			uint32_t serializer_idx = i - DMESH_DPA_THREAD_SERIALIZER_BASE;
+
+			thread_args[i].serializer_index = serializer_idx;
+			thread_args[i].dpa_copy_comp = dpa_thread->copy_comp_handles[serializer_idx];
+			thread_args[i].dpa_copy_async_ops =
+				dpa_thread->copy_async_ops_handles[serializer_idx];
+		} else {
 			thread_args[i].serializer_index = UINT32_MAX;
+			thread_args[i].dpa_copy_comp = 0;
+			thread_args[i].dpa_copy_async_ops = 0;
+		}
 	}
 
 	result = doca_dpa_h2d_memcpy(dpa_thread->dpa, dpa_thread->arg,

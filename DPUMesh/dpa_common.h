@@ -13,6 +13,8 @@
 
 typedef uint64_t doca_dpa_dev_uintptr_t;
 typedef uint64_t doca_dpa_dev_buf_arr_t;
+typedef uint64_t doca_dpa_dev_completion_t;
+typedef uint64_t doca_dpa_dev_async_ops_t;
 typedef uint64_t doca_dpa_dev_notification_completion_t;
 
 #define DMESH_GRPC_SERIALIZER_THREADS 16U
@@ -23,6 +25,8 @@ typedef uint64_t doca_dpa_dev_notification_completion_t;
 struct dpa_thread_arg {
 	uint64_t dpa_consumer_comp;
 	uint64_t dpa_producer_comp;
+	doca_dpa_dev_completion_t dpa_copy_comp;
+	doca_dpa_dev_async_ops_t dpa_copy_async_ops;
 	uint64_t dpa_producer;
 	uint64_t dpa_consumer;
 	doca_dpa_dev_buf_arr_t dpa_buf_arr;
@@ -70,7 +74,6 @@ struct comch_dma_comp_msg {
 	uint64_t idx;
 };
 
-typedef uint64_t doca_dpa_dev_completion_t;
 typedef uint64_t doca_dpa_dev_comch_producer_t;
 
 #define DMA_RING_CACHELINE_SIZE 64
