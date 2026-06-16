@@ -552,11 +552,16 @@ dmesh_doca_dpa_thread_create(struct dmesh_doca_dpa_thread *dpa_thread)
 				return result;
 		}
 
-		if (i != DMESH_DPA_THREAD_MSG) {
-			result = dmesh_doca_dpa_notification_create(dpa_thread, i);
-			if (result != DOCA_SUCCESS)
-				return result;
-		}
+		/*
+		 * The msg thread is also the gRPC dispatcher. It owns the Comch
+		 * completions, and additionally needs a notification completion so the
+		 * main descriptor thread can wake it for shared-memory dispatch work.
+		 * The dispatcher must stay resident after wakeup; rescheduling it would
+		 * make queue progress depend on a later Comch event.
+		 */
+		result = dmesh_doca_dpa_notification_create(dpa_thread, i);
+		if (result != DOCA_SUCCESS)
+			return result;
 	}
 
 	dpa_thread->thread = dpa_thread->threads[DMESH_DPA_THREAD_MAIN];
@@ -990,6 +995,7 @@ dmesh_fill_dpa_thread_arg(struct objects *objs, struct dpa_thread_arg *arg)
 #endif
 			.pipeline_state = objs->dpa_thread->shared_state,
 			.main_notify = objs->dpa_thread->notify_handles[DMESH_DPA_THREAD_MAIN],
+			.dispatcher_notify = objs->dpa_thread->notify_handles[DMESH_DPA_THREAD_MSG],
 		    };
 
 	for (uint32_t i = 0; i < DMESH_GRPC_SERIALIZER_THREADS; ++i) {

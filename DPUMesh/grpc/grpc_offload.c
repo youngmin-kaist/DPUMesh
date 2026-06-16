@@ -413,6 +413,8 @@ dmesh_grpc_arena_reclaim_through(struct dmesh_grpc_arena *arena, uint64_t consum
 	}
 }
 
+
+// per-field DMA version
 doca_error_t
 dmesh_grpc_hello_request_alloc(struct dmesh_grpc_arena *arena,
 			       uint64_t id,
@@ -541,8 +543,6 @@ dmesh_grpc_hello_flat_alloc(struct dmesh_grpc_arena *arena,
 	}
 
 	flat_len = align_up_size(raw_len, DMESH_GRPC_DMA_MSG_ALIGN);
-	if (flat_len == SIZE_MAX)
-		return DOCA_ERROR_INVALID_VALUE;
 	if (flat_len > DMESH_GRPC_MAX_FLAT_SIZE) {
 		DOCA_LOG_INFO("flat_len %zu exceeds max limit %u", flat_len, DMESH_GRPC_MAX_FLAT_SIZE);
 		return DOCA_ERROR_INVALID_VALUE;

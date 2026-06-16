@@ -47,6 +47,7 @@ struct dpa_thread_arg {
 	uint32_t thread_index;
 	uint64_t pipeline_state;
 	doca_dpa_dev_notification_completion_t main_notify;
+	doca_dpa_dev_notification_completion_t dispatcher_notify;
 	doca_dpa_dev_notification_completion_t serializer_notify[DMESH_GRPC_SERIALIZER_THREADS];
 	uint32_t serializer_index;
 	uint32_t reserved0;
@@ -90,6 +91,7 @@ typedef uint64_t doca_dpa_dev_comch_producer_t;
 #define DMESH_GRPC_PRIVATE_SLOT_SIZE \
 	DMA_ALIGN_UP(DMESH_GRPC_MAX_FLAT_SIZE + DMESH_GRPC_MAX_ENCODED_SIZE)
 #define DMESH_GRPC_MAX_PENDING 1024U
+#define DMESH_GRPC_DISPATCH_QUEUE_DEPTH DMESH_GRPC_MAX_PENDING
 #define DMESH_GRPC_SERIALIZER_QUEUE_DEPTH 16U
 #define DMESH_GRPC_SERIALIZER_IDLE_POLL_BUDGET 1024U
 #define DMESH_GRPC_SERIALIZER_DRR_QUANTUM DMESH_GRPC_MAX_FLAT_SIZE
@@ -125,6 +127,9 @@ struct dmesh_grpc_hello_request {
 };
 
 struct dmesh_grpc_hello_flat {
+	uint8_t reserved[3];
+	uint8_t compressed;	// gRPC header: compressed flag
+	uint32_t msg_len;	// gRPC header: gRPC message length
 	uint64_t id;
 	struct dmesh_grpc_ref name;
 	struct dmesh_grpc_u32_array_ref scores;
@@ -172,18 +177,26 @@ struct dpa_grpc_serialize_task {
 	uint32_t valid;
 	uint32_t request_id;
 	uint64_t ring_seq;
+	uint64_t src_addr;
 	uint32_t len;
+	uint32_t slot_idx;
 	uint16_t schema_id;
+	uint16_t flags;
 } __attribute__((__packed__, aligned(8)));
+
+#define DMESH_GRPC_SERIALIZE_TASK_F_COPY_FROM_HOST 1U
 
 struct dpa_grpc_pipeline_state {
 	enum pipeline_task_state pipeline_task_state[DMESH_GRPC_MAX_PENDING];
+	struct dpa_grpc_serialize_task dispatch_tasks[DMESH_GRPC_DISPATCH_QUEUE_DEPTH];
 	struct dpa_grpc_serialize_task
 		serializer_tasks[DMESH_GRPC_SERIALIZER_THREADS][DMESH_GRPC_SERIALIZER_QUEUE_DEPTH];
 	
 	uint32_t serializer_drr_cursor;
 	uint32_t reserved0;
 
+	uint32_t dispatch_prod;
+	uint32_t dispatch_cons;
 	uint32_t serializer_prod[DMESH_GRPC_SERIALIZER_THREADS];
 	uint32_t serializer_cons[DMESH_GRPC_SERIALIZER_THREADS];
 	uint32_t serializer_drr_deficit[DMESH_GRPC_SERIALIZER_THREADS];

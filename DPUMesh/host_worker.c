@@ -208,7 +208,7 @@ run_host_worker(struct objects *objs)
     }
 
     char *name;
-    int name_len = 8;
+    int name_len = 8000;
     if (name_len > 0) {
         name = (char *)malloc((size_t)name_len + 1);
         if (name == NULL) {
