@@ -38,6 +38,7 @@ struct dmesh_doca_dpa_msgq {
 	struct doca_pe *pe;
 	struct doca_comch_msgq *msgq;	      /**< The DOCA Comch MsgQ */
 	struct doca_comch_producer *producer; /**< The DOCA Comch Producer */
+	struct doca_comch_producer *serializer_producers[DMESH_GRPC_SERIALIZER_THREADS];
 	struct doca_comch_consumer *consumer; /**< The DOCA Comch Consumer */
 	bool is_send;			      /**< Indicates if MsgQ is used for sending from DPU to DPA */
 	
@@ -64,6 +65,7 @@ struct dmesh_doca_dpa_msgq {
 struct dmesh_doca_dpa_comch {
 	struct dmesh_doca_dpa_msgq send;			      /**< MsgQ used to send message from DPU to DPA */
 	struct doca_dpa_completion *producer_comp;	      /**< The producer completion context used by DPA */
+	struct doca_dpa_completion *serializer_producer_comps[DMESH_GRPC_SERIALIZER_THREADS];
 	struct dmesh_doca_dpa_msgq recv;			      /**< MsgQ used to receive message DPA */
 	struct doca_comch_consumer_completion *consumer_comp; /**< The consumer completion context used by DPA */
 };
@@ -77,6 +79,8 @@ struct dmesh_doca_dpa_msgq_create_attr {
 								 arrival of messages */
 	struct doca_dpa_completion *producer_comp; /**< Producer completion context used by DPA to poll completion of
 						      send message */
+	struct doca_dpa_completion *serializer_producer_comps[DMESH_GRPC_SERIALIZER_THREADS];
+	uint32_t num_serializer_producers;
 	struct doca_pe *pe;			   /**< Progress engine to be used by DPU consumer and producer */
 	doca_ctx_state_changed_callback_t ctx_state_changed_cb; /**< Callback invoked once consumer/producer state
 								   changes */

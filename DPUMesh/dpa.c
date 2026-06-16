@@ -175,10 +175,13 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
 
     switch (msg->type) {
         case COMCH_MSG_TYPE_DMA_COMPLETED: {
-            // struct comch_dma_comp_msg *comp_msg = (struct comch_dma_comp_msg *)msg;
-            // uint32_t *idx = (uint32_t *)(objs->dma_buffer + comp_msg->pos);
-            // DOCA_LOG_INFO("Received DMA completed message: desc_idx=%lu pos=%u length=%u value=%u",
-            //               comp_msg->idx, comp_msg->pos, comp_msg->length, *idx);
+// #if DEBUG_LOG
+//             struct comch_dma_comp_msg *comp_msg = (struct comch_dma_comp_msg *)msg;
+//             if (comp_msg->idx == 0) {
+//                 DOCA_LOG_INFO("Received DMA completed message: desc_idx=%lu pos=%u length=%u",
+//                             comp_msg->idx, comp_msg->pos, comp_msg->length);
+//             }
+// #endif
             break;
         }
         case COMCH_MSG_TYPE_GRPC_DMA_COMPLETED: {
@@ -576,6 +579,7 @@ dmesh_doca_dpa_msgq_create(const struct dmesh_doca_dpa_msgq_create_attr *attr,
     doca_error_t result;
     struct doca_ctx *consumer_ctx;
     struct doca_ctx *producer_ctx;
+    uint32_t max_num_producers;
 
     memset(msgq, 0, sizeof(*msgq));
 
@@ -604,7 +608,11 @@ dmesh_doca_dpa_msgq_create(const struct dmesh_doca_dpa_msgq_create_attr *attr,
         return result;
     }
 
-    result = doca_comch_msgq_set_max_num_producers(msgq->msgq, 1);
+    max_num_producers = 1U;
+    if (attr->is_send == false)
+        max_num_producers += attr->num_serializer_producers;
+
+    result = doca_comch_msgq_set_max_num_producers(msgq->msgq, max_num_producers);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to set max num producers - %s",
                 doca_error_get_name(result));
@@ -711,16 +719,18 @@ dmesh_doca_dpa_msgq_create(const struct dmesh_doca_dpa_msgq_create_attr *attr,
         return result;
     }
 
-    result = doca_comch_msgq_producer_create(msgq->msgq, &msgq->producer);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to create msgq producer - %s", 
-                doca_error_get_name(result));
-        return result;
-    }
-    producer_ctx = doca_comch_producer_as_ctx(msgq->producer);
     if (attr->is_send) {
         /* producer on DPU */
         union doca_data ctx_user_data;
+
+        result = doca_comch_msgq_producer_create(msgq->msgq, &msgq->producer);
+        if (result != DOCA_SUCCESS) {
+            DOCA_LOG_ERR("Failed to create msgq producer - %s",
+                    doca_error_get_name(result));
+            return result;
+        }
+
+        producer_ctx = doca_comch_producer_as_ctx(msgq->producer);
         ctx_user_data.ptr = attr->ctx_user_data;
         result = doca_ctx_set_user_data(producer_ctx, ctx_user_data);
         if (result != DOCA_SUCCESS) {
@@ -749,8 +759,23 @@ dmesh_doca_dpa_msgq_create(const struct dmesh_doca_dpa_msgq_create_attr *attr,
                     doca_error_get_name(result));
             return result;
         }
+
+        result = doca_ctx_start(producer_ctx);
+        if (result != DOCA_SUCCESS) {
+            DOCA_LOG_ERR("Failed to start producer ctx - %s",
+                    doca_error_get_name(result));
+            return result;
+        }
     } else {
         /* producer on DPA */
+        result = doca_comch_msgq_producer_create(msgq->msgq, &msgq->producer);
+        if (result != DOCA_SUCCESS) {
+            DOCA_LOG_ERR("Failed to create msgq producer - %s",
+                    doca_error_get_name(result));
+            return result;
+        }
+
+        producer_ctx = doca_comch_producer_as_ctx(msgq->producer);
         result = doca_ctx_set_datapath_on_dpa(producer_ctx, attr->dpa);
         if (result != DOCA_SUCCESS) {
             DOCA_LOG_ERR("Failed to set producer datapath on dpa - %s", 
@@ -769,12 +794,51 @@ dmesh_doca_dpa_msgq_create(const struct dmesh_doca_dpa_msgq_create_attr *attr,
                     doca_error_get_name(result));
             return result;
         }
-    }
-    result = doca_ctx_start(producer_ctx);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to start producer ctx - %s",
-                doca_error_get_name(result));
-        return result;
+
+        result = doca_ctx_start(producer_ctx);
+        if (result != DOCA_SUCCESS) {
+            DOCA_LOG_ERR("Failed to start producer ctx - %s",
+                    doca_error_get_name(result));
+            return result;
+        }
+
+        for (uint32_t idx = 0; idx < attr->num_serializer_producers; ++idx) {
+            struct doca_comch_producer **producer = &msgq->serializer_producers[idx];
+
+            result = doca_comch_msgq_producer_create(msgq->msgq, producer);
+            if (result != DOCA_SUCCESS) {
+                DOCA_LOG_ERR("Failed to create serializer msgq producer %u - %s",
+                        idx, doca_error_get_name(result));
+                return result;
+            }
+
+            producer_ctx = doca_comch_producer_as_ctx(*producer);
+            result = doca_ctx_set_datapath_on_dpa(producer_ctx, attr->dpa);
+            if (result != DOCA_SUCCESS) {
+                DOCA_LOG_ERR("Failed to set serializer producer %u datapath on dpa - %s",
+                        idx, doca_error_get_name(result));
+                return result;
+            }
+            result = doca_comch_producer_set_dev_max_num_send(*producer, attr->max_num_msg);
+            if (result != DOCA_SUCCESS) {
+                DOCA_LOG_ERR("Failed to set serializer producer %u max # of send messages - %s",
+                        idx, doca_error_get_name(result));
+                return result;
+            }
+            result = doca_comch_producer_dpa_completion_attach(*producer,
+                    attr->serializer_producer_comps[idx]);
+            if (result != DOCA_SUCCESS) {
+                DOCA_LOG_ERR("Failed to attach serializer producer %u dpa completion - %s",
+                        idx, doca_error_get_name(result));
+                return result;
+            }
+            result = doca_ctx_start(producer_ctx);
+            if (result != DOCA_SUCCESS) {
+                DOCA_LOG_ERR("Failed to start serializer producer %u ctx - %s",
+                        idx, doca_error_get_name(result));
+                return result;
+            }
+        }
     }
 
     /* Pre-post recv tasks if MsgQ is used for receiving from DPA */
@@ -855,9 +919,9 @@ dmesh_doca_dpa_comch_create(struct objects *objs)
         return result;
     }
     /*
-     * One producer completion is currently shared by main and serializer
-     * DPA threads. DOCA producer ownership for cross-thread posts should be
-     * revalidated before adding multiple producer completions.
+     * Keep the primary producer completion attached to the msg/dispatcher
+     * thread. Serializer DMA producers use separate completions below so each
+     * serializer waits only on completions generated by its own producer.
      */
     result = doca_dpa_completion_set_thread(comch->producer_comp,
 					    dpa_thread->threads[DMESH_DPA_THREAD_MSG]);
@@ -871,6 +935,34 @@ dmesh_doca_dpa_comch_create(struct objects *objs)
         DOCA_LOG_ERR("Failed to start producer completion - %s",
                 doca_error_get_name(result));
         return result;
+    }
+
+    for (uint32_t idx = 0; idx < DMESH_GRPC_SERIALIZER_THREADS; ++idx) {
+        uint32_t thread_idx = DMESH_DPA_THREAD_SERIALIZER_BASE + idx;
+
+        result = doca_dpa_completion_create(dpa_thread->dpa,
+                CC_DPA_MAX_MSG_NUM,
+                &comch->serializer_producer_comps[idx]);
+        if (result != DOCA_SUCCESS) {
+            DOCA_LOG_ERR("Failed to create serializer producer completion %u - %s",
+                    idx, doca_error_get_name(result));
+            return result;
+        }
+
+        result = doca_dpa_completion_set_thread(comch->serializer_producer_comps[idx],
+                dpa_thread->threads[thread_idx]);
+        if (result != DOCA_SUCCESS) {
+            DOCA_LOG_ERR("Failed to set serializer producer completion %u thread - %s",
+                    idx, doca_error_get_name(result));
+            return result;
+        }
+
+        result = doca_dpa_completion_start(comch->serializer_producer_comps[idx]);
+        if (result != DOCA_SUCCESS) {
+            DOCA_LOG_ERR("Failed to start serializer producer completion %u - %s",
+                    idx, doca_error_get_name(result));
+            return result;
+        }
     }
 
     return DOCA_SUCCESS;
@@ -1039,8 +1131,37 @@ dmesh_doca_run_dpa_thread(struct objects *objs, struct dmesh_doca_dpa_thread *dp
 		thread_args[i].thread_index = i;
 		if (i >= DMESH_DPA_THREAD_SERIALIZER_BASE) {
 			uint32_t serializer_idx = i - DMESH_DPA_THREAD_SERIALIZER_BASE;
+			doca_dpa_dev_completion_t serializer_producer_comp;
+			doca_dpa_dev_comch_producer_t serializer_producer;
+
+			if (comch->serializer_producer_comps[serializer_idx] == NULL ||
+			    comch->recv.serializer_producers[serializer_idx] == NULL) {
+				DOCA_LOG_ERR("Missing serializer producer resources for serializer %u",
+					     serializer_idx);
+				return DOCA_ERROR_INVALID_VALUE;
+			}
+
+			result = doca_dpa_completion_get_dpa_handle(
+				comch->serializer_producer_comps[serializer_idx],
+				&serializer_producer_comp);
+			if (result != DOCA_SUCCESS) {
+				DOCA_LOG_ERR("Failed to get serializer producer completion %u handle: %s",
+					     serializer_idx, doca_error_get_name(result));
+				return result;
+			}
+
+			result = doca_comch_producer_get_dpa_handle(
+				comch->recv.serializer_producers[serializer_idx],
+				&serializer_producer);
+			if (result != DOCA_SUCCESS) {
+				DOCA_LOG_ERR("Failed to get serializer producer %u handle: %s",
+					     serializer_idx, doca_error_get_name(result));
+				return result;
+			}
 
 			thread_args[i].serializer_index = serializer_idx;
+			thread_args[i].dpa_producer_comp = serializer_producer_comp;
+			thread_args[i].dpa_producer = serializer_producer;
 			thread_args[i].dpa_copy_comp = dpa_thread->copy_comp_handles[serializer_idx];
 			thread_args[i].dpa_copy_async_ops =
 				dpa_thread->copy_async_ops_handles[serializer_idx];

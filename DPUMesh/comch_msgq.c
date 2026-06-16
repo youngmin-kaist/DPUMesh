@@ -37,6 +37,11 @@ init_comch_dpa_msgq(struct objects *objs, struct doca_pe *pe)
 	if (result != DOCA_SUCCESS)
 		return result;
 
+	for (uint32_t idx = 0; idx < DMESH_GRPC_SERIALIZER_THREADS; ++idx)
+		msgq_attr.serializer_producer_comps[idx] =
+			objs->dpa_comch->serializer_producer_comps[idx];
+	msgq_attr.num_serializer_producers = DMESH_GRPC_SERIALIZER_THREADS;
+
 	msgq_attr.is_send = false;
 	result = dmesh_doca_dpa_msgq_create(&msgq_attr, &objs->dpa_comch->recv);
 	if (result != DOCA_SUCCESS)
