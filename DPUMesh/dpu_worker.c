@@ -276,9 +276,6 @@ run_dpu_worker(struct objects *objs)
         uint32_t pending_submitted = 0;
         loop_cnt++;
 
-        // progressed += dmesh_dpu_progress_pe_burst(objs->pe, DMESH_DPU_PE_PROGRESS_BURST);
-        // progress_pe += progressed;
-
         result = dmesh_dpu_progress_pending_pipeline(objs,
                                                      &progressed,
                                                      &pending_submitted);
@@ -303,9 +300,8 @@ run_dpu_worker(struct objects *objs)
                   (now.tv_nsec - last.tv_nsec) / 1e9;
 
 		if (elapsed >= 1.0) {
-            if (objs->sent_msg_cnt > 0 || objs->recv_msg_cnt > 0)
-			    DOCA_LOG_INFO("elapsed: %.2f, sent: %d/s, recv: %d/s", elapsed, objs->sent_msg_cnt, objs->recv_msg_cnt);
-
+            // if (objs->sent_msg_cnt > 0 || objs->recv_msg_cnt > 0)
+            DOCA_LOG_INFO("elapsed: %.2f, sent: %d/s, recv: %d/s", elapsed, objs->sent_msg_cnt, objs->recv_msg_cnt);
             DOCA_LOG_INFO("Loops: %d, PE: %d, pending send collect: %d, submitted pending sends: %d\n",
                             loop_cnt,
                             progress_pe,

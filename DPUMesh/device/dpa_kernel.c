@@ -527,8 +527,6 @@ submit_grpc_dma_copy(void *opaque,
     msg->idx = ctx->done_idx;
     __sync_synchronize();
 
-    wait_for_dpu_consumer(thread_arg);
-
     if (ctx->from_host) {
         src_mmap = thread_arg->host_mmap;
     } else {
@@ -553,6 +551,7 @@ submit_grpc_dma_copy(void *opaque,
                                          DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
 
     return wait_for_dpa_producer_completion(thread_arg);
+    // return 0;
 }
 
 static inline uint32_t 
@@ -1305,7 +1304,7 @@ poll_grpc_serializer_queue(struct dpa_thread_arg *thread_arg)
             continue;
         }
         task = state->serializer_tasks[worker][slot];
-        complete_grpc_serialize_task(thread_arg, task, DMESH_GRPC_SERIALIZE_MODE_COPY);
+        complete_grpc_serialize_task(thread_arg, task, DMESH_GRPC_SERIALIZE_DEFAULT_MODE);
 #if DMESH_GRPC_PIPELINE_PROFILE
         grpc_profile_note_serializer_completed(state, worker);
 #endif
