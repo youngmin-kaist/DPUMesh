@@ -240,7 +240,8 @@ run_host_worker(struct objects *objs)
         //                                         scores,
         //                                         (uint32_t)scores_count,
         //                                         &req);
-        result = dmesh_grpc_hello_flat_alloc(&app_arena,
+        result = dmesh_grpc_hello_flat_alloc(objs,
+                                             &app_arena,
                                              request_id,
                                              name,
                                              (uint32_t)name_len,
@@ -249,13 +250,9 @@ run_host_worker(struct objects *objs)
                                              &flat,
                                              &flat_len);
 
-        if (result == DOCA_ERROR_NO_MEMORY) {
-            dma_ring_refresh_consumer(objs->dma_ring);
-            dmesh_grpc_arena_reclaim_through(&app_arena,
-                                                objs->dma_ring->observed_consumer_seq);
+        if (result == DOCA_ERROR_NO_MEMORY)
             continue;
-        }
-        if (result != DOCA_SUCCESS)
+        else if (result != DOCA_SUCCESS)
             goto argp_cleanup;
 
         result = dmesh_grpc_submit_request(objs,

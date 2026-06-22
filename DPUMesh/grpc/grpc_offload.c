@@ -496,8 +496,8 @@ invalid_value:
 	return DOCA_ERROR_INVALID_VALUE;
 }
 
-doca_error_t
-dmesh_grpc_hello_flat_alloc(struct dmesh_grpc_arena *arena,
+static doca_error_t
+__dmesh_grpc_hello_flat_alloc(struct dmesh_grpc_arena *arena,
 			    uint64_t id,
 			    const char *name,
 			    uint32_t name_len,
@@ -581,6 +581,34 @@ dmesh_grpc_hello_flat_alloc(struct dmesh_grpc_arena *arena,
 	*out = flat;
 	*flat_len_out = flat_len;
 	return DOCA_SUCCESS;
+}
+
+doca_error_t
+dmesh_grpc_hello_flat_alloc(struct objects *objs,
+				struct dmesh_grpc_arena *arena,
+			    uint64_t id,
+			    const char *name,
+			    uint32_t name_len,
+			    const uint32_t *scores,
+			    uint32_t scores_count,
+			    struct dmesh_grpc_hello_flat **out,
+			    size_t *flat_len_out)
+{
+	doca_error_t result = __dmesh_grpc_hello_flat_alloc(arena,
+													  id,
+													  name,
+													  name_len,
+													  scores,
+													  scores_count,
+													  out,
+													  flat_len_out);
+
+	if (result == DOCA_ERROR_NO_MEMORY) {
+		dma_ring_refresh_consumer(objs->dma_ring);
+		dmesh_grpc_arena_reclaim_through(arena, objs->dma_ring->observed_consumer_seq);
+	}
+
+	return result;
 }
 
 static bool

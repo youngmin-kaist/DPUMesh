@@ -43,7 +43,7 @@ __dpa_rpc__ uint64_t thread_init_rpc(doca_dpa_dev_comch_consumer_t consumer,
  * use stack metadata. Make this table per-thread before running multiple DMA
  * managers in one DPA process.
  */
-static struct comch_grpc_dma_comp_msg grpc_dma_comp_imm[DMESH_GRPC_MAX_PENDING];
+static struct dpa_grpc_serialize_task grpc_tasks[DMESH_GRPC_MAX_PENDING];
 static struct comch_dma_comp_msg grpc_copy_dma_comp_imm[DMESH_GRPC_MAX_PENDING];
 
 #define DMESH_GRPC_STALL_LOG_POLL_INTERVAL 65536U
@@ -390,19 +390,16 @@ schedule_grpc_serialize_task_fields(struct dpa_thread_arg *thread_arg,
 
     // publish the task to the selected worker's queue
     uint32_t ser_queue_slot = prod % DMESH_GRPC_SERIALIZER_QUEUE_DEPTH;
-    struct dpa_grpc_serialize_task *ser_task = &state->serializer_tasks[worker][ser_queue_slot];
-    if (__atomic_load_n(&ser_task->valid, __ATOMIC_ACQUIRE) != 0U) {
+    if (__atomic_load_n(&state->serializer_tasks[worker][ser_queue_slot], __ATOMIC_ACQUIRE) != NULL) {
         DOCA_DPA_DEV_LOG_INFO("[%u] Unexpected valid task in serializer queue: slot=%u prod=%u cons=%u\n",
                                 worker, ser_queue_slot, prod, cons);
         return -1;
     }
 
     uint32_t dispatch_queue_slot = task->slot_idx;
-    if (dispatch_queue_slot >= DMESH_GRPC_MAX_PENDING)
-        return -1;
-
     enum pipeline_task_state cur_state = 
         __atomic_load_n(&state->pipeline_task_state[dispatch_queue_slot], __ATOMIC_ACQUIRE);
+
     if (cur_state != TASK_STATE_PROCESSING) {
         DOCA_DPA_DEV_LOG_INFO("[%u] Invalid pipeline task state for gRPC serialize request: req=%u seq=%lu slot=%u state=%u\n",
                                 worker, task->request_id, 
@@ -412,27 +409,25 @@ schedule_grpc_serialize_task_fields(struct dpa_thread_arg *thread_arg,
         return -1;
     }
 
-    *ser_task = *task;
-    ser_task->valid = 0U;
-    
-#if DEBUG_LOG    
+    #if DEBUG_LOG    
     if (task->ring_seq <= 8U || (task->ring_seq % DEBUG_INTERVAL) == 0U) {
         DOCA_DPA_DEV_LOG_INFO("[%u] Enqueued gRPC serialize task: "
             "req=%u seq=%lu slot=%u len=%u flags=0x%x cost=%u deficit=%u\n",
             worker, task->request_id, task->ring_seq, task->slot_idx,
             task->len, task->flags,
             cost, deficit);
-    }
-#endif
+        }
+        #endif
         
-    /*
-     * The dispatcher thread is the single producer for serializer queues.
-     * valid/prod are release-published; each serializer worker consumes only
-     * its own queue with acquire loads.
-     */
+        /*
+        * The dispatcher thread is the single producer for serializer queues.
+        * valid/prod are release-published; each serializer worker consumes only
+        * its own queue with acquire loads.
+        */
+    __atomic_store_n(&state->serializer_tasks[worker][ser_queue_slot], task, __ATOMIC_RELEASE);
     __sync_synchronize();
-    __atomic_store_n(&ser_task->valid, 1U, __ATOMIC_RELEASE);
     __atomic_store_n(&state->serializer_prod[worker], prod + 1U, __ATOMIC_RELEASE);
+
     state->serializer_drr_deficit[worker] = deficit - cost;
     state->serializer_drr_cursor = (worker + 1U) % DMESH_GRPC_SERIALIZER_THREADS;
     
@@ -454,12 +449,11 @@ enqueue_grpc_serialize_task(struct dpa_thread_arg *thread_arg,
     if (req == 0 || req->ring_seq == 0)
         return -1;
 
-    task.valid = 1;
+    task.slot_idx = (uint32_t)((req->ring_seq - 1U) % DMESH_GRPC_MAX_PENDING);
     task.request_id = req->request_id;
     task.ring_seq = req->ring_seq;
     task.src_addr = 0; // no need to copy from serializer 
     task.len = req->len;
-    task.slot_idx = (uint32_t)((req->ring_seq - 1U) % DMESH_GRPC_MAX_PENDING);
     task.schema_id = req->schema_id;
     task.flags = 0; // no need to copy from serializer
 
@@ -469,23 +463,13 @@ enqueue_grpc_serialize_task(struct dpa_thread_arg *thread_arg,
 // main -> dispatcher
 static int
 enqueue_grpc_dispatch_task_fields(struct dpa_thread_arg *thread_arg,
-                                  uint32_t request_id,
-                                  uint64_t ring_seq,
-                                  uint64_t src_addr,
-                                  uint32_t len,
-                                  uint32_t slot_idx,
-                                  uint16_t schema_id,
-                                  uint16_t flags)
+                                  struct dpa_grpc_serialize_task *task)
 {
     struct dpa_grpc_pipeline_state *state = grpc_pipeline_state(thread_arg);
     uint32_t prod;
     uint32_t cons;
-    uint32_t queue_slot;
-    struct dpa_grpc_serialize_task *task;
+    uint32_t dispatch_slot;
     uint8_t notify_dispatcher;
-
-    if (state == 0 || ring_seq == 0 || slot_idx >= DMESH_GRPC_MAX_PENDING)
-        return -1;
 
     /*
      * Main is the only producer and dispatcher is the only consumer for this
@@ -500,21 +484,12 @@ enqueue_grpc_dispatch_task_fields(struct dpa_thread_arg *thread_arg,
         __dpa_thread_window_read_inv();
     }
 
-    queue_slot = prod % DMESH_GRPC_DISPATCH_QUEUE_DEPTH;
-    task = &state->dispatch_tasks[queue_slot];
-    if (__atomic_load_n(&task->valid, __ATOMIC_ACQUIRE) != 0U)
+    dispatch_slot = prod % DMESH_GRPC_DISPATCH_QUEUE_DEPTH;
+    if (__atomic_load_n(&state->dispatch_tasks[dispatch_slot], __ATOMIC_ACQUIRE) != NULL)
         return -1;
     notify_dispatcher = (prod == cons);
 
-    task->request_id = request_id;
-    task->ring_seq = ring_seq;
-    task->src_addr = src_addr;
-    task->len = len;
-    task->slot_idx = slot_idx;
-    task->schema_id = schema_id;
-    task->flags = flags;
-
-    __atomic_store_n(&task->valid, 1U, __ATOMIC_RELEASE);
+    __atomic_store_n(&state->dispatch_tasks[dispatch_slot], task, __ATOMIC_RELEASE);
     __atomic_store_n(&state->dispatch_prod, prod + 1U, __ATOMIC_RELEASE);
     if (notify_dispatcher && thread_arg->dispatcher_notify != 0) {
         /*
@@ -635,34 +610,30 @@ dispatch_grpc_serialize_tasks(struct dpa_thread_arg *thread_arg,
     uint32_t slot;
     int result;
 
-    if (state == 0)
-        return 0;
+    if (budget == 0)
+        budget = DMESH_GRPC_MAX_PENDING;
 
-    for (;;) {
+    while (dispatched < budget) {
         cons = __atomic_load_n(&state->dispatch_cons, __ATOMIC_ACQUIRE);
         prod = __atomic_load_n(&state->dispatch_prod, __ATOMIC_ACQUIRE);
-
-
         if (cons == prod)
-            break;
-        if (budget != 0U && dispatched >= budget)
             break;
 
         slot = cons % DMESH_GRPC_DISPATCH_QUEUE_DEPTH;
-        task = &state->dispatch_tasks[slot];
-        if (__atomic_load_n(&task->valid, __ATOMIC_ACQUIRE) == 0U) {
+        if (__atomic_load_n(&state->dispatch_tasks[slot], __ATOMIC_ACQUIRE) == NULL) {
             __dpa_thread_window_read_inv();
             continue;
         }
-
+        
+        task = state->dispatch_tasks[slot];
         result = schedule_grpc_serialize_task_fields(thread_arg, task);
-        if (result < 0 && task->slot_idx < DMESH_GRPC_MAX_PENDING) {
+        if (result < 0) {
             __atomic_store_n(&state->pipeline_task_state[task->slot_idx],
                              TASK_STATE_ERROR,
                              __ATOMIC_RELEASE);
         }
 
-        __atomic_store_n(&task->valid, 0U, __ATOMIC_RELEASE);
+        __atomic_store_n(&state->dispatch_tasks[slot], NULL, __ATOMIC_RELEASE);
         __atomic_store_n(&state->dispatch_cons, cons + 1U, __ATOMIC_RELEASE);
         dispatched++;
     }
@@ -683,28 +654,28 @@ publish_consumer_seq(struct dpa_thread_arg *thread_arg, uint64_t consumer_seq)
 }
 
 static inline void
-init_grpc_dma_comp_msg(struct comch_grpc_dma_comp_msg *comp_msg,
+init_grpc_task(struct dpa_grpc_serialize_task *task,
                        const struct grpc_req_desc *desc,
-                       uint64_t ring_seq)
+                       uint32_t slot_idx)
 {
-    comp_msg->type = COMCH_MSG_TYPE_GRPC_DMA_COMPLETED;
-    comp_msg->request_id = desc->req_id;
-    comp_msg->ring_seq = ring_seq;
-    comp_msg->len = 0;
-    comp_msg->schema_id = (uint16_t)desc->schema_id;
-    comp_msg->expected_dma = 0;
+    task->slot_idx = slot_idx;
+    task->request_id = desc->req_id;
+    task->ring_seq = desc->seq;
+    task->src_addr = 0;
+    task->len = 0;
+    task->schema_id = (uint16_t)desc->schema_id;
+    task->flags = DMESH_GRPC_SERIALIZE_TASK_F_COPY_FROM_HOST;
 }
 
 static int
 prepare_grpc_hello_request_flat(struct dpa_thread_arg *thread_arg,
                            const struct grpc_req_desc *desc,
-                           uint32_t slot_idx,
-                           struct comch_grpc_dma_comp_msg *comp_msg)
+                           struct dpa_grpc_serialize_task *task)
 {
     uint32_t flat_len = desc->size;
     int result;
 
-    if (comp_msg == 0)
+    if (task == 0)
         return -1;
     if ((desc->addr & (DMESH_GRPC_ARENA_ADDR_ALIGN - 1U)) != 0)
         return -1;
@@ -712,17 +683,10 @@ prepare_grpc_hello_request_flat(struct dpa_thread_arg *thread_arg,
             desc->size > DMESH_GRPC_MAX_FLAT_SIZE)
         return -1;
 
-    comp_msg->len = flat_len;
-    comp_msg->expected_dma = 1;
+    task->len = flat_len;
+    task->src_addr = desc->addr;
 
-    result = enqueue_grpc_dispatch_task_fields(thread_arg,
-                                               desc->req_id,
-                                               desc->seq,
-                                               desc->addr,
-                                               flat_len,
-                                               slot_idx,
-                                               (uint16_t)desc->schema_id,
-                                               DMESH_GRPC_SERIALIZE_TASK_F_COPY_FROM_HOST);
+    result = enqueue_grpc_dispatch_task_fields(thread_arg, task);
     if (result < 0)
         return result;
 
@@ -761,7 +725,7 @@ poll_desc_ring_grpc(struct dpa_thread_arg *thread_arg)
     uint16_t publish_consumer = 0;
 	while (1) {
         uint32_t prepared = 0;
-        struct comch_grpc_dma_comp_msg *dma_comp_msg;
+        struct dpa_grpc_serialize_task *task;
         enum pipeline_task_state task_state;
 
 #if DEBUG_LOG
@@ -840,16 +804,15 @@ poll_desc_ring_grpc(struct dpa_thread_arg *thread_arg)
         }
 #endif
 
-        if (publish_consumer > 256) {
-            struct comch_grpc_serialize_comp_msg *msg = 
-                (struct comch_grpc_serialize_comp_msg *)&grpc_dma_comp_imm[(consumer_seq - 1) % DMESH_GRPC_MAX_PENDING];
+        if (publish_consumer > DMA_COMPLETION_BATCH_SIZE) {
+            struct dpa_grpc_serialize_task *done_task = &grpc_tasks[(consumer_seq - 1) % DMESH_GRPC_MAX_PENDING];
             struct comch_grpc_serialize_comp_msg ser_comp_msg = 
                 (struct comch_grpc_serialize_comp_msg){
                     .type = COMCH_MSG_TYPE_GRPC_SERIALIZE_COMPLETED,
-                    .request_id = msg->request_id,
-                    .ring_seq = msg->ring_seq,
-                    .encoded_len = msg->encoded_len,
-                    .schema_id = msg->schema_id,
+                    .request_id = done_task->request_id,
+                    .ring_seq = done_task->ring_seq,
+                    .encoded_len = done_task->len,
+                    .schema_id = done_task->schema_id,
                     .completed = publish_consumer, // use status field to piggyback the number of completed descriptors
                 };
 
@@ -899,30 +862,27 @@ poll_desc_ring_grpc(struct dpa_thread_arg *thread_arg)
                                       desc->req_id, desc->addr, desc->size);
             }
 #endif
-            __atomic_store_n(&state->pipeline_task_state[desc_idx], TASK_STATE_PROCESSING, __ATOMIC_RELEASE);
 
             /*
-             * Descriptor ownership remains with DPA until serialization finishes.
-             * Host arena memory may be DMA source for pointer fields, so
-             * consumer_seq advances only when this sequence is completed.
-             */
+            * Descriptor ownership remains with DPA until serialization finishes.
+            * Host arena memory may be DMA source for pointer fields, so
+            * consumer_seq advances only when this sequence is completed.
+            */
             if (desc->schema_id <= grpc_schema_blob.msg_count) {
-                dma_comp_msg = &grpc_dma_comp_imm[desc_idx];
-                init_grpc_dma_comp_msg(dma_comp_msg, desc, next_desc_seq);
+                __atomic_store_n(&state->pipeline_task_state[desc_idx], TASK_STATE_PROCESSING, __ATOMIC_RELEASE);
+                task = &grpc_tasks[desc_idx];
+                init_grpc_task(task, desc, desc_idx);
 
-                prep_result = prepare_grpc_hello_request_flat(thread_arg, desc,
-                                                              desc_idx, dma_comp_msg);
-
+                prep_result = prepare_grpc_hello_request_flat(thread_arg, desc, task);
 #if DEBUG_LOG                                                            
                 if (next_desc_seq <= 8U || (next_desc_seq % DEBUG_INTERVAL) == 0U) {
                     DOCA_DPA_DEV_LOG_INFO("gRPC prepare result: next_desc_seq=%lu consumer_seq=%lu ring_seq=%lu "
-                                            "req=%u schema=%u expected_dma=%u\n",
+                                            "req=%u schema=%u\n",
                                             next_desc_seq, consumer_seq,             
-                                            dma_comp_msg->ring_seq, 
-                                            dma_comp_msg->request_id,
-                                            dma_comp_msg->schema_id,
-                                            (uint32_t)dma_comp_msg->expected_dma);
-                 }
+                                            task->ring_seq, 
+                                            task->request_id,
+                                            task->schema_id);
+                }
 #endif
             
             }
@@ -960,7 +920,6 @@ complete_grpc_serialize_task(struct dpa_thread_arg *thread_arg,
 #if DEBUG_LOG
     uint64_t out_offset = 0;
 #endif
-    struct comch_grpc_serialize_comp_msg *comp_msg;
     uint32_t copy_len;
     uint32_t done_idx;
     uint32_t slot_idx;
@@ -981,7 +940,6 @@ complete_grpc_serialize_task(struct dpa_thread_arg *thread_arg,
         return;
     }
     done_idx = slot_idx;
-    comp_msg = (struct comch_grpc_serialize_comp_msg *)&grpc_dma_comp_imm[done_idx];
 
     uint64_t flat_addr = thread_arg->dpu_base_addr + (slot_idx * DMESH_GRPC_PRIVATE_SLOT_SIZE);
     uint64_t out_addr = flat_addr + DMA_ALIGN_UP(DMESH_GRPC_MAX_FLAT_SIZE);
@@ -1063,9 +1021,7 @@ complete_grpc_serialize_task(struct dpa_thread_arg *thread_arg,
 finish:
     __dpa_thread_window_writeback();
 
-
-    comp_msg->completed = 0;
-    comp_msg->encoded_len = proto_cpl.encoded_len;
+    task->len = proto_cpl.encoded_len; // flat_len -> encoded_len
     __sync_synchronize();
 
     if (result < 0) {
@@ -1079,10 +1035,10 @@ finish:
 
 
 #if DEBUG_LOG
-    if (comp_msg->ring_seq <= 8U || (comp_msg->ring_seq % DEBUG_INTERVAL) == 0U) {
+    if (task->ring_seq <= 8U || (task->ring_seq % DEBUG_INTERVAL) == 0U) {
         DOCA_DPA_DEV_LOG_INFO("gRPC serialize done: "
                                 "req=%u seq=%lu slot=%u status=%d len=%u out_offset=%lu\n",
-                                comp_msg->request_id, comp_msg->ring_seq, done_idx,
+                                task->request_id, task->ring_seq, done_idx,
                                 proto_cpl.status, proto_cpl.encoded_len, out_offset);
     }
 #endif
@@ -1094,9 +1050,6 @@ poll_grpc_serializer_queue(struct dpa_thread_arg *thread_arg)
     struct dpa_grpc_pipeline_state *state = grpc_pipeline_state(thread_arg);
     uint32_t worker = thread_arg->serializer_index;
     uint32_t idle_polls = 0;
-
-    if (state == 0 || worker >= DMESH_GRPC_SERIALIZER_THREADS)
-        return;
 
     for (;;) {
         uint32_t cons = __atomic_load_n(&state->serializer_cons[worker], __ATOMIC_ACQUIRE);
@@ -1120,18 +1073,17 @@ poll_grpc_serializer_queue(struct dpa_thread_arg *thread_arg)
             __dpa_thread_window_read_inv();
             continue;
         }
-        
         idle_polls = 0;
+        
         slot = cons % DMESH_GRPC_SERIALIZER_QUEUE_DEPTH;
-        task = &state->serializer_tasks[worker][slot];
-        if (__atomic_load_n(&task->valid, __ATOMIC_ACQUIRE) == 0) {
+        if (__atomic_load_n(&state->serializer_tasks[worker][slot], __ATOMIC_ACQUIRE) == NULL) {
             __dpa_thread_window_read_inv();
             continue;
         }
-
+        task = state->serializer_tasks[worker][slot];
         complete_grpc_serialize_task(thread_arg, task, DMESH_GRPC_SERIALIZE_MODE_COPY);
 
-        __atomic_store_n(&task->valid, 0U, __ATOMIC_RELEASE);
+        __atomic_store_n(&state->serializer_tasks[worker][slot], NULL, __ATOMIC_RELEASE);
         __atomic_store_n(&state->serializer_cons[worker], cons + 1U, __ATOMIC_RELEASE);
     }
 }

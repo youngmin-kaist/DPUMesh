@@ -17,7 +17,7 @@ typedef uint64_t doca_dpa_dev_completion_t;
 typedef uint64_t doca_dpa_dev_async_ops_t;
 typedef uint64_t doca_dpa_dev_notification_completion_t;
 
-#define DMESH_GRPC_SERIALIZER_THREADS 16U
+#define DMESH_GRPC_SERIALIZER_THREADS 4U
 #define DEBUG_INTERVAL (1024 * 128 + 7717)
 // #define DEBUG_INTERVAL 0xffffffff
 #define DEBUG_LOG 0
@@ -78,7 +78,7 @@ struct comch_dma_comp_msg {
 typedef uint64_t doca_dpa_dev_comch_producer_t;
 
 #define DMA_RING_CACHELINE_SIZE 64
-#define DMA_COMPLETION_BATCH_SIZE 64
+#define DMA_COMPLETION_BATCH_SIZE 256
 #define DMA_MSG_SIZE_LIMIT 8192
 #define DMA_COMPLETION_IDLE_POLL_LIMIT 1024
 
@@ -86,8 +86,8 @@ typedef uint64_t doca_dpa_dev_comch_producer_t;
 
 #define DMESH_GRPC_ARENA_ADDR_ALIGN 64U
 #define DMESH_GRPC_DMA_MSG_ALIGN DMA_ADDR_ALIGN
-#define DMESH_GRPC_MAX_FLAT_SIZE 8192U
-#define DMESH_GRPC_MAX_ENCODED_SIZE 8192U
+#define DMESH_GRPC_MAX_FLAT_SIZE DMA_MSG_SIZE_LIMIT
+#define DMESH_GRPC_MAX_ENCODED_SIZE DMA_MSG_SIZE_LIMIT
 #define DMESH_GRPC_PRIVATE_SLOT_SIZE \
 	DMA_ALIGN_UP(DMESH_GRPC_MAX_FLAT_SIZE + DMESH_GRPC_MAX_ENCODED_SIZE)
 #define DMESH_GRPC_MAX_PENDING 1024U
@@ -174,12 +174,11 @@ struct comch_grpc_serialize_comp_msg {
 } __attribute__((__packed__, aligned(8)));
 
 struct dpa_grpc_serialize_task {
-	uint32_t valid;
+	uint32_t slot_idx;
 	uint32_t request_id;
 	uint64_t ring_seq;
 	uint64_t src_addr;
 	uint32_t len;
-	uint32_t slot_idx;
 	uint16_t schema_id;
 	uint16_t flags;
 } __attribute__((__packed__, aligned(8)));
@@ -188,9 +187,9 @@ struct dpa_grpc_serialize_task {
 
 struct dpa_grpc_pipeline_state {
 	enum pipeline_task_state pipeline_task_state[DMESH_GRPC_MAX_PENDING];
-	struct dpa_grpc_serialize_task dispatch_tasks[DMESH_GRPC_DISPATCH_QUEUE_DEPTH];
+	struct dpa_grpc_serialize_task *dispatch_tasks[DMESH_GRPC_DISPATCH_QUEUE_DEPTH];
 	struct dpa_grpc_serialize_task
-		serializer_tasks[DMESH_GRPC_SERIALIZER_THREADS][DMESH_GRPC_SERIALIZER_QUEUE_DEPTH];
+		*serializer_tasks[DMESH_GRPC_SERIALIZER_THREADS][DMESH_GRPC_SERIALIZER_QUEUE_DEPTH];
 	
 	uint32_t serializer_drr_cursor;
 	uint32_t reserved0;
