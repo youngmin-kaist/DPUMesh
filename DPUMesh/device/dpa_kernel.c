@@ -13,7 +13,7 @@
 #define DMESH_GRPC_SERIALIZE_MODE_DMA_COPY 3U
 
 #ifndef DMESH_GRPC_SERIALIZE_DEFAULT_MODE
-#define DMESH_GRPC_SERIALIZE_DEFAULT_MODE DMESH_GRPC_SERIALIZE_MODE_GRPC_REVERSE
+#define DMESH_GRPC_SERIALIZE_DEFAULT_MODE DMESH_GRPC_SERIALIZE_MODE_COPY
 #endif
 
 #define POLL_GRPC 1
@@ -657,8 +657,9 @@ schedule_grpc_serialize_task_fields(struct dpa_thread_arg *thread_arg,
     state->serializer_drr_cursor = (worker + 1U) % DMESH_GRPC_SERIALIZER_THREADS;
     
     // notify the serializer worker thread
-    if (thread_arg->serializer_notify[worker] != 0)
+    if (thread_arg->serializer_notify[worker] != 0) {
         doca_dpa_dev_thread_notify(thread_arg->serializer_notify[worker]);
+    }
     
     return 0;
 }
@@ -889,36 +890,10 @@ init_grpc_task(struct dpa_grpc_serialize_task *task,
     task->slot_idx = slot_idx;
     task->request_id = desc->req_id;
     task->ring_seq = desc->seq;
-    task->src_addr = 0;
-    task->len = 0;
+    task->src_addr = desc->addr;
+    task->len = desc->size;
     task->schema_id = (uint16_t)desc->schema_id;
     task->flags = DMESH_GRPC_SERIALIZE_TASK_F_COPY_FROM_HOST;
-}
-
-static int
-prepare_grpc_hello_request_flat(struct dpa_thread_arg *thread_arg,
-                           const struct grpc_req_desc *desc,
-                           struct dpa_grpc_serialize_task *task)
-{
-    uint32_t flat_len = desc->size;
-    int result;
-
-    if (task == 0)
-        return -1;
-    if ((desc->addr & (DMESH_GRPC_ARENA_ADDR_ALIGN - 1U)) != 0)
-        return -1;
-    if (desc->size < sizeof(struct dmesh_grpc_hello_flat) ||
-            desc->size > DMESH_GRPC_MAX_FLAT_SIZE)
-        return -1;
-
-    task->len = flat_len;
-    task->src_addr = desc->addr;
-
-    result = enqueue_grpc_dispatch_task_fields(thread_arg, task);
-    if (result < 0)
-        return result;
-
-    return 1;
 }
 
 static void 
@@ -1077,7 +1052,7 @@ poll_desc_ring_grpc(struct dpa_thread_arg *thread_arg)
         while (next_desc_seq - consumer_seq <= ring_size &&
                prepared < DMA_COMPLETION_BATCH_SIZE) {
             uint32_t desc_idx = (uint32_t)((next_desc_seq - 1U) % ring_size);
-            int prep_result;
+            int enqueue_result;
 
             if (__atomic_load_n(&state->pipeline_task_state[desc_idx], __ATOMIC_ACQUIRE) 
                 != TASK_STATE_IDLE)
@@ -1116,7 +1091,8 @@ poll_desc_ring_grpc(struct dpa_thread_arg *thread_arg)
                 task = &grpc_tasks[desc_idx];
                 init_grpc_task(task, desc, desc_idx);
 
-                prep_result = prepare_grpc_hello_request_flat(thread_arg, desc, task);
+                enqueue_result = enqueue_grpc_dispatch_task_fields(thread_arg, task);
+
 #if DEBUG_LOG                                                            
                 if (next_desc_seq <= 8U || (next_desc_seq % DEBUG_INTERVAL) == 0U) {
                     DOCA_DPA_DEV_LOG_INFO("gRPC prepare result: next_desc_seq=%lu consumer_seq=%lu ring_seq=%lu "
@@ -1128,12 +1104,10 @@ poll_desc_ring_grpc(struct dpa_thread_arg *thread_arg)
                 }
 #endif
             
-            }
+            } else
+                enqueue_result = -1;
 
-            else
-                prep_result = -1;
-
-            if (prep_result <= 0) {
+            if (enqueue_result < 0) {
                 DOCA_DPA_DEV_LOG_INFO("Failed to prepare gRPC descriptor: seq=%lu\n", next_desc_seq);
                 __atomic_store_n(&state->pipeline_task_state[desc_idx], TASK_STATE_COMPLETED, __ATOMIC_RELEASE);
             }

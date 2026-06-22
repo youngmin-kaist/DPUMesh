@@ -497,6 +497,7 @@ dmesh_doca_dpa_thread_create(struct dmesh_doca_dpa_thread *dpa_thread)
 	}
 
     /* set EU affinity */
+    uint32_t test_eus[DMESH_DPA_THREAD_COUNT] = {0, 16, 32, 33, 34, 35};
     for (i = 0; i < DMESH_DPA_THREAD_COUNT; ++i) {
 		doca_dpa_func_t *func;
 		doca_dpa_dev_uintptr_t arg_addr =
@@ -527,6 +528,18 @@ dmesh_doca_dpa_thread_create(struct dmesh_doca_dpa_thread *dpa_thread)
 			return result;
 		}
 
+#ifdef DOCA_ARCH_DPU
+        /*
+         * Strict EU affinity.
+         */
+        if (i < total_eus) {
+            result = dmesh_doca_dpa_thread_set_eu_affinity(dpa_thread, i, test_eus[i]);
+            if (result != DOCA_SUCCESS)
+                return result;
+        } else {
+            DOCA_LOG_WARN("No unique EU for DPA thread %u; leaving affinity unset", i);
+        }
+#endif
 
 			result = doca_dpa_thread_start(dpa_thread->threads[i]);
 		if (result != DOCA_SUCCESS) {
