@@ -885,7 +885,7 @@ poll_desc_ring_grpc(struct dpa_thread_arg *thread_arg)
                 */
                break;
             }
-// TODO: valid schema_id check
+
             if (desc->schema_id > grpc_schema_blob.msg_count) {
                 DOCA_DPA_DEV_LOG_INFO("gRPC serialize unsupported schema: req=%u seq=%lu schema=%u\n",
                                     desc->req_id, desc->seq, desc->schema_id);
