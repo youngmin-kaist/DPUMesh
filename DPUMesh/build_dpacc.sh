@@ -45,6 +45,8 @@ DPACC_MCPU_FLAG=$5
 DOCA_LIB_DIR=$6
 OUTPUT_PATH=$7
 DPA_GRPC_WIRE_SRC="${PROJECT_SRC_DIR}/grpc/grpc_wire_encode.c"
+shift 7 || true
+EXTRA_CC_FLAGS="$*"
 
 # DOCA Configurations
 DOCA_DIR="/opt/mellanox/doca"
@@ -54,6 +56,10 @@ DOCA_DPACC="${DOCA_TOOLS}/dpacc"
 
 HOST_CC_FLAGS="-Wno-deprecated-declarations -Werror -Wall -Wextra -DFLEXIO_ALLOW_EXPERIMENTAL_API"
 DEVICE_CC_FLAGS="-Wno-deprecated-declarations -Wno-error -Wall -Wextra -DFLEXIO_DEV_ALLOW_EXPERIMENTAL_API -O2"
+if [ -n "${EXTRA_CC_FLAGS}" ]; then
+	HOST_CC_FLAGS="${HOST_CC_FLAGS} ${EXTRA_CC_FLAGS}"
+	DEVICE_CC_FLAGS="${DEVICE_CC_FLAGS} ${EXTRA_CC_FLAGS}"
+fi
 
 # DOCA DPA APP Configuration
 # This variable name passed to DPACC with --app-name parameter and it's token must be identical to the

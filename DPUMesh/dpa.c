@@ -451,6 +451,10 @@ dmesh_doca_dpa_thread_create(struct dmesh_doca_dpa_thread *dpa_thread)
 
     DOCA_LOG_INFO("DPA resources: cores=%u, eus_per_core=%u, total_eus=%u",
                 num_cores, eus_per_core, total_eus);
+    DOCA_LOG_INFO("DPA gRPC config: serializers=%u, pipeline_profile=%u, profile_interval=%u",
+                DMESH_GRPC_SERIALIZER_THREADS,
+                DMESH_GRPC_PIPELINE_PROFILE,
+                DMESH_GRPC_PROFILE_LOG_INTERVAL);
 
     if (total_eus < DMESH_DPA_THREAD_COUNT) {
         DOCA_LOG_WARN("DPA EUs fewer than DPA threads: total_eus=%u, threads=%u",
@@ -493,7 +497,6 @@ dmesh_doca_dpa_thread_create(struct dmesh_doca_dpa_thread *dpa_thread)
 	}
 
     /* set EU affinity */
-    uint32_t test_eus[DMESH_DPA_THREAD_COUNT] = {0, 16, 32, 33, 34, 35};
     for (i = 0; i < DMESH_DPA_THREAD_COUNT; ++i) {
 		doca_dpa_func_t *func;
 		doca_dpa_dev_uintptr_t arg_addr =
@@ -525,20 +528,7 @@ dmesh_doca_dpa_thread_create(struct dmesh_doca_dpa_thread *dpa_thread)
 		}
 
 
-#ifdef DOCA_ARCH_DPU
-        /*
-         * Strict EU affinity.
-         */
-        // if (i < total_eus) {
-        //     result = dmesh_doca_dpa_thread_set_eu_affinity(dpa_thread, i, test_eus[i]);
-        //     if (result != DOCA_SUCCESS)
-        //         return result;
-        // } else {
-        //     DOCA_LOG_WARN("No unique EU for DPA thread %u; leaving affinity unset", i);
-        // }
-#endif
-
-		result = doca_dpa_thread_start(dpa_thread->threads[i]);
+			result = doca_dpa_thread_start(dpa_thread->threads[i]);
 		if (result != DOCA_SUCCESS) {
 			DOCA_LOG_ERR("Failed to start DPA thread %u: %s",
 				     i, doca_error_get_descr(result));

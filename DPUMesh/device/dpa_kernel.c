@@ -128,6 +128,228 @@ static inline struct dpa_grpc_pipeline_state
     return (struct dpa_grpc_pipeline_state *)(uintptr_t)thread_arg->pipeline_state;
 }
 
+#if DMESH_GRPC_PIPELINE_PROFILE
+/*
+ * Profiling counters are observational only. They intentionally use relaxed
+ * atomics and must not be treated as task ownership/order synchronization; the
+ * queue pointer/prod/cons release-acquire protocol remains authoritative.
+ */
+static inline uint64_t
+grpc_profile_now_us(void)
+{
+    return __dpa_thread_time();
+}
+
+static inline uint64_t
+grpc_profile_load_u64(const uint64_t *ptr)
+{
+    return __atomic_load_n(ptr, __ATOMIC_RELAXED);
+}
+
+static inline void
+grpc_profile_store_u64(uint64_t *ptr, uint64_t value)
+{
+    __atomic_store_n(ptr, value, __ATOMIC_RELAXED);
+}
+
+static inline void
+grpc_profile_add_u64(uint64_t *ptr, uint64_t delta)
+{
+    uint64_t value = grpc_profile_load_u64(ptr);
+
+    grpc_profile_store_u64(ptr, value + delta);
+}
+
+static inline uint64_t
+grpc_profile_per_sec(uint64_t count, uint64_t window_us)
+{
+    if (window_us == 0U)
+        return 0U;
+
+    return (count * 1000000ULL) / window_us;
+}
+
+static inline void
+grpc_profile_note_serializer_enqueue(struct dpa_grpc_pipeline_state *state,
+                                     uint32_t worker,
+                                     uint32_t occupancy)
+{
+    uint32_t max_occupancy;
+
+    if (state == 0 || worker >= DMESH_GRPC_SERIALIZER_THREADS)
+        return;
+
+    max_occupancy = __atomic_load_n(&state->profile.serializer_queue_max_occupancy[worker],
+                                    __ATOMIC_RELAXED);
+    if (occupancy > max_occupancy) {
+        __atomic_store_n(&state->profile.serializer_queue_max_occupancy[worker],
+                         occupancy,
+                         __ATOMIC_RELAXED);
+    }
+}
+
+static inline void
+grpc_profile_note_serializer_completed(struct dpa_grpc_pipeline_state *state,
+                                       uint32_t worker)
+{
+    if (state == 0 || worker >= DMESH_GRPC_SERIALIZER_THREADS)
+        return;
+
+    grpc_profile_add_u64(&state->profile.serializer_completed[worker], 1U);
+}
+
+static inline void
+grpc_profile_note_serializer_idle_poll(struct dpa_grpc_pipeline_state *state,
+                                       uint32_t worker)
+{
+    if (state == 0 || worker >= DMESH_GRPC_SERIALIZER_THREADS)
+        return;
+
+    grpc_profile_add_u64(&state->profile.serializer_idle_polls[worker], 1U);
+}
+
+static inline void
+grpc_profile_note_serializer_reschedule(struct dpa_grpc_pipeline_state *state,
+                                        uint32_t worker)
+{
+    if (state == 0 || worker >= DMESH_GRPC_SERIALIZER_THREADS)
+        return;
+
+    grpc_profile_add_u64(&state->profile.serializer_reschedules[worker], 1U);
+}
+
+static inline void
+grpc_profile_note_retire_stall(struct dpa_grpc_pipeline_state *state,
+                               uint8_t new_stall_event)
+{
+    if (state == 0)
+        return;
+
+    grpc_profile_add_u64(&state->profile.retire_stall_polls, 1U);
+    if (new_stall_event)
+        grpc_profile_add_u64(&state->profile.retire_stall_events, 1U);
+}
+
+static void
+grpc_profile_report_dispatcher(struct dpa_thread_arg *thread_arg,
+                               uint32_t dispatched)
+{
+    struct dpa_grpc_pipeline_state *state = grpc_pipeline_state(thread_arg);
+    struct dpa_grpc_pipeline_profile *profile;
+    uint64_t total_dispatched;
+    uint64_t last_dispatched;
+    uint64_t dispatch_delta;
+    uint64_t now_us;
+    uint64_t last_us;
+    uint64_t window_us;
+    uint64_t retire_stall_polls;
+    uint64_t retire_stall_events;
+    uint64_t retire_stall_polls_delta;
+    uint64_t retire_stall_events_delta;
+    uint32_t dispatch_prod;
+    uint32_t dispatch_cons;
+    uint32_t dispatch_occupancy;
+    uint32_t i;
+
+    if (state == 0 || dispatched == 0U)
+        return;
+
+    profile = &state->profile;
+    total_dispatched = grpc_profile_load_u64(&profile->dispatcher_dispatched) + dispatched;
+    grpc_profile_store_u64(&profile->dispatcher_dispatched, total_dispatched);
+
+    last_dispatched = grpc_profile_load_u64(&profile->dispatcher_last_dispatched);
+    dispatch_delta = total_dispatched - last_dispatched;
+    if (dispatch_delta < DMESH_GRPC_PROFILE_LOG_INTERVAL)
+        return;
+
+    now_us = grpc_profile_now_us();
+    last_us = grpc_profile_load_u64(&profile->dispatcher_last_report_us);
+    if (last_us == 0U) {
+        grpc_profile_store_u64(&profile->dispatcher_last_report_us, now_us);
+        grpc_profile_store_u64(&profile->dispatcher_last_dispatched, total_dispatched);
+        return;
+    }
+    window_us = now_us - last_us;
+
+    retire_stall_polls = grpc_profile_load_u64(&profile->retire_stall_polls);
+    retire_stall_events = grpc_profile_load_u64(&profile->retire_stall_events);
+    retire_stall_polls_delta =
+        retire_stall_polls - grpc_profile_load_u64(&profile->retire_last_stall_polls);
+    retire_stall_events_delta =
+        retire_stall_events - grpc_profile_load_u64(&profile->retire_last_stall_events);
+
+    dispatch_prod = __atomic_load_n(&state->dispatch_prod, __ATOMIC_ACQUIRE);
+    dispatch_cons = __atomic_load_n(&state->dispatch_cons, __ATOMIC_ACQUIRE);
+    dispatch_occupancy = dispatch_prod - dispatch_cons;
+
+    DOCA_DPA_DEV_LOG_INFO("gRPC profile dispatcher: serializers=%u dispatched_total=%lu "
+                          "dispatched_delta=%lu dispatched_per_sec=%lu window_us=%lu "
+                          "dispatch_q_occ=%u retire_stall_polls_delta=%lu "
+                          "retire_stall_events_delta=%lu retire_stall_polls_total=%lu "
+                          "retire_stall_events_total=%lu\n",
+                          DMESH_GRPC_SERIALIZER_THREADS,
+                          (unsigned long)total_dispatched,
+                          (unsigned long)dispatch_delta,
+                          (unsigned long)grpc_profile_per_sec(dispatch_delta, window_us),
+                          (unsigned long)window_us,
+                          dispatch_occupancy,
+                          (unsigned long)retire_stall_polls_delta,
+                          (unsigned long)retire_stall_events_delta,
+                          (unsigned long)retire_stall_polls,
+                          (unsigned long)retire_stall_events);
+
+    for (i = 0; i < DMESH_GRPC_SERIALIZER_THREADS; ++i) {
+        uint64_t completed = grpc_profile_load_u64(&profile->serializer_completed[i]);
+        uint64_t idle_polls = grpc_profile_load_u64(&profile->serializer_idle_polls[i]);
+        uint64_t reschedules = grpc_profile_load_u64(&profile->serializer_reschedules[i]);
+        uint64_t completed_delta =
+            completed - grpc_profile_load_u64(&profile->serializer_last_completed[i]);
+        uint64_t idle_polls_delta =
+            idle_polls - grpc_profile_load_u64(&profile->serializer_last_idle_polls[i]);
+        uint64_t reschedules_delta =
+            reschedules - grpc_profile_load_u64(&profile->serializer_last_reschedules[i]);
+        uint32_t prod = __atomic_load_n(&state->serializer_prod[i], __ATOMIC_ACQUIRE);
+        uint32_t cons = __atomic_load_n(&state->serializer_cons[i], __ATOMIC_ACQUIRE);
+        uint32_t occupancy = prod - cons;
+        uint32_t max_occupancy =
+            __atomic_load_n(&profile->serializer_queue_max_occupancy[i],
+                            __ATOMIC_RELAXED);
+
+        DOCA_DPA_DEV_LOG_INFO("gRPC profile worker: serializers=%u worker=%u "
+                              "completed_delta=%lu completed_per_sec=%lu "
+                              "completed_total=%lu idle_polls_delta=%lu "
+                              "idle_polls_total=%lu reschedules_delta=%lu "
+                              "reschedules_total=%lu q_occ=%u q_max=%u prod=%u cons=%u\n",
+                              DMESH_GRPC_SERIALIZER_THREADS,
+                              i,
+                              (unsigned long)completed_delta,
+                              (unsigned long)grpc_profile_per_sec(completed_delta, window_us),
+                              (unsigned long)completed,
+                              (unsigned long)idle_polls_delta,
+                              (unsigned long)idle_polls,
+                              (unsigned long)reschedules_delta,
+                              (unsigned long)reschedules,
+                              occupancy,
+                              max_occupancy,
+                              prod,
+                              cons);
+
+        grpc_profile_store_u64(&profile->serializer_last_completed[i], completed);
+        grpc_profile_store_u64(&profile->serializer_last_idle_polls[i], idle_polls);
+        grpc_profile_store_u64(&profile->serializer_last_reschedules[i], reschedules);
+        __atomic_store_n(&profile->serializer_queue_max_occupancy[i],
+                         occupancy,
+                         __ATOMIC_RELAXED);
+    }
+
+    grpc_profile_store_u64(&profile->dispatcher_last_dispatched, total_dispatched);
+    grpc_profile_store_u64(&profile->dispatcher_last_report_us, now_us);
+    grpc_profile_store_u64(&profile->retire_last_stall_polls, retire_stall_polls);
+    grpc_profile_store_u64(&profile->retire_last_stall_events, retire_stall_events);
+}
+#endif
+
 static uint32_t
 drain_dpa_producer_completions(struct dpa_thread_arg *thread_arg)
 {
@@ -427,6 +649,9 @@ schedule_grpc_serialize_task_fields(struct dpa_thread_arg *thread_arg,
     __atomic_store_n(&state->serializer_tasks[worker][ser_queue_slot], task, __ATOMIC_RELEASE);
     __sync_synchronize();
     __atomic_store_n(&state->serializer_prod[worker], prod + 1U, __ATOMIC_RELEASE);
+#if DMESH_GRPC_PIPELINE_PROFILE
+    grpc_profile_note_serializer_enqueue(state, worker, (prod + 1U) - cons);
+#endif
 
     state->serializer_drr_deficit[worker] = deficit - cost;
     state->serializer_drr_cursor = (worker + 1U) % DMESH_GRPC_SERIALIZER_THREADS;
@@ -639,6 +864,9 @@ dispatch_grpc_serialize_tasks(struct dpa_thread_arg *thread_arg,
     }
 
     // __atomic_store_n(&state->dispatch_cons, cons + dispatched, __ATOMIC_RELEASE);
+#if DMESH_GRPC_PIPELINE_PROFILE
+    grpc_profile_report_dispatcher(thread_arg, dispatched);
+#endif
 
     return dispatched;
 }
@@ -707,6 +935,10 @@ poll_desc_ring_grpc(struct dpa_thread_arg *thread_arg)
 	uint32_t stall_poll_count = 0;
 	uint64_t stall_consumer_seq = 0;
 #endif
+#if DMESH_GRPC_PIPELINE_PROFILE
+	enum pipeline_task_state profile_stall_task_state = TASK_STATE_IDLE;
+	uint64_t profile_stall_consumer_seq = (uint64_t)-1;
+#endif
 
 	if (state == 0)
 	    return;
@@ -741,6 +973,17 @@ poll_desc_ring_grpc(struct dpa_thread_arg *thread_arg)
 #if DEBUG_LOG
                 retire_blocked = 1;
                 retire_blocked_idx = done_idx;
+#endif
+#if DMESH_GRPC_PIPELINE_PROFILE
+                uint8_t new_stall_event =
+                    profile_stall_consumer_seq != consumer_seq ||
+                    profile_stall_task_state != task_state;
+
+                if (new_stall_event) {
+                    profile_stall_consumer_seq = consumer_seq;
+                    profile_stall_task_state = task_state;
+                }
+                grpc_profile_note_retire_stall(state, new_stall_event);
 #endif
                 break;
             }
@@ -1059,6 +1302,10 @@ poll_grpc_serializer_queue(struct dpa_thread_arg *thread_arg)
 
         if (cons == prod) {
             if (++idle_polls >= DMESH_GRPC_SERIALIZER_IDLE_POLL_BUDGET) {
+#if DMESH_GRPC_PIPELINE_PROFILE
+                grpc_profile_note_serializer_idle_poll(state, worker);
+                grpc_profile_note_serializer_reschedule(state, worker);
+#endif
                 /*
                  * Serializer workers are event-driven by notification
                  * completions. After a bounded empty-queue poll window, yield
@@ -1070,6 +1317,9 @@ poll_grpc_serializer_queue(struct dpa_thread_arg *thread_arg)
                 doca_dpa_dev_thread_reschedule();
                 return;
             }
+#if DMESH_GRPC_PIPELINE_PROFILE
+            grpc_profile_note_serializer_idle_poll(state, worker);
+#endif
             __dpa_thread_window_read_inv();
             continue;
         }
@@ -1082,6 +1332,9 @@ poll_grpc_serializer_queue(struct dpa_thread_arg *thread_arg)
         }
         task = state->serializer_tasks[worker][slot];
         complete_grpc_serialize_task(thread_arg, task, DMESH_GRPC_SERIALIZE_MODE_COPY);
+#if DMESH_GRPC_PIPELINE_PROFILE
+        grpc_profile_note_serializer_completed(state, worker);
+#endif
 
         __atomic_store_n(&state->serializer_tasks[worker][slot], NULL, __ATOMIC_RELEASE);
         __atomic_store_n(&state->serializer_cons[worker], cons + 1U, __ATOMIC_RELEASE);

@@ -11,6 +11,15 @@ program_name = 'dpa_kernel'
 # Comment this line to restore warnings of experimental DOCA features
 add_project_arguments('-D DOCA_ALLOW_EXPERIMENTAL_API', language: ['c', 'cpp'])
 
+grpc_common_c_args = [
+  '-DDMESH_GRPC_SERIALIZER_THREADS=@0@U'.format(get_option('grpc_serializer_threads')),
+  '-DDMESH_GRPC_PROFILE_LOG_INTERVAL=@0@U'.format(get_option('grpc_pipeline_profile_interval')),
+]
+if get_option('grpc_pipeline_profile')
+  grpc_common_c_args += ['-DDMESH_GRPC_PIPELINE_PROFILE=1']
+endif
+add_project_arguments(grpc_common_c_args, language: ['c', 'cpp'])
+
 inc_dirs = []
 inc_dirs += include_directories('/opt/mellanox/doca/include/')
 inc_dirs += include_directories('../')
@@ -59,7 +68,7 @@ dpa_program_lib = custom_target('dpa_kernel_archive',
   input : device_src,
   output : program_name + '.a',
   command : [dpacc_build_script, meson.project_build_root(), meson.project_source_root(),
-             '@INPUT@', program_name, dpacc_mcpu_flag, doca_lib_dir, '@OUTPUT@'],
+             '@INPUT@', program_name, dpacc_mcpu_flag, doca_lib_dir, '@OUTPUT@'] + grpc_common_c_args,
   depend_files : [
     dpacc_build_script,
     meson.project_source_root() + '/dpa_common.h',

@@ -17,7 +17,15 @@ typedef uint64_t doca_dpa_dev_completion_t;
 typedef uint64_t doca_dpa_dev_async_ops_t;
 typedef uint64_t doca_dpa_dev_notification_completion_t;
 
+#ifndef DMESH_GRPC_SERIALIZER_THREADS
 #define DMESH_GRPC_SERIALIZER_THREADS 4U
+#endif
+#ifndef DMESH_GRPC_PIPELINE_PROFILE
+#define DMESH_GRPC_PIPELINE_PROFILE 0
+#endif
+#ifndef DMESH_GRPC_PROFILE_LOG_INTERVAL
+#define DMESH_GRPC_PROFILE_LOG_INTERVAL 65536U
+#endif
 #define DEBUG_INTERVAL (1024 * 128 + 7717)
 // #define DEBUG_INTERVAL 0xffffffff
 #define DEBUG_LOG 0
@@ -185,6 +193,27 @@ struct dpa_grpc_serialize_task {
 
 #define DMESH_GRPC_SERIALIZE_TASK_F_COPY_FROM_HOST 1U
 
+#if DMESH_GRPC_PIPELINE_PROFILE
+struct dpa_grpc_pipeline_profile {
+	uint64_t dispatcher_dispatched;
+	uint64_t dispatcher_last_dispatched;
+	uint64_t dispatcher_last_report_us;
+
+	uint64_t retire_stall_polls;
+	uint64_t retire_stall_events;
+	uint64_t retire_last_stall_polls;
+	uint64_t retire_last_stall_events;
+
+	uint64_t serializer_completed[DMESH_GRPC_SERIALIZER_THREADS];
+	uint64_t serializer_idle_polls[DMESH_GRPC_SERIALIZER_THREADS];
+	uint64_t serializer_reschedules[DMESH_GRPC_SERIALIZER_THREADS];
+	uint64_t serializer_last_completed[DMESH_GRPC_SERIALIZER_THREADS];
+	uint64_t serializer_last_idle_polls[DMESH_GRPC_SERIALIZER_THREADS];
+	uint64_t serializer_last_reschedules[DMESH_GRPC_SERIALIZER_THREADS];
+	uint32_t serializer_queue_max_occupancy[DMESH_GRPC_SERIALIZER_THREADS];
+};
+#endif
+
 struct dpa_grpc_pipeline_state {
 	enum pipeline_task_state pipeline_task_state[DMESH_GRPC_MAX_PENDING];
 	struct dpa_grpc_serialize_task *dispatch_tasks[DMESH_GRPC_DISPATCH_QUEUE_DEPTH];
@@ -199,6 +228,9 @@ struct dpa_grpc_pipeline_state {
 	uint32_t serializer_prod[DMESH_GRPC_SERIALIZER_THREADS];
 	uint32_t serializer_cons[DMESH_GRPC_SERIALIZER_THREADS];
 	uint32_t serializer_drr_deficit[DMESH_GRPC_SERIALIZER_THREADS];
+#if DMESH_GRPC_PIPELINE_PROFILE
+	struct dpa_grpc_pipeline_profile profile;
+#endif
 } __attribute__((aligned(4096)));
 
 struct comch_msg {

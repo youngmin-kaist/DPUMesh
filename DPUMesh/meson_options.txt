@@ -2,3 +2,18 @@ option('host_worker_bench',
        type : 'boolean',
        value : false,
        description : 'Build host_worker_bench.c instead of host_worker.c')
+option('grpc_serializer_threads',
+       type : 'integer',
+       min : 1,
+       max : 64,
+       value : 4,
+       description : 'Number of DPA gRPC serializer worker threads')
+option('grpc_pipeline_profile',
+       type : 'boolean',
+       value : false,
+       description : 'Enable DPA gRPC pipeline profiling logs')
+option('grpc_pipeline_profile_interval',
+       type : 'integer',
+       min : 1,
+       value : 65536,
+       description : 'DPA gRPC pipeline profiling report interval in dispatched tasks')
