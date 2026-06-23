@@ -166,6 +166,67 @@ static uint8_t *emit_hello_request_specialized(const uint8_t *base,
     return out;
 }
 
+static uint8_t *emit_dmesh_hello_request_specialized(const uint8_t *base,
+                                                     uint8_t *out,
+                                                     const uint8_t *end)
+{
+    const struct DmeshGrpcHelloFlat *flat = (const struct DmeshGrpcHelloFlat *)base;
+    const struct DmeshGrpcRef *name = &flat->name;
+    const struct DmeshGrpcU32ArrayRef *scores = &flat->scores;
+    const uint8_t *name_ptr;
+    const uint32_t *score_ptr;
+    uint8_t *len_pos;
+    uint8_t *payload_start;
+    uint32_t i;
+
+    out = put_varint_checked(out, end, make_tag(1U, WIRE_VARINT));
+    if (out == NULL)
+        return NULL;
+    out = put_varint_checked(out, end, flat->id);
+    if (out == NULL)
+        return NULL;
+
+    if (name->len != 0U) {
+        if (name->len > PROTO_MAX_LEN_DELIMITED)
+            return NULL;
+        out = put_varint_checked(out, end, make_tag(2U, WIRE_LEN));
+        if (out == NULL)
+            return NULL;
+        out = put_varint_checked(out, end, name->len);
+        if (out == NULL)
+            return NULL;
+
+        name_ptr = base + name->offset;
+        for (i = 0; i < name->len; ++i) {
+            if (out >= end)
+                return NULL;
+            *(out++) = *(name_ptr++);
+        }
+    }
+
+    if (scores->count != 0U) {
+        out = put_varint_checked(out, end, make_tag(3U, WIRE_LEN));
+        if (out == NULL || out + 5U > end)
+            return NULL;
+
+        len_pos = out;
+        out += 5U;
+        payload_start = out;
+
+        score_ptr = (const uint32_t *)(base + scores->offset);
+        for (i = 0; i < scores->count; ++i) {
+            out = put_varint_checked(out, end, ld_u32(score_ptr++));
+            if (out == NULL)
+                return NULL;
+        }
+
+        return backfill_len_varint_compact(len_pos, payload_start,
+                                           (uint32_t)(out - payload_start));
+    }
+
+    return out;
+}
+
 static uint8_t *emit_field_generic(const ProtoSchemaBlob *blob,
                                    const ProtoFieldSchema *f,
                                    const uint8_t *base,
@@ -486,10 +547,69 @@ int grpc_wire_serialize_one_copy(const ProtoTask *task,
         }
     }
 
-    put_grpc_header((uint8_t *)(uintptr_t)task->out_base + 3, flat_len);
+    // put_grpc_header((uint8_t *)(uintptr_t)task->out_base + 3, flat_len);
     cpl->encoded_len = flat_len;
     cpl->status = 0;
     return 0;
+}
+
+int grpc_wire_serialize_one_dmesh_flat(const ProtoSchemaBlob *blob,
+                                       const ProtoTask *task,
+                                       ProtoCompletion *cpl,
+                                       GrpcWireEncodeStats *stats)
+{
+    const ProtoMessageSchema *desc;
+    const uint8_t *flat_base;
+    uint8_t *out_base;
+    uint8_t *out_end;
+    const uint8_t *cap_end;
+    uint32_t payload_len;
+
+    if (blob == NULL || task == NULL || cpl == NULL)
+        return -1;
+    cpl->request_id = task->request_id;
+
+    desc = find_desc(blob, task->schema_id);
+    if (desc == NULL) {
+        cpl->status = -1;
+        goto error;
+    }
+
+    if (desc->schema_id != DMESH_GRPC_SCHEMA_HELLO_REQUEST) {
+        cpl->status = -1;
+        goto error;
+    }
+
+    flat_base = (const uint8_t *)(uintptr_t)task->flat;
+    out_base = (uint8_t *)(uintptr_t)task->out;
+    cap_end = out_base + MAX_ENCODED_SIZE;
+
+    if (stats != NULL)
+        stats->specialized_attempts++;
+
+    out_end = emit_dmesh_hello_request_specialized(flat_base, out_base + 5U, cap_end);
+    if (out_end == NULL) {
+        cpl->status = -2;
+        goto error;
+    }
+
+    if (stats != NULL)
+        stats->specialized_hits++;
+
+    payload_len = (uint32_t)(out_end - (out_base + 5U));
+    if (payload_len > PROTO_MAX_LEN_DELIMITED) {
+        cpl->status = -3;
+        goto error;
+    }
+
+    put_grpc_header(out_base, payload_len);
+    cpl->encoded_len = (uint32_t)(out_end - out_base);
+    cpl->status = 0;
+    return 0;
+
+error:
+    cpl->encoded_len = 0U;
+    return cpl->status;
 }
 
 
@@ -604,6 +724,69 @@ static uint8_t *emit_hello_request_specialized_reverse(const uint8_t *base,
     }
 
     /* field 1: uint64 id = 1.  Proto3/default-value semantics: omit zero. */
+    if (flat->id != 0U) {
+        cur = put_varint_reverse_checked(cur, begin, flat->id);
+        if (cur == NULL)
+            return NULL;
+        cur = put_varint_reverse_checked(cur, begin, make_tag(1U, WIRE_VARINT));
+        if (cur == NULL)
+            return NULL;
+    }
+
+    return cur;
+}
+
+static uint8_t *emit_dmesh_hello_request_specialized_reverse(const uint8_t *base,
+                                                             uint8_t *cur,
+                                                             const uint8_t *begin)
+{
+    const struct DmeshGrpcHelloFlat *flat = (const struct DmeshGrpcHelloFlat *)base;
+    const struct DmeshGrpcRef *name = &flat->name;
+    const struct DmeshGrpcU32ArrayRef *scores = &flat->scores;
+    const uint8_t *name_ptr;
+    const uint32_t *score_ptr;
+    uint8_t *payload_end;
+    uint32_t payload_len;
+    uint32_t i;
+
+    if (scores->count != 0U) {
+        payload_end = cur;
+        score_ptr = (const uint32_t *)(base + scores->offset);
+
+        for (i = scores->count; i > 0U; --i) {
+            cur = put_varint_reverse_checked(cur, begin, ld_u32(score_ptr + i - 1U));
+            if (cur == NULL)
+                return NULL;
+        }
+
+        payload_len = (uint32_t)(payload_end - cur);
+        if (payload_len > PROTO_MAX_LEN_DELIMITED)
+            return NULL;
+
+        cur = put_varint_reverse_checked(cur, begin, payload_len);
+        if (cur == NULL)
+            return NULL;
+        cur = put_varint_reverse_checked(cur, begin, make_tag(3U, WIRE_LEN));
+        if (cur == NULL)
+            return NULL;
+    }
+
+    if (name->len != 0U) {
+        if (name->len > PROTO_MAX_LEN_DELIMITED)
+            return NULL;
+
+        name_ptr = base + name->offset;
+        cur = put_bytes_reverse_checked(cur, begin, name_ptr, name->len);
+        if (cur == NULL)
+            return NULL;
+        cur = put_varint_reverse_checked(cur, begin, name->len);
+        if (cur == NULL)
+            return NULL;
+        cur = put_varint_reverse_checked(cur, begin, make_tag(2U, WIRE_LEN));
+        if (cur == NULL)
+            return NULL;
+    }
+
     if (flat->id != 0U) {
         cur = put_varint_reverse_checked(cur, begin, flat->id);
         if (cur == NULL)
@@ -794,8 +977,8 @@ static uint8_t *emit_message_dispatch_reverse(const ProtoSchemaBlob *blob,
         if (ret != NULL) {
             if (stats != NULL)
                 stats->specialized_hits++;
-            return ret;
-        }
+            }
+        return ret;
     }
 
     if (stats != NULL)
@@ -845,6 +1028,70 @@ int grpc_wire_serialize_one_reverse(const ProtoSchemaBlob *blob,
         cpl->status = -2;
         goto error;
     }
+
+    payload_len = (uint32_t)(out_cap_end - payload_start);
+    if (payload_len > PROTO_MAX_LEN_DELIMITED || payload_len > MAX_ENCODED_SIZE - 5U) {
+        cpl->status = -3;
+        goto error;
+    }
+
+    out_begin = payload_start - 5U;
+    put_grpc_header(out_begin, payload_len);
+    cpl->encoded_len = 5U + payload_len;
+    cpl->status = 0;
+    return out_begin - out_base;
+
+error:
+    cpl->encoded_len = 0U;
+    return cpl->status;
+}
+
+int grpc_wire_serialize_one_reverse_dmesh_flat(const ProtoSchemaBlob *blob,
+                                               const ProtoTask *task,
+                                               ProtoCompletion *cpl,
+                                               GrpcWireEncodeStats *stats)
+{
+    const ProtoMessageSchema *desc;
+    const uint8_t *flat_base;
+    uint8_t *out_base;
+    uint8_t *out_begin;
+    uint8_t *out_cap_end;
+    uint8_t *payload_start;
+    uint32_t payload_len;
+
+    if (blob == NULL || task == NULL || cpl == NULL)
+        return -1;
+    cpl->request_id = task->request_id;
+
+    desc = find_desc(blob, task->schema_id);
+    if (desc == NULL) {
+        cpl->status = -1;
+        goto error;
+    }
+
+    if (desc->schema_id != DMESH_GRPC_SCHEMA_HELLO_REQUEST) {
+        cpl->status = -1;
+        goto error;
+    }
+
+    flat_base = (const uint8_t *)(uintptr_t)task->flat;
+    out_base = (uint8_t *)(uintptr_t)task->out;
+    out_begin = out_base + 5U;
+    out_cap_end = out_base + MAX_ENCODED_SIZE;
+
+    if (stats != NULL)
+        stats->specialized_attempts++;
+
+    payload_start = emit_dmesh_hello_request_specialized_reverse(flat_base,
+                                                                 out_cap_end,
+                                                                 out_begin);
+    if (payload_start == NULL) {
+        cpl->status = -2;
+        goto error;
+    }
+
+    if (stats != NULL)
+        stats->specialized_hits++;
 
     payload_len = (uint32_t)(out_cap_end - payload_start);
     if (payload_len > PROTO_MAX_LEN_DELIMITED || payload_len > MAX_ENCODED_SIZE - 5U) {

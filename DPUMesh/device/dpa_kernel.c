@@ -45,6 +45,7 @@ __dpa_rpc__ uint64_t thread_init_rpc(doca_dpa_dev_comch_consumer_t consumer,
  */
 static struct dpa_grpc_serialize_task grpc_tasks[DMESH_GRPC_MAX_PENDING];
 static struct comch_dma_comp_msg grpc_copy_dma_comp_imm[DMESH_GRPC_MAX_PENDING];
+static struct comch_grpc_serialize_comp_msg ser_comp_msg;
 
 #define DMESH_GRPC_STALL_LOG_POLL_INTERVAL 65536U
 
@@ -519,7 +520,6 @@ submit_grpc_dma_copy(void *opaque,
         return 0;
 
     thread_arg = ctx->thread_arg;
-
     msg = &grpc_copy_dma_comp_imm[ctx->done_idx];
     msg->type = COMCH_MSG_TYPE_DMA_COMPLETED;
     msg->pos = 0U;
@@ -551,7 +551,6 @@ submit_grpc_dma_copy(void *opaque,
                                          DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
 
     return wait_for_dpa_producer_completion(thread_arg);
-    // return 0;
 }
 
 static inline uint32_t 
@@ -1023,15 +1022,13 @@ poll_desc_ring_grpc(struct dpa_thread_arg *thread_arg)
 
         if (publish_consumer > DMA_COMPLETION_BATCH_SIZE) {
             struct dpa_grpc_serialize_task *done_task = &grpc_tasks[(consumer_seq - 1) % DMESH_GRPC_MAX_PENDING];
-            struct comch_grpc_serialize_comp_msg ser_comp_msg = 
-                (struct comch_grpc_serialize_comp_msg){
-                    .type = COMCH_MSG_TYPE_GRPC_SERIALIZE_COMPLETED,
-                    .request_id = done_task->request_id,
-                    .ring_seq = done_task->ring_seq,
-                    .encoded_len = done_task->len,
-                    .schema_id = done_task->schema_id,
-                    .completed = publish_consumer, // use status field to piggyback the number of completed descriptors
-                };
+
+            ser_comp_msg.type = COMCH_MSG_TYPE_GRPC_SERIALIZE_COMPLETED;
+            ser_comp_msg.request_id = done_task->request_id;
+            ser_comp_msg.ring_seq = done_task->ring_seq;
+            ser_comp_msg.encoded_len = done_task->len;
+            ser_comp_msg.schema_id = done_task->schema_id;
+            ser_comp_msg.completed = publish_consumer;
 
             doca_dpa_dev_comch_producer_post_send_imm_only(thread_arg->dpa_producer,
                                                    /*consumer_id=*/1,
@@ -1210,10 +1207,10 @@ complete_grpc_serialize_task(struct dpa_thread_arg *thread_arg,
 
     switch (mode) {
     case DMESH_GRPC_SERIALIZE_MODE_GRPC:
-        result = grpc_wire_serialize_one(&grpc_schema_blob, &proto_task, &proto_cpl, NULL);
+        result = grpc_wire_serialize_one_dmesh_flat(&grpc_schema_blob, &proto_task, &proto_cpl, NULL);
         break;
     case DMESH_GRPC_SERIALIZE_MODE_GRPC_REVERSE:
-        result = grpc_wire_serialize_one_reverse(&grpc_schema_blob, &proto_task, &proto_cpl, NULL);
+        result = grpc_wire_serialize_one_reverse_dmesh_flat(&grpc_schema_blob, &proto_task, &proto_cpl, NULL);
 #if DEBUG_LOG
         if (result > 0) {
             out_offset = result;

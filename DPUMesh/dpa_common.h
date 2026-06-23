@@ -17,6 +17,11 @@ typedef uint64_t doca_dpa_dev_completion_t;
 typedef uint64_t doca_dpa_dev_async_ops_t;
 typedef uint64_t doca_dpa_dev_notification_completion_t;
 
+#define DEBUG_INTERVAL (1024 * 128 + 7717)
+// #define DEBUG_INTERVAL 0xffffffff
+#define DEBUG_LOG 0
+#define DEBUG_VALIDATE 0
+
 #ifndef DMESH_GRPC_SERIALIZER_THREADS
 #define DMESH_GRPC_SERIALIZER_THREADS 4U
 #endif
@@ -24,12 +29,8 @@ typedef uint64_t doca_dpa_dev_notification_completion_t;
 #define DMESH_GRPC_PIPELINE_PROFILE 0
 #endif
 #ifndef DMESH_GRPC_PROFILE_LOG_INTERVAL
-#define DMESH_GRPC_PROFILE_LOG_INTERVAL 65536U
+#define DMESH_GRPC_PROFILE_LOG_INTERVAL DEBUG_INTERVAL
 #endif
-#define DEBUG_INTERVAL (1024 * 128 + 7717)
-// #define DEBUG_INTERVAL 0xffffffff
-#define DEBUG_LOG 0
-#define DEBUG_VALIDATE 0
 
 struct dpa_thread_arg {
 	uint64_t dpa_consumer_comp;
