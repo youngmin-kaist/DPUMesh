@@ -450,8 +450,8 @@ int grpc_wire_serialize_one_copy(const ProtoTask *task,
                                  GrpcWireCopySubmitFn copy_submit,
                                  void *copy_ctx)
 {
-    const uint8_t *flat_base;
-    uint8_t *out_base;
+    const uint8_t *flat;
+    uint8_t *out;
     uint32_t i;
     int result;
 
@@ -465,6 +465,14 @@ int grpc_wire_serialize_one_copy(const ProtoTask *task,
         return cpl->status;
     }
 
+    flat = (const uint8_t *)(uintptr_t)task->flat;
+    out = (uint8_t *)(uintptr_t)task->out;
+    if (flat == NULL || out == NULL) {
+        cpl->status = -1;
+        cpl->encoded_len = 0U;
+        return cpl->status;
+    }
+
     if (copy_submit != NULL) {
         result = copy_submit(copy_ctx, task->out, task->flat, flat_len);
         if (result < 0) {
@@ -472,23 +480,13 @@ int grpc_wire_serialize_one_copy(const ProtoTask *task,
             cpl->encoded_len = 0U;
             return cpl->status;
         }
-
-        cpl->encoded_len = flat_len;
-        cpl->status = 0;
-        return 0;
+    } else { // DPA가 직접 per-byte copy
+        for (i = 0; i < flat_len; ++i) {
+            out[i] = flat[i];
+        }
     }
 
-    flat_base = (const uint8_t *)(uintptr_t)task->flat;
-    out_base = (uint8_t *)(uintptr_t)task->out;
-    if (flat_base == NULL || out_base == NULL) {
-        cpl->status = -1;
-        cpl->encoded_len = 0U;
-        return cpl->status;
-    }
-
-    for (i = 0; i < flat_len; ++i)
-        out_base[i] = flat_base[i];
-
+    put_grpc_header((uint8_t *)(uintptr_t)task->out_base + 3, flat_len);
     cpl->encoded_len = flat_len;
     cpl->status = 0;
     return 0;

@@ -81,6 +81,7 @@ typedef struct {
     uint32_t schema_id;
     uint64_t flat;
     uint64_t out;
+    uint64_t out_base; // for simple copy modes
 } ProtoTask;
 
 typedef struct {

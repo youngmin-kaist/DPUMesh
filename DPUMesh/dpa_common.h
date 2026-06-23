@@ -29,6 +29,7 @@ typedef uint64_t doca_dpa_dev_notification_completion_t;
 #define DEBUG_INTERVAL (1024 * 128 + 7717)
 // #define DEBUG_INTERVAL 0xffffffff
 #define DEBUG_LOG 0
+#define DEBUG_VALIDATE 0
 
 struct dpa_thread_arg {
 	uint64_t dpa_consumer_comp;

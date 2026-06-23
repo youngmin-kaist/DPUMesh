@@ -13,6 +13,7 @@
 #include "ring.h"
 #include "grpc/grpc_offload.h"
 #include <arpa/inet.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -150,6 +151,343 @@ struct dmesh_doca_dpa_msgq_send_ctx {
     uint8_t msg_data[];
 };
 
+#define DMESH_GRPC_FRAME_HEADER_SIZE 5U
+
+static uint32_t
+dmesh_grpc_read_be32(const uint8_t *p)
+{
+    return ((uint32_t)p[0] << 24) |
+           ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) |
+           (uint32_t)p[3];
+}
+
+static doca_error_t
+dmesh_grpc_read_varint(const uint8_t **cursor, const uint8_t *end,
+                       uint64_t *value)
+{
+    const uint8_t *p;
+    uint64_t result = 0;
+
+    if (cursor == NULL || *cursor == NULL || value == NULL)
+        return DOCA_ERROR_INVALID_VALUE;
+
+    p = *cursor;
+    for (uint32_t i = 0; i < 10U; ++i) {
+        uint8_t byte;
+
+        if (p >= end)
+            return DOCA_ERROR_BAD_STATE;
+
+        byte = *p++;
+        if (i == 9U && (byte & 0xfeU) != 0U)
+            return DOCA_ERROR_BAD_STATE;
+
+        result |= ((uint64_t)(byte & 0x7fU)) << (i * 7U);
+        if ((byte & 0x80U) == 0U) {
+            *cursor = p;
+            *value = result;
+            return DOCA_SUCCESS;
+        }
+    }
+
+    return DOCA_ERROR_BAD_STATE;
+}
+
+static doca_error_t
+dmesh_grpc_validate_hello_payload(const uint8_t *payload, uint32_t payload_len,
+                                  uint64_t ring_seq)
+{
+    const uint8_t *cursor = payload;
+    const uint8_t *end = payload + payload_len;
+
+    while (cursor < end) {
+        uint64_t tag;
+        uint32_t field_no;
+        uint32_t wire_type;
+        uint64_t value;
+        doca_error_t result;
+
+        result = dmesh_grpc_read_varint(&cursor, end, &tag);
+        if (result != DOCA_SUCCESS || tag == 0U) {
+            DOCA_LOG_ERR("Invalid gRPC protobuf tag: ring_seq=%lu result=%s",
+                         ring_seq, doca_error_get_name(result));
+            return DOCA_ERROR_BAD_STATE;
+        }
+
+        field_no = (uint32_t)(tag >> 3U);
+        wire_type = (uint32_t)(tag & 0x7U);
+
+        switch (field_no) {
+        case 1U:
+            if (wire_type != WIRE_VARINT) {
+                DOCA_LOG_ERR("Invalid HelloRequest.id wire type: ring_seq=%lu wire=%u",
+                             ring_seq, wire_type);
+                return DOCA_ERROR_BAD_STATE;
+            }
+            result = dmesh_grpc_read_varint(&cursor, end, &value);
+            if (result != DOCA_SUCCESS) {
+                DOCA_LOG_ERR("Invalid HelloRequest.id varint: ring_seq=%lu result=%s",
+                             ring_seq, doca_error_get_name(result));
+                return result;
+            }
+            break;
+        case 2U:
+            if (wire_type != WIRE_LEN) {
+                DOCA_LOG_ERR("Invalid HelloRequest.name wire type: ring_seq=%lu wire=%u",
+                             ring_seq, wire_type);
+                return DOCA_ERROR_BAD_STATE;
+            }
+            result = dmesh_grpc_read_varint(&cursor, end, &value);
+            if (result != DOCA_SUCCESS || value > (uint64_t)(end - cursor)) {
+                DOCA_LOG_ERR("Invalid HelloRequest.name length: ring_seq=%lu len=%lu result=%s",
+                             ring_seq, value, doca_error_get_name(result));
+                return DOCA_ERROR_BAD_STATE;
+            }
+            cursor += (size_t)value;
+            break;
+        case 3U: {
+            const uint8_t *packed_end;
+
+            if (wire_type != WIRE_LEN) {
+                DOCA_LOG_ERR("Invalid HelloRequest.scores wire type: ring_seq=%lu wire=%u",
+                             ring_seq, wire_type);
+                return DOCA_ERROR_BAD_STATE;
+            }
+            result = dmesh_grpc_read_varint(&cursor, end, &value);
+            if (result != DOCA_SUCCESS || value > (uint64_t)(end - cursor)) {
+                DOCA_LOG_ERR("Invalid HelloRequest.scores length: ring_seq=%lu len=%lu result=%s",
+                             ring_seq, value, doca_error_get_name(result));
+                return DOCA_ERROR_BAD_STATE;
+            }
+
+            packed_end = cursor + (size_t)value;
+            while (cursor < packed_end) {
+                result = dmesh_grpc_read_varint(&cursor, packed_end, &value);
+                if (result != DOCA_SUCCESS) {
+                    DOCA_LOG_ERR("Invalid HelloRequest.scores varint: ring_seq=%lu result=%s",
+                                 ring_seq, doca_error_get_name(result));
+                    return result;
+                }
+            }
+            break;
+        }
+        default:
+            DOCA_LOG_ERR("Unexpected HelloRequest field: ring_seq=%lu field=%u wire=%u",
+                         ring_seq, field_no, wire_type);
+            return DOCA_ERROR_BAD_STATE;
+        }
+    }
+
+    if (cursor != end)
+        return DOCA_ERROR_BAD_STATE;
+
+    return DOCA_SUCCESS;
+}
+
+static doca_error_t
+dmesh_grpc_validate_payload(uint16_t schema_id, const uint8_t *payload,
+                            uint32_t payload_len, uint64_t ring_seq)
+{
+    switch (schema_id) {
+    case DMESH_GRPC_SCHEMA_HELLO_REQUEST:
+        return dmesh_grpc_validate_hello_payload(payload, payload_len, ring_seq);
+    default:
+        DOCA_LOG_ERR("Unsupported gRPC serialized schema: ring_seq=%lu schema=%u",
+                     ring_seq, schema_id);
+        return DOCA_ERROR_INVALID_VALUE;
+    }
+}
+
+static doca_error_t
+dmesh_grpc_validate_hello_flat_copy(const uint8_t *serialized,
+                                    uint32_t encoded_len,
+                                    uint64_t ring_seq)
+{
+    const struct dmesh_grpc_hello_flat *flat =
+        (const struct dmesh_grpc_hello_flat *)serialized;
+    uint64_t name_end;
+    uint64_t scores_bytes;
+    uint64_t scores_end;
+
+    if (encoded_len < sizeof(*flat)) {
+        DOCA_LOG_ERR("Invalid HelloRequest flat length: ring_seq=%lu len=%u min=%zu",
+                     ring_seq, encoded_len, sizeof(*flat));
+        return DOCA_ERROR_BAD_STATE;
+    }
+
+    name_end = (uint64_t)flat->name.offset + (uint64_t)flat->name.len;
+    if (flat->name.offset > encoded_len || name_end > encoded_len) {
+        DOCA_LOG_ERR("Invalid HelloRequest flat name ref: ring_seq=%lu offset=%u len=%u encoded_len=%u",
+                     ring_seq, flat->name.offset, flat->name.len, encoded_len);
+        return DOCA_ERROR_BAD_STATE;
+    }
+
+    scores_bytes = (uint64_t)flat->scores.count * sizeof(uint32_t);
+    scores_end = (uint64_t)flat->scores.offset + scores_bytes;
+    if (flat->scores.offset > encoded_len ||
+        scores_bytes > UINT32_MAX ||
+        scores_end > encoded_len) {
+        DOCA_LOG_ERR("Invalid HelloRequest flat scores ref: ring_seq=%lu offset=%u count=%u encoded_len=%u",
+                     ring_seq, flat->scores.offset, flat->scores.count, encoded_len);
+        return DOCA_ERROR_BAD_STATE;
+    }
+
+    return DOCA_SUCCESS;
+}
+
+static doca_error_t
+dmesh_grpc_validate_flat_copy(uint16_t schema_id, const uint8_t *serialized,
+                              uint32_t encoded_len, uint64_t ring_seq)
+{
+    switch (schema_id) {
+    case DMESH_GRPC_SCHEMA_HELLO_REQUEST:
+        return dmesh_grpc_validate_hello_flat_copy(serialized, encoded_len, ring_seq);
+    default:
+        DOCA_LOG_ERR("Unsupported gRPC flat-copy schema: ring_seq=%lu schema=%u",
+                     ring_seq, schema_id);
+        return DOCA_ERROR_INVALID_VALUE;
+    }
+}
+
+static doca_error_t
+dmesh_grpc_validate_serialized_slot(struct objects *objs, uint64_t ring_seq,
+                                    uint16_t schema_id,
+                                    uint32_t expected_encoded_len)
+{
+    size_t slot_idx;
+    size_t slot_offset;
+    size_t encoded_offset;
+    const uint8_t *serialized;
+    const uint8_t *frame;
+    uint32_t payload_len;
+    uint32_t encoded_len;
+    uint8_t flat_copy_layout = 0;
+
+    if (objs == NULL || objs->dma_buffer == NULL || ring_seq == 0U)
+        return DOCA_ERROR_INVALID_VALUE;
+
+    slot_idx = (size_t)((ring_seq - 1U) % DMESH_GRPC_MAX_PENDING);
+    if (slot_idx > SIZE_MAX / DMESH_GRPC_PRIVATE_SLOT_SIZE)
+        return DOCA_ERROR_INVALID_VALUE;
+
+    /*
+     * The DPA serializer writes each output at the beginning of the slot's
+     * encoded region. Reverse-mode serialization returns a non-zero output
+     * offset but the completion message does not carry it, so strict validation
+     * currently assumes the non-reverse serializer layout.
+     */
+    slot_offset = slot_idx * DMESH_GRPC_PRIVATE_SLOT_SIZE;
+    encoded_offset = slot_offset + DMA_ALIGN_UP(DMESH_GRPC_MAX_FLAT_SIZE);
+    if (encoded_offset > BUFFER_SIZE ||
+        DMESH_GRPC_MAX_ENCODED_SIZE > BUFFER_SIZE - encoded_offset) {
+        DOCA_LOG_ERR("gRPC serialized slot outside DPU buffer: ring_seq=%lu slot=%zu offset=%zu",
+                     ring_seq, slot_idx, encoded_offset);
+        return DOCA_ERROR_INVALID_VALUE;
+    }
+
+    serialized = (const uint8_t *)objs->dma_buffer + encoded_offset;
+    frame = serialized;
+    payload_len = dmesh_grpc_read_be32(frame + 1U);
+    encoded_len = payload_len + DMESH_GRPC_FRAME_HEADER_SIZE;
+
+    if ((serialized[0] != 0U ||
+         payload_len > DMESH_GRPC_MAX_ENCODED_SIZE - DMESH_GRPC_FRAME_HEADER_SIZE ||
+         (expected_encoded_len != 0U && expected_encoded_len != encoded_len)) &&
+        DMESH_GRPC_FRAME_HEADER_SIZE + 3U <= DMESH_GRPC_MAX_ENCODED_SIZE) {
+        frame = serialized + 3U;
+        payload_len = dmesh_grpc_read_be32(frame + 1U);
+        encoded_len = payload_len;
+        flat_copy_layout = 1;
+    }
+
+    if (frame[0] != 0U) {
+        DOCA_LOG_ERR("Invalid gRPC frame compression flag: ring_seq=%lu flag=%u",
+                     ring_seq, frame[0]);
+        return DOCA_ERROR_BAD_STATE;
+    }
+
+    if ((!flat_copy_layout &&
+         payload_len > DMESH_GRPC_MAX_ENCODED_SIZE - DMESH_GRPC_FRAME_HEADER_SIZE) ||
+        (flat_copy_layout && payload_len > DMESH_GRPC_MAX_ENCODED_SIZE)) {
+        DOCA_LOG_ERR("Invalid gRPC frame length: ring_seq=%lu payload_len=%u",
+                     ring_seq, payload_len);
+        return DOCA_ERROR_BAD_STATE;
+    }
+
+    if (expected_encoded_len != 0U && expected_encoded_len != encoded_len) {
+        DOCA_LOG_ERR("gRPC encoded_len mismatch: ring_seq=%lu expected=%u actual=%u layout=%s",
+                     ring_seq, expected_encoded_len, encoded_len,
+                     flat_copy_layout ? "flat-copy" : "wire");
+        return DOCA_ERROR_BAD_STATE;
+    }
+
+    if (flat_copy_layout) {
+        return dmesh_grpc_validate_flat_copy(schema_id, serialized,
+                                            encoded_len, ring_seq);
+    }
+
+    return dmesh_grpc_validate_payload(schema_id,
+                                       frame + DMESH_GRPC_FRAME_HEADER_SIZE,
+                                       payload_len,
+                                       ring_seq);
+}
+
+static doca_error_t
+dmesh_grpc_validate_serialized_completion(struct objects *objs,
+                                          const struct comch_grpc_serialize_comp_msg *comp_msg,
+                                          uint32_t imm_data_len)
+{
+    uint64_t first_seq;
+    doca_error_t result;
+
+    if (objs == NULL || comp_msg == NULL)
+        return DOCA_ERROR_INVALID_VALUE;
+
+    if (imm_data_len < sizeof(*comp_msg)) {
+        DOCA_LOG_ERR("Short gRPC serialize completion: len=%u expected=%zu",
+                     imm_data_len, sizeof(*comp_msg));
+        return DOCA_ERROR_INVALID_VALUE;
+    }
+
+    if (comp_msg->completed == 0U ||
+        comp_msg->ring_seq == 0U ||
+        (uint64_t)comp_msg->completed > comp_msg->ring_seq ||
+        comp_msg->completed > DMESH_GRPC_MAX_PENDING) {
+        DOCA_LOG_ERR("Invalid gRPC serialize completion metadata: req=%u seq=%lu completed=%u",
+                     comp_msg->request_id, comp_msg->ring_seq, comp_msg->completed);
+        return DOCA_ERROR_INVALID_VALUE;
+    }
+
+    if (comp_msg->encoded_len < DMESH_GRPC_FRAME_HEADER_SIZE ||
+        comp_msg->encoded_len > DMESH_GRPC_MAX_ENCODED_SIZE) {
+        DOCA_LOG_ERR("Invalid gRPC serialize completion encoded_len: req=%u seq=%lu len=%u",
+                     comp_msg->request_id, comp_msg->ring_seq, comp_msg->encoded_len);
+        return DOCA_ERROR_BAD_STATE;
+    }
+
+    /*
+     * Completion batches carry only the last descriptor's schema and encoded
+     * length. This debug validator samples DPU private slots after DPA reports
+     * completion; it assumes the slots have not been reused before this callback
+     * runs and that the current batch is homogeneous by schema. A mixed-schema
+     * or delayed-validation path needs per-descriptor completion metadata.
+     */
+    first_seq = comp_msg->ring_seq - (uint64_t)comp_msg->completed + 1U;
+    for (uint64_t seq = first_seq; seq <= comp_msg->ring_seq; ++seq) {
+        uint32_t expected_len = (seq == comp_msg->ring_seq) ?
+            comp_msg->encoded_len : 0U;
+
+        result = dmesh_grpc_validate_serialized_slot(objs, seq,
+                                                     comp_msg->schema_id,
+                                                     expected_len);
+        if (result != DOCA_SUCCESS)
+            return result;
+    }
+
+    return DOCA_SUCCESS;
+}
+
 /*
  * Callback invoked once a message is received from DPA successfully
  *
@@ -172,6 +510,11 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
     
     data_len = doca_comch_consumer_task_post_recv_get_imm_data_len(recv_task);
     msg = (struct comch_msg *)doca_comch_consumer_task_post_recv_get_imm_data(recv_task);
+    if (msg == NULL || data_len < sizeof(enum comch_msg_type)) {
+        DOCA_LOG_ERR("Received invalid DPA MsgQ immediate data: ptr=%p len=%u",
+                     (void *)msg, data_len);
+        goto resubmit_recv;
+    }
 
     switch (msg->type) {
         case COMCH_MSG_TYPE_DMA_COMPLETED: {
@@ -197,6 +540,14 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
         }
         case COMCH_MSG_TYPE_GRPC_SERIALIZE_COMPLETED: {
             struct comch_grpc_serialize_comp_msg *comp_msg = (struct comch_grpc_serialize_comp_msg *)msg;
+#if DEBUG_VALIDATE
+            result = dmesh_grpc_validate_serialized_completion(objs, comp_msg, data_len);
+            if (result != DOCA_SUCCESS) {
+                DOCA_LOG_ERR("Failed to validate gRPC serialized completion: result=%s",
+                            doca_error_get_name(result));
+                break;
+            }
+#endif
 #if DEBUG_LOG            
             if (comp_msg->ring_seq <= 8U || (comp_msg->ring_seq % DEBUG_INTERVAL) == 0U) {
                 DOCA_LOG_INFO("gRPC serialize complete:\nreq=%u completed=%u encoded_len=%u data_len=%u",
@@ -212,6 +563,7 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
             break;
     }
 
+resubmit_recv:
 	result = doca_task_submit(task);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("DPA MsgQ receive callback failed: Failed to resubmit receive task - %s",
