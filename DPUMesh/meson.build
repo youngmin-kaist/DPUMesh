@@ -16,7 +16,10 @@ grpc_common_c_args = [
   '-DDMESH_GRPC_PROFILE_LOG_INTERVAL=@0@U'.format(get_option('grpc_pipeline_profile_interval')),
 ]
 if get_option('grpc_pipeline_profile')
-  grpc_common_c_args += ['-DDMESH_GRPC_PIPELINE_PROFILE=1']
+  grpc_common_c_args += [
+    '-DDMESH_GRPC_PIPELINE_PROFILE=1',
+    '-DDMESH_GRPC_HOST_RING_PROFILE=1',
+  ]
 endif
 add_project_arguments(grpc_common_c_args, language: ['c', 'cpp'])
 

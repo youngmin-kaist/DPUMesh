@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <doca_log.h>
 #include <doca_mmap.h>
@@ -38,6 +39,143 @@ align_up_uintptr(uintptr_t value, size_t align)
 	if (value > UINTPTR_MAX - (uintptr_t)(align - 1U))
 		return UINTPTR_MAX;
 	return (value + (uintptr_t)(align - 1U)) & ~((uintptr_t)align - 1U);
+}
+
+#if DMESH_GRPC_HOST_RING_PROFILE
+struct dmesh_grpc_host_ring_profile {
+	uint64_t submitted;
+	uint64_t last_submitted;
+	uint64_t last_report_us;
+	uint64_t last_observed_consumer_seq;
+	uint64_t wait_free_events;
+	uint64_t last_wait_free_events;
+	uint64_t wait_free_iters;
+	uint64_t last_wait_free_iters;
+	uint64_t wait_consumer_progress;
+	uint64_t last_wait_consumer_progress;
+	uint64_t lag_max;
+};
+
+static struct dmesh_grpc_host_ring_profile host_ring_profile;
+
+static uint64_t
+dmesh_grpc_host_profile_now_us(void)
+{
+	struct timespec ts;
+
+	(void)clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ((uint64_t)ts.tv_sec * UINT64_C(1000000)) +
+	       ((uint64_t)ts.tv_nsec / UINT64_C(1000));
+}
+
+static uint64_t
+dmesh_grpc_host_profile_per_sec(uint64_t count, uint64_t window_us)
+{
+	if (window_us == 0)
+		return 0;
+
+	return (count * UINT64_C(1000000)) / window_us;
+}
+
+static void
+dmesh_grpc_host_profile_note_submit(const struct dma_ring *ring,
+				    uint64_t wait_iters,
+				    uint64_t wait_consumer_progress)
+{
+	struct dmesh_grpc_host_ring_profile *profile = &host_ring_profile;
+	uint64_t submitted_delta;
+	uint64_t wait_events_delta;
+	uint64_t wait_iters_delta;
+	uint64_t wait_progress_delta;
+	uint64_t observed_delta;
+	uint64_t now_us;
+	uint64_t window_us;
+	uint64_t lag;
+
+	if (ring == NULL)
+		return;
+
+	/*
+	 * Debug-only counters assume the existing single host submitter that
+	 * owns ring->producer_seq. If descriptor submission becomes MPSC, make
+	 * this per-thread or atomic; do not use these counters for ordering.
+	 */
+	profile->submitted++;
+	profile->wait_free_iters += wait_iters;
+	if (wait_iters != 0)
+		profile->wait_free_events++;
+	profile->wait_consumer_progress += wait_consumer_progress;
+
+	if (ring->producer_seq >= ring->observed_consumer_seq)
+		lag = ring->producer_seq - ring->observed_consumer_seq;
+	else
+		lag = 0;
+	if (lag > profile->lag_max)
+		profile->lag_max = lag;
+
+	now_us = dmesh_grpc_host_profile_now_us();
+	if (profile->last_report_us == 0) {
+		profile->last_report_us = now_us;
+		profile->last_observed_consumer_seq = ring->observed_consumer_seq;
+		return;
+	}
+
+	submitted_delta = profile->submitted - profile->last_submitted;
+	if (submitted_delta < DMESH_GRPC_PROFILE_LOG_INTERVAL)
+		return;
+
+	window_us = now_us - profile->last_report_us;
+	wait_events_delta = profile->wait_free_events - profile->last_wait_free_events;
+	wait_iters_delta = profile->wait_free_iters - profile->last_wait_free_iters;
+	wait_progress_delta =
+		profile->wait_consumer_progress - profile->last_wait_consumer_progress;
+	observed_delta = ring->observed_consumer_seq -
+			 profile->last_observed_consumer_seq;
+
+	DOCA_LOG_INFO("host gRPC ring profile: submitted_delta=%lu submitted_per_sec=%lu "
+		      "submitted_total=%lu producer_seq=%lu observed_consumer_seq=%lu "
+		      "observed_consumer_delta=%lu ring_lag=%lu ring_lag_max=%lu "
+		      "wait_free_events_delta=%lu wait_free_iters_delta=%lu "
+		      "wait_consumer_progress_delta=%lu",
+		      (unsigned long)submitted_delta,
+		      (unsigned long)dmesh_grpc_host_profile_per_sec(submitted_delta,
+								     window_us),
+		      (unsigned long)profile->submitted,
+		      (unsigned long)ring->producer_seq,
+		      (unsigned long)ring->observed_consumer_seq,
+		      (unsigned long)observed_delta,
+		      (unsigned long)lag,
+		      (unsigned long)profile->lag_max,
+		      (unsigned long)wait_events_delta,
+		      (unsigned long)wait_iters_delta,
+		      (unsigned long)wait_progress_delta);
+
+	profile->last_submitted = profile->submitted;
+	profile->last_report_us = now_us;
+	profile->last_observed_consumer_seq = ring->observed_consumer_seq;
+	profile->last_wait_free_events = profile->wait_free_events;
+	profile->last_wait_free_iters = profile->wait_free_iters;
+	profile->last_wait_consumer_progress = profile->wait_consumer_progress;
+	profile->lag_max = lag;
+}
+#endif
+
+static void
+dmesh_grpc_hello_flat_set_header(struct dmesh_grpc_hello_flat *flat,
+				 uint32_t payload_len)
+{
+	uint8_t *header;
+
+	if (flat == NULL)
+		return;
+
+	memset(flat->reserved, 0, sizeof(flat->reserved));
+	header = &flat->compressed;
+	header[0] = 0;
+	header[1] = (uint8_t)((payload_len >> 24) & 0xffU);
+	header[2] = (uint8_t)((payload_len >> 16) & 0xffU);
+	header[3] = (uint8_t)((payload_len >> 8) & 0xffU);
+	header[4] = (uint8_t)(payload_len & 0xffU);
 }
 
 static void
@@ -559,6 +697,7 @@ __dmesh_grpc_hello_flat_alloc(struct dmesh_grpc_arena *arena,
 		return DOCA_ERROR_NO_MEMORY;
 	}
 
+	dmesh_grpc_hello_flat_set_header(flat, (uint32_t)flat_len);
 	flat->id = id;
 	flat->name.offset = name_off;
 	flat->name.len = name_len;
@@ -649,8 +788,20 @@ dmesh_grpc_submit_request(struct objects *objs,
 	}
 
 	ring = objs->dma_ring;
+#if DMESH_GRPC_HOST_RING_PROFILE
+	uint64_t profile_wait_iters = 0;
+	uint64_t profile_wait_progress = 0;
+#endif
 	while (!dma_ring_has_free_slot(ring)) {
+#if DMESH_GRPC_HOST_RING_PROFILE
+		uint64_t before_seq = ring->observed_consumer_seq;
+#endif
 		dma_ring_refresh_consumer(ring);
+#if DMESH_GRPC_HOST_RING_PROFILE
+		profile_wait_iters++;
+		if (ring->observed_consumer_seq > before_seq)
+			profile_wait_progress += ring->observed_consumer_seq - before_seq;
+#endif
 	}
 
 	result = doca_mmap_dev_get_dpa_handle(objs->local_mmap, objs->dev, &local_mmap);
@@ -683,6 +834,9 @@ dmesh_grpc_submit_request(struct objects *objs,
 	 */
 	desc->seq = next_producer_seq;
 	ring->producer_seq = next_producer_seq;
+#if DMESH_GRPC_HOST_RING_PROFILE
+	dmesh_grpc_host_profile_note_submit(ring, profile_wait_iters, profile_wait_progress);
+#endif
 	return DOCA_SUCCESS;
 }
 

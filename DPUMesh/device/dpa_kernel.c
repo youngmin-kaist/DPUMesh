@@ -231,6 +231,125 @@ grpc_profile_note_retire_stall(struct dpa_grpc_pipeline_state *state,
         grpc_profile_add_u64(&state->profile.retire_stall_events, 1U);
 }
 
+static inline void
+grpc_profile_note_main_prepared(struct dpa_grpc_pipeline_state *state,
+                                uint32_t prepared)
+{
+    if (state == 0 || prepared == 0U)
+        return;
+
+    grpc_profile_add_u64(&state->profile.main_prepared, prepared);
+}
+
+static inline void
+grpc_profile_note_main_ring_empty(struct dpa_grpc_pipeline_state *state)
+{
+    if (state == 0)
+        return;
+
+    grpc_profile_add_u64(&state->profile.main_ring_empty_polls, 1U);
+}
+
+static inline void
+grpc_profile_note_main_window_full(struct dpa_grpc_pipeline_state *state)
+{
+    if (state == 0)
+        return;
+
+    grpc_profile_add_u64(&state->profile.main_window_full_polls, 1U);
+}
+
+static inline void
+grpc_profile_note_main_slot_busy(struct dpa_grpc_pipeline_state *state)
+{
+    if (state == 0)
+        return;
+
+    grpc_profile_add_u64(&state->profile.main_slot_busy_polls, 1U);
+}
+
+static inline void
+grpc_profile_note_main_enqueue_failure(struct dpa_grpc_pipeline_state *state)
+{
+    if (state == 0)
+        return;
+
+    grpc_profile_add_u64(&state->profile.main_dispatch_enqueue_failures, 1U);
+}
+
+static inline void
+grpc_profile_note_main_consumer_publish(struct dpa_grpc_pipeline_state *state,
+                                        uint32_t completed)
+{
+    if (state == 0 || completed == 0U)
+        return;
+
+    grpc_profile_add_u64(&state->profile.main_consumer_published, completed);
+}
+
+static inline void
+grpc_profile_note_main_completion_send(struct dpa_grpc_pipeline_state *state,
+                                       uint32_t completed,
+                                       uint8_t consumer_empty)
+{
+    uint32_t max_batch;
+
+    if (state == 0 || completed == 0U)
+        return;
+
+    grpc_profile_add_u64(&state->profile.main_completion_sends, 1U);
+    grpc_profile_add_u64(&state->profile.main_completion_completed, completed);
+    if (consumer_empty)
+        grpc_profile_add_u64(&state->profile.main_completion_consumer_empty, 1U);
+
+    max_batch = __atomic_load_n(&state->profile.main_completion_max_batch,
+                                __ATOMIC_RELAXED);
+    if (completed > max_batch) {
+        __atomic_store_n(&state->profile.main_completion_max_batch,
+                         completed,
+                         __ATOMIC_RELAXED);
+    }
+}
+
+static inline void
+grpc_profile_note_main_producer_comps_drained(struct dpa_grpc_pipeline_state *state,
+                                             uint32_t drained)
+{
+    if (state == 0 || drained == 0U)
+        return;
+
+    grpc_profile_add_u64(&state->profile.main_producer_comps_drained, drained);
+}
+
+static inline void
+grpc_profile_note_main_position(struct dpa_grpc_pipeline_state *state,
+                                uint64_t next_desc_seq,
+                                uint64_t consumer_seq)
+{
+    uint64_t outstanding;
+    uint32_t outstanding32;
+    uint32_t max_outstanding;
+
+    if (state == 0)
+        return;
+
+    grpc_profile_store_u64(&state->profile.main_next_desc_seq, next_desc_seq);
+    grpc_profile_store_u64(&state->profile.main_consumer_seq, consumer_seq);
+
+    if (next_desc_seq <= consumer_seq + 1U)
+        outstanding = 0;
+    else
+        outstanding = (next_desc_seq - 1U) - consumer_seq;
+    outstanding32 = outstanding > UINT32_MAX ? UINT32_MAX : (uint32_t)outstanding;
+    max_outstanding = __atomic_load_n(&state->profile.main_outstanding_max,
+                                      __ATOMIC_RELAXED);
+    if (outstanding32 > max_outstanding) {
+        __atomic_store_n(&state->profile.main_outstanding_max,
+                         outstanding32,
+                         __ATOMIC_RELAXED);
+    }
+}
+
 static void
 grpc_profile_report_dispatcher(struct dpa_thread_arg *thread_arg,
                                uint32_t dispatched)
@@ -247,6 +366,32 @@ grpc_profile_report_dispatcher(struct dpa_thread_arg *thread_arg,
     uint64_t retire_stall_events;
     uint64_t retire_stall_polls_delta;
     uint64_t retire_stall_events_delta;
+    uint64_t main_prepared;
+    uint64_t main_prepared_delta;
+    uint64_t main_ring_empty_polls;
+    uint64_t main_ring_empty_polls_delta;
+    uint64_t main_window_full_polls;
+    uint64_t main_window_full_polls_delta;
+    uint64_t main_slot_busy_polls;
+    uint64_t main_slot_busy_polls_delta;
+    uint64_t main_enqueue_failures;
+    uint64_t main_enqueue_failures_delta;
+    uint64_t main_consumer_published;
+    uint64_t main_consumer_published_delta;
+    uint64_t main_completion_sends;
+    uint64_t main_completion_sends_delta;
+    uint64_t main_completion_completed;
+    uint64_t main_completion_completed_delta;
+    uint64_t main_completion_empty;
+    uint64_t main_completion_empty_delta;
+    uint64_t main_producer_comps_drained;
+    uint64_t main_producer_comps_drained_delta;
+    uint64_t main_next_desc_seq;
+    uint64_t main_consumer_seq;
+    uint64_t main_outstanding;
+    uint64_t main_completion_avg_batch;
+    uint32_t main_completion_max_batch;
+    uint32_t main_outstanding_max;
     uint32_t dispatch_prod;
     uint32_t dispatch_cons;
     uint32_t dispatch_occupancy;
@@ -280,6 +425,55 @@ grpc_profile_report_dispatcher(struct dpa_thread_arg *thread_arg,
     retire_stall_events_delta =
         retire_stall_events - grpc_profile_load_u64(&profile->retire_last_stall_events);
 
+    main_prepared = grpc_profile_load_u64(&profile->main_prepared);
+    main_prepared_delta =
+        main_prepared - grpc_profile_load_u64(&profile->main_last_prepared);
+    main_ring_empty_polls = grpc_profile_load_u64(&profile->main_ring_empty_polls);
+    main_ring_empty_polls_delta =
+        main_ring_empty_polls - grpc_profile_load_u64(&profile->main_last_ring_empty_polls);
+    main_window_full_polls = grpc_profile_load_u64(&profile->main_window_full_polls);
+    main_window_full_polls_delta =
+        main_window_full_polls - grpc_profile_load_u64(&profile->main_last_window_full_polls);
+    main_slot_busy_polls = grpc_profile_load_u64(&profile->main_slot_busy_polls);
+    main_slot_busy_polls_delta =
+        main_slot_busy_polls - grpc_profile_load_u64(&profile->main_last_slot_busy_polls);
+    main_enqueue_failures = grpc_profile_load_u64(&profile->main_dispatch_enqueue_failures);
+    main_enqueue_failures_delta =
+        main_enqueue_failures -
+        grpc_profile_load_u64(&profile->main_last_dispatch_enqueue_failures);
+    main_consumer_published = grpc_profile_load_u64(&profile->main_consumer_published);
+    main_consumer_published_delta =
+        main_consumer_published -
+        grpc_profile_load_u64(&profile->main_last_consumer_published);
+    main_completion_sends = grpc_profile_load_u64(&profile->main_completion_sends);
+    main_completion_sends_delta =
+        main_completion_sends - grpc_profile_load_u64(&profile->main_last_completion_sends);
+    main_completion_completed = grpc_profile_load_u64(&profile->main_completion_completed);
+    main_completion_completed_delta =
+        main_completion_completed -
+        grpc_profile_load_u64(&profile->main_last_completion_completed);
+    main_completion_empty = grpc_profile_load_u64(&profile->main_completion_consumer_empty);
+    main_completion_empty_delta =
+        main_completion_empty -
+        grpc_profile_load_u64(&profile->main_last_completion_consumer_empty);
+    main_producer_comps_drained =
+        grpc_profile_load_u64(&profile->main_producer_comps_drained);
+    main_producer_comps_drained_delta =
+        main_producer_comps_drained -
+        grpc_profile_load_u64(&profile->main_last_producer_comps_drained);
+    main_next_desc_seq = grpc_profile_load_u64(&profile->main_next_desc_seq);
+    main_consumer_seq = grpc_profile_load_u64(&profile->main_consumer_seq);
+    if (main_next_desc_seq <= main_consumer_seq + 1U)
+        main_outstanding = 0;
+    else
+        main_outstanding = (main_next_desc_seq - 1U) - main_consumer_seq;
+    main_completion_avg_batch = main_completion_sends_delta == 0U ? 0U :
+        main_completion_completed_delta / main_completion_sends_delta;
+    main_completion_max_batch =
+        __atomic_load_n(&profile->main_completion_max_batch, __ATOMIC_RELAXED);
+    main_outstanding_max =
+        __atomic_load_n(&profile->main_outstanding_max, __ATOMIC_RELAXED);
+
     dispatch_prod = __atomic_load_n(&state->dispatch_prod, __ATOMIC_ACQUIRE);
     dispatch_cons = __atomic_load_n(&state->dispatch_cons, __ATOMIC_ACQUIRE);
     dispatch_occupancy = dispatch_prod - dispatch_cons;
@@ -299,6 +493,36 @@ grpc_profile_report_dispatcher(struct dpa_thread_arg *thread_arg,
                           (unsigned long)retire_stall_events_delta,
                           (unsigned long)retire_stall_polls,
                           (unsigned long)retire_stall_events);
+
+    DOCA_DPA_DEV_LOG_INFO("gRPC profile main: prepared_delta=%lu prepared_per_sec=%lu "
+                          "prepared_total=%lu ring_empty_polls_delta=%lu "
+                          "window_full_polls_delta=%lu slot_busy_polls_delta=%lu "
+                          "enqueue_failures_delta=%lu consumer_published_delta=%lu "
+                          "consumer_publish_per_sec=%lu completion_sends_delta=%lu "
+                          "completion_completed_delta=%lu completion_avg_batch=%lu "
+                          "completion_max_batch=%u completion_consumer_empty_delta=%lu "
+                          "producer_comps_drained_delta=%lu outstanding=%lu "
+                          "outstanding_max=%u next_desc_seq=%lu consumer_seq=%lu\n",
+                          (unsigned long)main_prepared_delta,
+                          (unsigned long)grpc_profile_per_sec(main_prepared_delta, window_us),
+                          (unsigned long)main_prepared,
+                          (unsigned long)main_ring_empty_polls_delta,
+                          (unsigned long)main_window_full_polls_delta,
+                          (unsigned long)main_slot_busy_polls_delta,
+                          (unsigned long)main_enqueue_failures_delta,
+                          (unsigned long)main_consumer_published_delta,
+                          (unsigned long)grpc_profile_per_sec(main_consumer_published_delta,
+                                                              window_us),
+                          (unsigned long)main_completion_sends_delta,
+                          (unsigned long)main_completion_completed_delta,
+                          (unsigned long)main_completion_avg_batch,
+                          main_completion_max_batch,
+                          (unsigned long)main_completion_empty_delta,
+                          (unsigned long)main_producer_comps_drained_delta,
+                          (unsigned long)main_outstanding,
+                          main_outstanding_max,
+                          (unsigned long)main_next_desc_seq,
+                          (unsigned long)main_consumer_seq);
 
     for (i = 0; i < DMESH_GRPC_SERIALIZER_THREADS; ++i) {
         uint64_t completed = grpc_profile_load_u64(&profile->serializer_completed[i]);
@@ -348,6 +572,24 @@ grpc_profile_report_dispatcher(struct dpa_thread_arg *thread_arg,
     grpc_profile_store_u64(&profile->dispatcher_last_report_us, now_us);
     grpc_profile_store_u64(&profile->retire_last_stall_polls, retire_stall_polls);
     grpc_profile_store_u64(&profile->retire_last_stall_events, retire_stall_events);
+    grpc_profile_store_u64(&profile->main_last_prepared, main_prepared);
+    grpc_profile_store_u64(&profile->main_last_ring_empty_polls, main_ring_empty_polls);
+    grpc_profile_store_u64(&profile->main_last_window_full_polls, main_window_full_polls);
+    grpc_profile_store_u64(&profile->main_last_slot_busy_polls, main_slot_busy_polls);
+    grpc_profile_store_u64(&profile->main_last_dispatch_enqueue_failures,
+                           main_enqueue_failures);
+    grpc_profile_store_u64(&profile->main_last_consumer_published, main_consumer_published);
+    grpc_profile_store_u64(&profile->main_last_completion_sends, main_completion_sends);
+    grpc_profile_store_u64(&profile->main_last_completion_completed,
+                           main_completion_completed);
+    grpc_profile_store_u64(&profile->main_last_completion_consumer_empty,
+                           main_completion_empty);
+    grpc_profile_store_u64(&profile->main_last_producer_comps_drained,
+                           main_producer_comps_drained);
+    __atomic_store_n(&profile->main_completion_max_batch, 0U, __ATOMIC_RELAXED);
+    __atomic_store_n(&profile->main_outstanding_max,
+                     main_outstanding > UINT32_MAX ? UINT32_MAX : (uint32_t)main_outstanding,
+                     __ATOMIC_RELAXED);
 }
 #endif
 
@@ -363,6 +605,10 @@ drain_dpa_producer_completions(struct dpa_thread_arg *thread_arg)
 
     if (drained != 0) {
         doca_dpa_dev_completion_ack(thread_arg->dpa_producer_comp, drained);
+#if DMESH_GRPC_PIPELINE_PROFILE
+        grpc_profile_note_main_producer_comps_drained(grpc_pipeline_state(thread_arg),
+                                                      drained);
+#endif
     }
 
     return drained;
@@ -932,6 +1178,9 @@ poll_desc_ring_grpc(struct dpa_thread_arg *thread_arg)
         uint32_t prepared = 0;
         struct dpa_grpc_serialize_task *task;
         enum pipeline_task_state task_state;
+#if DMESH_GRPC_PIPELINE_PROFILE
+        uint8_t profile_idle_reason = 0;
+#endif
 
 #if DEBUG_LOG
         uint8_t retire_blocked = 0;
@@ -1022,6 +1271,11 @@ poll_desc_ring_grpc(struct dpa_thread_arg *thread_arg)
 
         if (publish_consumer > DMA_COMPLETION_BATCH_SIZE) {
             struct dpa_grpc_serialize_task *done_task = &grpc_tasks[(consumer_seq - 1) % DMESH_GRPC_MAX_PENDING];
+#if DMESH_GRPC_PIPELINE_PROFILE
+            uint8_t consumer_empty =
+                doca_dpa_dev_comch_producer_is_consumer_empty(thread_arg->dpa_producer,
+                                                              /*consumer_id=*/1) != 0;
+#endif
 
             ser_comp_msg.type = COMCH_MSG_TYPE_GRPC_SERIALIZE_COMPLETED;
             ser_comp_msg.request_id = done_task->request_id;
@@ -1042,17 +1296,30 @@ poll_desc_ring_grpc(struct dpa_thread_arg *thread_arg)
             // doca_dpa_dev_completion_ack(thread_arg->dpa_producer_comp, 1);
 
             publish_consumer_seq(thread_arg, consumer_seq);
+#if DMESH_GRPC_PIPELINE_PROFILE
+            grpc_profile_note_main_completion_send(state, publish_consumer, consumer_empty);
+            grpc_profile_note_main_consumer_publish(state, publish_consumer);
+#endif
             publish_consumer = 0;
         }
 
+#if DMESH_GRPC_PIPELINE_PROFILE
+        if (next_desc_seq - consumer_seq > ring_size)
+            profile_idle_reason = 3U;
+#endif
         while (next_desc_seq - consumer_seq <= ring_size &&
                prepared < DMA_COMPLETION_BATCH_SIZE) {
             uint32_t desc_idx = (uint32_t)((next_desc_seq - 1U) % ring_size);
             int enqueue_result;
 
             if (__atomic_load_n(&state->pipeline_task_state[desc_idx], __ATOMIC_ACQUIRE) 
-                != TASK_STATE_IDLE)
+                != TASK_STATE_IDLE) {
+#if DMESH_GRPC_PIPELINE_PROFILE
+                if (prepared == 0U)
+                    profile_idle_reason = 2U;
+#endif
                 break;
+            }
 
             desc = (struct grpc_req_desc *)get_dev_ptr(thread_arg->dpa_buf_arr, desc_idx);
             if (desc->seq != next_desc_seq) {
@@ -1060,6 +1327,10 @@ poll_desc_ring_grpc(struct dpa_thread_arg *thread_arg)
                 * Host descriptor publish is pure shared-memory polling; no
                 * completion wakes this path when the ring is empty.
                 */
+#if DMESH_GRPC_PIPELINE_PROFILE
+               if (prepared == 0U)
+                   profile_idle_reason = 1U;
+#endif
                break;
             }
 
@@ -1106,11 +1377,27 @@ poll_desc_ring_grpc(struct dpa_thread_arg *thread_arg)
             if (enqueue_result < 0) {
                 DOCA_DPA_DEV_LOG_INFO("Failed to prepare gRPC descriptor: seq=%lu\n", next_desc_seq);
                 __atomic_store_n(&state->pipeline_task_state[desc_idx], TASK_STATE_COMPLETED, __ATOMIC_RELEASE);
+#if DMESH_GRPC_PIPELINE_PROFILE
+                grpc_profile_note_main_enqueue_failure(state);
+#endif
             }
 
             next_desc_seq++;
             prepared++;
         }
+
+#if DMESH_GRPC_PIPELINE_PROFILE
+        if (prepared != 0U) {
+            grpc_profile_note_main_prepared(state, prepared);
+        } else if (profile_idle_reason == 1U) {
+            grpc_profile_note_main_ring_empty(state);
+        } else if (profile_idle_reason == 2U) {
+            grpc_profile_note_main_slot_busy(state);
+        } else if (profile_idle_reason == 3U) {
+            grpc_profile_note_main_window_full(state);
+        }
+        grpc_profile_note_main_position(state, next_desc_seq, consumer_seq);
+#endif
 
         if (prepared == 0) {
             __dpa_thread_window_read_inv();

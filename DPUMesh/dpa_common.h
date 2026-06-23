@@ -17,7 +17,7 @@ typedef uint64_t doca_dpa_dev_completion_t;
 typedef uint64_t doca_dpa_dev_async_ops_t;
 typedef uint64_t doca_dpa_dev_notification_completion_t;
 
-#define DEBUG_INTERVAL (1024 * 128 + 7717)
+#define DEBUG_INTERVAL (1024 * 512 + 7717)
 // #define DEBUG_INTERVAL 0xffffffff
 #define DEBUG_LOG 0
 #define DEBUG_VALIDATE 0
@@ -27,6 +27,9 @@ typedef uint64_t doca_dpa_dev_notification_completion_t;
 #endif
 #ifndef DMESH_GRPC_PIPELINE_PROFILE
 #define DMESH_GRPC_PIPELINE_PROFILE 0
+#endif
+#ifndef DMESH_GRPC_HOST_RING_PROFILE
+#define DMESH_GRPC_HOST_RING_PROFILE 0
 #endif
 #ifndef DMESH_GRPC_PROFILE_LOG_INTERVAL
 #define DMESH_GRPC_PROFILE_LOG_INTERVAL DEBUG_INTERVAL
@@ -205,6 +208,31 @@ struct dpa_grpc_pipeline_profile {
 	uint64_t retire_stall_events;
 	uint64_t retire_last_stall_polls;
 	uint64_t retire_last_stall_events;
+
+	uint64_t main_prepared;
+	uint64_t main_last_prepared;
+	uint64_t main_ring_empty_polls;
+	uint64_t main_last_ring_empty_polls;
+	uint64_t main_window_full_polls;
+	uint64_t main_last_window_full_polls;
+	uint64_t main_slot_busy_polls;
+	uint64_t main_last_slot_busy_polls;
+	uint64_t main_dispatch_enqueue_failures;
+	uint64_t main_last_dispatch_enqueue_failures;
+	uint64_t main_consumer_published;
+	uint64_t main_last_consumer_published;
+	uint64_t main_completion_sends;
+	uint64_t main_last_completion_sends;
+	uint64_t main_completion_completed;
+	uint64_t main_last_completion_completed;
+	uint64_t main_completion_consumer_empty;
+	uint64_t main_last_completion_consumer_empty;
+	uint64_t main_producer_comps_drained;
+	uint64_t main_last_producer_comps_drained;
+	uint64_t main_next_desc_seq;
+	uint64_t main_consumer_seq;
+	uint32_t main_completion_max_batch;
+	uint32_t main_outstanding_max;
 
 	uint64_t serializer_completed[DMESH_GRPC_SERIALIZER_THREADS];
 	uint64_t serializer_idle_polls[DMESH_GRPC_SERIALIZER_THREADS];

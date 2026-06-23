@@ -547,7 +547,6 @@ int grpc_wire_serialize_one_copy(const ProtoTask *task,
         }
     }
 
-    // put_grpc_header((uint8_t *)(uintptr_t)task->out_base + 3, flat_len);
     cpl->encoded_len = flat_len;
     cpl->status = 0;
     return 0;

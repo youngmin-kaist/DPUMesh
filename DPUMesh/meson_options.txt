@@ -15,5 +15,5 @@ option('grpc_pipeline_profile',
 option('grpc_pipeline_profile_interval',
        type : 'integer',
        min : 1,
-       value : 65536,
+       value : 600000,
        description : 'DPA gRPC pipeline profiling report interval in dispatched tasks')
