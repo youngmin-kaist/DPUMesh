@@ -1461,7 +1461,6 @@ complete_grpc_serialize_task(struct dpa_thread_arg *thread_arg,
     proto_task.schema_id = task->schema_id;
     proto_task.flat = flat;
     proto_task.out = out;
-    proto_task.out_base = out;
     copy_ctx.thread_arg = thread_arg;
     copy_ctx.done_idx = done_idx;
 
@@ -1481,14 +1480,12 @@ complete_grpc_serialize_task(struct dpa_thread_arg *thread_arg,
         } else {
             proto_task.flat = task->src_addr;
             proto_task.out = out_addr;
-            proto_task.out_base = out;
             copy_ctx.from_host = 1;
         }
 
     } else if (mode > DMESH_GRPC_SERIALIZE_MODE_GRPC_REVERSE) {
         proto_task.flat = flat_addr;
         proto_task.out = out_addr;
-        proto_task.out_base = out;
         copy_ctx.from_host = 0;
     }
 
