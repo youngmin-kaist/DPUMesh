@@ -1,0 +1,3 @@
+[submodule "linkerd2-proxy"]
+	path = linkerd2-proxy
+	url = git@github.com:youngmin-kaist/linkerd2-proxy
