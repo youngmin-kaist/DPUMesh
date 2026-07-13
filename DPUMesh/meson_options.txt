@@ -5,7 +5,7 @@ option('host_worker_bench',
 option('grpc_serializer_threads',
        type : 'integer',
        min : 1,
-       max : 64,
+       max : 128,
        value : 4,
        description : 'Number of DPA gRPC serializer worker threads')
 option('grpc_pipeline_profile',
