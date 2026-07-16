@@ -14,10 +14,12 @@
 #include <doca_comch.h>
 
 #include <time.h>
+#include <errno.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/epoll.h>
 
 DOCA_LOG_REGISTER(DPU_WORKER);
-
-#define BUFFER_SIZE 1024 * 1024
 
 void
 run_dpu_worker(struct objects *objs)
@@ -100,13 +102,6 @@ run_dpu_worker(struct objects *objs)
         goto argp_cleanup;
     }
 
-    // /* export mmap to DPU */
-    // result = export_mmap_to_remote(objs, objs->local_mmap, objs->dma_buffer, 1024 * 1024, DPU_TO_HOST);
-    // if (result != DOCA_SUCCESS) {
-    //     DOCA_LOG_ERR("Failed to export mmap and buffer to DPU: %s", doca_error_get_descr(result));
-    //     goto argp_cleanup;
-    // }
-
     result = send_dma_request_to_dpa(objs);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to send DMA request to DPA: %s", doca_error_get_descr(result));
@@ -151,4 +146,143 @@ run_dpu_worker(struct objects *objs)
 
 argp_cleanup:
     clean_argp();
+}
+
+/*
+ * Steady-state data path: busy-poll the consumer PE and report throughput once
+ * per second. Extracted so the event-driven worker can reuse it. Does not return.
+ */
+void
+dmesh_doca_run_datapath(struct objects *objs)
+{
+    struct timespec last, now;
+    double elapsed;
+
+    clock_gettime(CLOCK_MONOTONIC, &last);
+    while (true) {
+        doca_pe_progress(objs->consumer_pe);
+
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        elapsed = (now.tv_sec - last.tv_sec) +
+                  (now.tv_nsec - last.tv_nsec) / 1e9;
+        if (elapsed >= 1.0) {
+            if (objs->sent_msg_cnt > 0 || objs->recv_msg_cnt > 0)
+                DOCA_LOG_INFO("elapsed: %.2f, sent: %d/s, recv: %d/s",
+                              elapsed, objs->sent_msg_cnt, objs->recv_msg_cnt);
+            objs->sent_msg_cnt = 0;
+            objs->recv_msg_cnt = 0;
+            last = now;
+        }
+    }
+}
+
+/*
+ * Event-driven (on-demand) DPU worker.
+ *
+ * Same initialization as run_dpu_worker(), but instead of busy-polling the
+ * control PE while waiting for host-driven control messages (connection, ring
+ * mmap, remote mmap), it registers the control PE notification fd with epoll and
+ * only progresses the PE when the fd signals. The init sequencing lives in the
+ * shared dmesh_doca_ctrl_advance() state machine (comch_server.c), so this loop
+ * mirrors exactly what the Rust AsyncFd driver will do via FFI.
+ */
+void
+run_dpu_worker_event_driven(struct objects *objs)
+{
+    doca_error_t result;
+    enum dmesh_doca_init_state state, prev;
+    int fd, epfd;
+    struct epoll_event ev;
+
+    DOCA_LOG_INFO("Starting DPU worker (event-driven)");
+
+    /* Start the control-path server without blocking on the host connection. */
+    result = start_comch_ctrl_path_server("DPUMesh", objs, true);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to start comch control path server: %s", doca_error_get_descr(result));
+        cleanup_objects(objs);
+        return;
+    }
+
+    /* Get the control PE notification fd and register it with epoll. */
+    result = dmesh_doca_ctrl_get_fd(objs, &fd);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to get control PE notification fd: %s", doca_error_get_descr(result));
+        cleanup_objects(objs);
+        return;
+    }
+
+    epfd = epoll_create1(0);
+    if (epfd < 0) {
+        DOCA_LOG_ERR("Failed to create epoll instance: %s", strerror(errno));
+        cleanup_objects(objs);
+        return;
+    }
+
+    ev.events = EPOLLIN;
+    ev.data.fd = fd;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) != 0) {
+        DOCA_LOG_ERR("Failed to register control PE fd with epoll: %s", strerror(errno));
+        close(epfd);
+        cleanup_objects(objs);
+        return;
+    }
+
+    state = objs->phase; /* DMESH_DOCA_STATE_SERVER_STARTED */
+    while (state != DMESH_DOCA_STATE_RUNNING) {
+        /* Arm first so events pending now (or arriving during the drain below)
+         * signal the fd; then process everything currently ready and cascade
+         * through as many phases as are unlocked, without blocking. This closes
+         * the race where a phase's internal progress already consumed the
+         * awaited control message (so no further fd edge would arrive). */
+        result = dmesh_doca_ctrl_arm(objs);
+        if (result != DOCA_SUCCESS) {
+            DOCA_LOG_ERR("Failed to arm control PE: %s", doca_error_get_descr(result));
+            goto fail;
+        }
+
+        do {
+            prev = state;
+
+            result = dmesh_doca_ctrl_drain(objs);
+            if (result != DOCA_SUCCESS) {
+                DOCA_LOG_ERR("Failed to drain control PE: %s", doca_error_get_descr(result));
+                goto fail;
+            }
+
+            result = dmesh_doca_ctrl_advance(objs, &state);
+            if (result != DOCA_SUCCESS || state == DMESH_DOCA_STATE_ERROR) {
+                DOCA_LOG_ERR("Control-path init failed: %s", doca_error_get_descr(result));
+                goto fail;
+            }
+        } while (state != prev && state != DMESH_DOCA_STATE_RUNNING);
+
+        if (state == DMESH_DOCA_STATE_RUNNING)
+            break;
+
+        /* Nothing ready: block until the control PE fd signals the next event. */
+        if (epoll_wait(epfd, &ev, 1, -1) < 0) {
+            if (errno == EINTR)
+                continue;
+            DOCA_LOG_ERR("epoll_wait on control PE fd failed: %s", strerror(errno));
+            goto fail;
+        }
+
+        result = dmesh_doca_ctrl_clear_and_drain(objs, fd);
+        if (result != DOCA_SUCCESS) {
+            DOCA_LOG_ERR("Failed to clear/drain control PE: %s", doca_error_get_descr(result));
+            goto fail;
+        }
+        /* Phase transitions happen at the top of the next iteration (post re-arm). */
+    }
+
+    close(epfd);
+    DOCA_LOG_INFO("DPU worker initialization complete; entering data path");
+
+    dmesh_doca_run_datapath(objs);
+    return;
+
+fail:
+    close(epfd);
+    cleanup_objects(objs);
 }
