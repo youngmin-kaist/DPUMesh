@@ -668,7 +668,6 @@ dmesh_fill_dpa_thread_arg(struct objects *objs, struct dpa_thread_arg *arg)
                 doca_error_get_name(result));
         return result;
     }
-
 #endif
 
     *arg = (struct dpa_thread_arg) {

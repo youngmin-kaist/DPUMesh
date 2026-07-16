@@ -16,6 +16,42 @@ DOCA_LOG_REGISTER(COMCH_CONSUMER);
  * @comch_connection [in]: The connection related to the consumer
  * @id [in]: The ID of the new remote consumer
  */
+void dmesh_doca_server_new_consumer_cb(struct doca_comch_event_consumer *event,
+				  struct doca_comch_connection *comch_connection,
+				  uint32_t id)
+{
+	union doca_data user_data;
+	struct doca_comch_server *comch_server;
+	struct objects *objs;
+	doca_error_t result;
+
+	/* This argument is not in use */
+	(void)event;
+	comch_server = doca_comch_server_get_server_ctx(comch_connection);
+	if (comch_server == NULL) {
+		DOCA_LOG_ERR("Failed to get comch server from connection");
+		return;
+	}
+
+	result = doca_ctx_get_user_data(doca_comch_server_as_ctx(comch_server), &user_data);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Failed to get user data from ctx with error = %s", doca_error_get_name(result));
+		return;
+	}
+
+	objs = (struct objects *)(user_data.ptr);
+	// objs->remote_consumer_id = id;
+
+	DOCA_LOG_INFO("Got a new remote consumer with ID = [%d]", id);
+}
+
+/**
+ * Callback for new consumer arrival event
+ *
+ * @event [in]: New remote consumer event object
+ * @comch_connection [in]: The connection related to the consumer
+ * @id [in]: The ID of the new remote consumer
+ */
 void server_new_consumer_callback(struct doca_comch_event_consumer *event,
 				  struct doca_comch_connection *comch_connection,
 				  uint32_t id)

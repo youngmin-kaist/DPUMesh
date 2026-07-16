@@ -4,6 +4,7 @@
 #include <doca_comch_consumer.h>
 #include <doca_comch.h>
 #include <doca_ctx.h>
+#include <doca_pe.h>
 
 #define CC_DATA_PATH_MAX_MSG_SIZE (1024 * 1024) /* CC DATA PATH maximum message size */
 #define CC_DATA_PATH_TASK_NUM       256
@@ -26,6 +27,9 @@ struct objects; /* Forward declaration */
 doca_error_t
 init_comch_datapath_consumer(struct objects *objs);
 
+void
+clean_comch_consumer(struct doca_comch_consumer *consumer, struct doca_pe *pe);
+
 void 
 server_new_consumer_callback(struct doca_comch_event_consumer *event,
 				  struct doca_comch_connection *comch_connection,
@@ -41,4 +45,8 @@ expired_consumer_callback(struct doca_comch_event_consumer *event,
 			       struct doca_comch_connection *comch_connection,
 			       uint32_t id);
 
+void 
+dmesh_doca_server_new_consumer_cb(struct doca_comch_event_consumer *event,
+					struct doca_comch_connection *comch_connection,
+					uint32_t id);
 #endif /* COMCH_CONSUMER_H */

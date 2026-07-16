@@ -17,6 +17,15 @@ typedef uint64_t doca_dpa_dev_buf_arr_t;
 
 #define MAX_CONSUMERS 16
 
+/* DOCA objects for DPUMesh thread */
+struct dmesh_doca_objects {
+    struct doca_dev *dev;
+    struct doca_dev_rep *rep_dev;
+    struct doca_pe *pe;
+    struct doca_comch_server *cc_server;
+    
+};
+
 struct objects {
     struct doca_dev *dev;
     struct doca_dev_rep *rep_dev;
@@ -44,6 +53,7 @@ struct objects {
 
     /* comch control path related */
     bool server_finish;             /* Controls whether server progress loop should be run */
+    enum dmesh_doca_init_state phase; /* event-driven init state machine progress */
 
     /* comch data path related */
     struct local_mem_bufs *consumer_mem;

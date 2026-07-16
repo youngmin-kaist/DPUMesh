@@ -6,6 +6,21 @@
 #include <doca_ctx.h>
 
 struct objects; /* Forward declaration */
+struct dmesh_doca_objects; /* Forward declaration */
+
+/* Init state machine for the event-driven (on-demand) control path.
+ * Progresses SERVER_STARTED -> AWAIT_CONNECTION -> AWAIT_REMOTE -> RUNNING.
+ * DPA objects + thread are created up front (before the host connects);
+ * consumer + DPA msgq are set up once connected; the rest of the init runs
+ * once BOTH remote mmaps (ring + buffer) have arrived. See
+ * dmesh_doca_ctrl_advance(). */
+enum dmesh_doca_init_state {
+	DMESH_DOCA_STATE_ERROR = -1,		 /* a DOCA phase failed */
+	DMESH_DOCA_STATE_SERVER_STARTED = 0,	 /* server ctx started; DPA not yet created */
+	DMESH_DOCA_STATE_AWAIT_CONNECTION = 1, /* DPA objects+thread created; awaiting host connection */
+	DMESH_DOCA_STATE_AWAIT_REMOTE = 2,	 /* connected; consumer+msgq set up; awaiting ring_mmap + remote_mmap */
+	DMESH_DOCA_STATE_RUNNING = 3,		 /* run_dpa_thread + send_dma done; init complete */
+};
 
 #define CC_SEND_TASK_NUM 1024 /* Number of CC send tasks  */
 #define CC_RECV_QUEUE_SIZE 1024 /* Size of CC receive queue */
@@ -46,12 +61,43 @@ doca_error_t start_comch_data_path_server(const char *server_name,
 doca_error_t 
 init_comch_dpa_datapath(struct objects *objs);
 
-doca_error_t 
-init_comch_ctrl_path_server(const char *server_name, struct objects *objs, bool is_fast_path);							
+doca_error_t
+init_comch_ctrl_path_server(const char *server_name, struct objects *objs, bool is_fast_path);
+
+/* Non-blocking variant: create + configure + start the comch server context,
+ * but DO NOT busy-wait for the host connection. The connection is established
+ * later via the event-driven driver (see dmesh_doca_ctrl_advance). */
+doca_error_t
+start_comch_ctrl_path_server(const char *server_name, struct objects *objs, bool is_fast_path);
+
+/* Event-driven control-path helpers (operate on the control PE objs->pe).
+ * All return doca_error_t. See dmesh_doca_ctrl_advance for the state machine. */
+doca_error_t
+dmesh_doca_ctrl_get_fd(struct objects *objs, int *out_fd);
+
+doca_error_t
+dmesh_doca_ctrl_arm(struct objects *objs);
+
+/* Progress the control PE until no more progress is made, WITHOUT clearing the
+ * notification. Used to process events already pending (e.g. consumed by a
+ * phase's internal progress) before blocking on the fd, closing the arm/ready
+ * race. */
+doca_error_t
+dmesh_doca_ctrl_drain(struct objects *objs);
+
+doca_error_t
+dmesh_doca_ctrl_clear_and_drain(struct objects *objs, int fd);
+
+doca_error_t
+dmesh_doca_ctrl_advance(struct objects *objs, enum dmesh_doca_init_state *out_state);
 
 doca_error_t 
 server_send_msg(struct objects *objs, const char *msg, size_t len);
 
 doca_error_t
 export_dpa_comp_to_host(struct objects *objs);
+
+doca_error_t
+dmesh_doca_init_comch_server(struct dmesh_doca_objects *objs, const char *server_name, 
+							 bool enable_fast_path);
 #endif // COMCH_SERVER_H

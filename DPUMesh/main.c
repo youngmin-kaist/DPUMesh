@@ -96,7 +96,12 @@ int main(int argc, char **argv)
     if (gcfg.mode == HOST_MODE) {
         run_host_worker(&objs);
     } else {
-        run_dpu_worker(&objs);
+        /* Event-driven (on-demand) control path. Set DPUMESH_BUSY_POLL=1 to run
+         * the original busy-poll worker for comparison. */
+        if (getenv("DPUMESH_BUSY_POLL") != NULL)
+            run_dpu_worker(&objs);
+        else
+            run_dpu_worker_event_driven(&objs);
     }
         
 //     result = init_comch_ctrl_path_server("DPUMesh", &objs, true);

@@ -7,6 +7,9 @@
 
 struct objects;
 
+/* Size of the local DMA buffer allocated on the DPU for PCI export. */
+#define BUFFER_SIZE (1024 * 1024)
+
 doca_error_t
 alloc_buffer_and_set_mmap(struct doca_mmap **mmap, struct doca_dev *dev,
                         void **buffer, size_t buffer_size, uint32_t access_mask);
