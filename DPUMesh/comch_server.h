@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <doca_comch.h>
 #include <doca_ctx.h>
+#include <doca_pe.h>
 
 struct objects; /* Forward declaration */
 
@@ -47,7 +48,13 @@ doca_error_t
 init_comch_dpa_datapath(struct objects *objs);
 
 doca_error_t 
-init_comch_ctrl_path_server(const char *server_name, struct objects *objs, bool is_fast_path);							
+init_comch_ctrl_path_server(struct doca_dev *dev, 
+							struct doca_dev_rep *rep_dev,
+							struct doca_pe *pe,
+							struct doca_comch_server **comch_server,
+							const char *server_name,
+							void *user_data,
+							bool is_fast_path);	
 
 doca_error_t 
 server_send_msg(struct objects *objs, const char *msg, size_t len);

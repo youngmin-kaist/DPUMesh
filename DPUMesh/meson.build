@@ -20,6 +20,8 @@ sample_dependencies = []
 sample_dependencies += dependency('doca-common')
 # The DOCA library of the sample itself
 sample_dependencies += dependency('doca-comch')
+# DOCA DMA library
+sample_dependencies += dependency('doca-dma')
 # Utility DOCA library for executables
 sample_dependencies += dependency('doca-argp')
 # DOCA DPA library

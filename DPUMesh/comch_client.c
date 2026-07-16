@@ -95,11 +95,19 @@ static void client_message_recv_callback(struct doca_comch_event_msg_recv *event
 	comch_msg = (struct dmesh_comch_msg *)recv_buffer;
 	switch (comch_msg->type)
 	{
-	case DMESH_MSG_EXPORT_DESC:
-		if (msg_len <= sizeof(struct dmesh_mmap_msg)) {
-			DOCA_LOG_ERR("Received invalid MMAP message from server");
+	case DMESH_MSG_EXPORT_RING:
+		if (msg_len < sizeof(struct dmesh_export_ring_msg)) {
+			DOCA_LOG_ERR("Received invalid RING message from server");
 			return;
 		}
+		result = process_export_ring_msg(objs, (struct dmesh_export_ring_msg *)recv_buffer);
+		break;
+	case DMESH_MSG_EXPORT_BUFFER:
+		if (msg_len < sizeof(struct dmesh_export_buf_msg)) {
+			DOCA_LOG_ERR("Received invalid BUFFER message from server");
+			return;
+		}
+		result = process_export_buf_msg(objs, (struct dmesh_export_buf_msg *)recv_buffer);
 		// result = process_mmap_msg(objs, (struct dmesh_mmap_msg *)recv_buffer);
 		break;
 	case DMESH_MSG_EXPORT_DPA_COMP:

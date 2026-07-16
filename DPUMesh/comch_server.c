@@ -113,13 +113,21 @@ static void server_message_recv_callback(struct doca_comch_event_msg_recv *event
 
 	DOCA_LOG_INFO("Received message from client with type = %u", comch_msg->type);
 	switch (comch_msg->type) {
-	case DMESH_MSG_EXPORT_DESC:
+	case DMESH_MSG_EXPORT_RING:
 
-		if (msg_len <= sizeof(struct dmesh_mmap_msg)) {
-			DOCA_LOG_ERR("Received invalid MMAP message from client");
+		if (msg_len < sizeof(struct dmesh_export_ring_msg)) {
+			DOCA_LOG_ERR("Received invalid RING message from client");
 			return;
 		}
-		result = process_mmap_msg(objs, (struct dmesh_mmap_msg *)recv_buffer);
+		result = process_export_ring_msg(objs, (struct dmesh_export_ring_msg *)recv_buffer);
+		break;
+
+	case DMESH_MSG_EXPORT_BUFFER:
+		if (msg_len < sizeof(struct dmesh_export_buf_msg)) {
+			DOCA_LOG_ERR("Received invalid BUFFER message from client");
+			return;
+		}
+		result = process_export_buf_msg(objs, (struct dmesh_export_buf_msg *)recv_buffer);
 		break;
 	default:
 
@@ -184,45 +192,42 @@ static void server_disconnection_event_callback(struct doca_comch_event_connecti
 }
 
 doca_error_t 
-init_comch_ctrl_path_server(const char *server_name, struct objects *objs, bool is_fast_path)
+init_comch_ctrl_path_server(struct doca_dev *dev, 
+							struct doca_dev_rep *rep_dev,
+							struct doca_pe *pe,
+							struct doca_comch_server **comch_server,
+							const char *server_name,
+							void *user_data,
+							bool is_fast_path)
 {
     doca_error_t result;
     struct doca_ctx *ctx;
-    union doca_data user_data;
+    union doca_data udata;
     uint32_t max_msg_size, max_rq_size;
 	struct timespec ts = {
 		.tv_nsec = SLEEP_IN_NANOS,
 	};
 
-	/* create a progress engine */
-    result = doca_pe_create(&(objs->pe));
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed creating pe with error = %s", doca_error_get_name(result));
-        return result;
-    }
-	
-    result = doca_comch_server_create(objs->dev, objs->rep_dev,
-                server_name, &objs->cc_server);
+	if (dev == NULL || rep_dev == NULL || comch_server == NULL || server_name == NULL) {
+		DOCA_LOG_ERR("Invalid argument(s) passed to init_comch_ctrl_path_server");
+		return DOCA_ERROR_INVALID_VALUE;
+	}
+
+    result = doca_comch_server_create(dev, rep_dev, server_name, comch_server);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to create server with error = %s", doca_error_get_name(result));
         goto destroy_pe;
     }
 
-    ctx = doca_comch_server_as_ctx(objs->cc_server);
+    ctx = doca_comch_server_as_ctx(*comch_server);
 
-    result = doca_pe_connect_ctx(objs->pe, ctx);
+    result = doca_pe_connect_ctx(pe, ctx);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed adding pe context to server with error = %s", doca_error_get_name(result));
         goto destroy_server;
     }
 
-    // result = doca_ctx_set_state_changed_cb(ctx, server_state_changed_callback);
-    // if (result != DOCA_SUCCESS) {
-    //     DOCA_LOG_ERR("Failed setting state change callback with error = %s", doca_error_get_name(result));
-    //     goto destroy_server;
-    // }
-
-    result = doca_comch_server_task_send_set_conf(objs->cc_server,
+    result = doca_comch_server_task_send_set_conf(*comch_server,
                 server_send_task_completion_callback,
                 server_send_task_completion_err_callback,
                 CC_SEND_TASK_NUM);
@@ -231,13 +236,13 @@ init_comch_ctrl_path_server(const char *server_name, struct objects *objs, bool 
         goto destroy_server;
     }
 
-    result = doca_comch_server_event_msg_recv_register(objs->cc_server, server_message_recv_callback);
+    result = doca_comch_server_event_msg_recv_register(*comch_server, server_message_recv_callback);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed adding message recv event cb with error = %s", doca_error_get_name(result));
         goto destroy_server;
     }
 
-    result = doca_comch_server_event_connection_status_changed_register(objs->cc_server,
+    result = doca_comch_server_event_connection_status_changed_register(*comch_server,
                                         server_connection_event_callback,
                                         server_disconnection_event_callback);
     if (result != DOCA_SUCCESS) {
@@ -247,7 +252,7 @@ init_comch_ctrl_path_server(const char *server_name, struct objects *objs, bool 
 
     /* Config the data_path related events */
 	if (is_fast_path) {
-		result = doca_comch_server_event_consumer_register(objs->cc_server,
+		result = doca_comch_server_event_consumer_register(*comch_server,
 									server_new_consumer_callback,
 									expired_consumer_callback);
 		if (result != DOCA_SUCCESS) {
@@ -256,32 +261,32 @@ init_comch_ctrl_path_server(const char *server_name, struct objects *objs, bool 
 		}
 	}
 
-    result = doca_comch_cap_get_max_msg_size(doca_dev_as_devinfo(objs->dev), &max_msg_size);
+    result = doca_comch_cap_get_max_msg_size(doca_dev_as_devinfo(dev), &max_msg_size);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to get max message size with error = %s", doca_error_get_name(result));
         goto destroy_server;
     } 
 
-    result = doca_comch_cap_get_max_recv_queue_size(doca_dev_as_devinfo(objs->dev), &max_rq_size);
+    result = doca_comch_cap_get_max_recv_queue_size(doca_dev_as_devinfo(dev), &max_rq_size);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to get max recv queue size with error = %s", doca_error_get_name(result));
         goto destroy_server;
     }
     
-    result = doca_comch_server_set_max_msg_size(objs->cc_server, max_msg_size);
+    result = doca_comch_server_set_max_msg_size(*comch_server, max_msg_size);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to set max message size with error = %s", doca_error_get_name(result));
         goto destroy_server;
     }
 
-    result = doca_comch_server_set_recv_queue_size(objs->cc_server, CC_RECV_QUEUE_SIZE);
+    result = doca_comch_server_set_recv_queue_size(*comch_server, CC_RECV_QUEUE_SIZE);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to set recv queue size with error = %s", doca_error_get_name(result));
         goto destroy_server;
     }
 
-    user_data.ptr = (void *)objs;
-    result = doca_ctx_set_user_data(ctx, user_data);
+    udata.ptr = (void *)user_data;
+    result = doca_ctx_set_user_data(ctx, udata);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to set ctx user data with error = %s", doca_error_get_name(result));
         goto destroy_server;
@@ -293,21 +298,14 @@ init_comch_ctrl_path_server(const char *server_name, struct objects *objs, bool 
         goto destroy_server;
     }
 
-	while (objs->connection == NULL) {
-		if (doca_pe_progress(objs->pe) == 0)
-			nanosleep(&ts, &ts);
-	}
-
-	DOCA_LOG_INFO("Server connection established");
-
     return DOCA_SUCCESS;
 
 destroy_server:
-    doca_comch_server_destroy(objs->cc_server);
-    objs->cc_server = NULL;
+    doca_comch_server_destroy(*comch_server);
+    *comch_server = NULL;
 destroy_pe:
-    doca_pe_destroy(objs->pe);
-    objs->pe = NULL;
+    doca_pe_destroy(pe);
+    pe = NULL;
     return result;
 }
 

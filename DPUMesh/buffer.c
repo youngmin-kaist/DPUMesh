@@ -3,6 +3,9 @@
 
 #include <doca_dev.h>
 #include <doca_mmap.h>
+#include <doca_buf_inventory.h>
+#include <doca_buf_pool.h>
+#include <doca_error.h>
 
 DOCA_LOG_REGISTER(BUFFER);
 
@@ -149,6 +152,68 @@ free_mem:
 		free(local->mem);
 		local->mem = NULL;
 	}
+	return result;
+}
+
+doca_error_t init_dmesh_buffer(struct doca_dev *dev, struct dmesh_buffer *dmesh_buf, size_t buf_size)
+{
+	doca_error_t result;
+	int ret;
+
+	result = doca_mmap_create(&dmesh_buf->mmap);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Failed to create dmesh buffer mmap: %s", doca_error_get_descr(result));
+		return result;
+	}
+
+	result = doca_mmap_add_dev(dmesh_buf->mmap, dev);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to add device to mmap - %s",
+                doca_error_get_name(result));
+        goto destroy_mmap;
+    }
+
+	result = doca_mmap_set_permissions(dmesh_buf->mmap, DOCA_ACCESS_FLAG_PCI_READ_WRITE);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to set mmap permissions - %s",
+                doca_error_get_name(result));
+        goto destroy_mmap;
+    }
+
+	ret = posix_memalign(&dmesh_buf->buf, CACHE_ALIGN, buf_size);
+    if (ret != 0) {
+        result = DOCA_ERROR_NO_MEMORY;
+        DOCA_LOG_ERR("Failed to allocate aligned memory for buffer - %s",
+                strerror(ret));
+        goto destroy_mmap;
+    }
+	
+	memset(dmesh_buf->buf, 0, buf_size);
+	dmesh_buf->size = buf_size;
+	DOCA_LOG_INFO("Allocated buffer at address %p with size %zu", dmesh_buf->buf, buf_size);
+
+    result = doca_mmap_set_memrange(dmesh_buf->mmap, dmesh_buf->buf, buf_size);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to set mmap memrange - %s",
+                doca_error_get_name(result));
+        goto free_buffer;
+    }
+    result = doca_mmap_start(dmesh_buf->mmap);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to start mmap - %s",   
+                doca_error_get_name(result));
+        goto free_buffer;
+    }
+
+    return DOCA_SUCCESS;
+
+free_buffer:
+    free(dmesh_buf->buf);
+    dmesh_buf->buf = NULL;
+destroy_mmap:
+    doca_mmap_destroy(dmesh_buf->mmap);
+    dmesh_buf->mmap = NULL;
+	
 	return result;
 }
 

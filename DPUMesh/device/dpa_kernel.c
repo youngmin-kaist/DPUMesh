@@ -120,88 +120,156 @@ static void handle_msgs(struct dpa_thread_arg *thread_arg)
     }
     // DOCA_DPA_DEV_LOG_INFO("Handled %u msgs from host\n", num_msgs);
 }
+#define CONSUMER_HEAD_PUBLISH_BATCH 1
+#define DMA_RING_LOG_INTERVAL 1024
 
 static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
 {
     doca_dpa_dev_comch_producer_t producer = thread_arg->dpa_producer;
-    struct comch_dma_comp_msg msg;
+    struct comch_dma_comp_msg msg = {0};
     doca_dpa_dev_uintptr_t dev_ptr;
     doca_dpa_dev_buf_t buf;
+    struct dma_ring_ctrl *ctrl;
     struct dma_desc *desc;
-    int desc_idx = 0;
+    uint64_t producer_tail;
+    uint64_t consumer_head;
+    uint64_t last_published_head;
+
     uint32_t ring_size = thread_arg->buf_arr_size;
+    uint32_t ring_mask = ring_size - 1;
     uint32_t buf_size = thread_arg->buf_size;
 
-    buf = doca_dpa_dev_buf_array_get_buf(thread_arg->dpa_buf_arr, desc_idx);
+    DOCA_DPA_DEV_LOG_INFO("Polling descriptor ring with size %u, buf_size: %u\n", ring_size, buf_size);
+    
+    buf = doca_dpa_dev_buf_array_get_buf(thread_arg->dpa_buf_arr, 0);
     dev_ptr = doca_dpa_dev_buf_get_external_ptr(buf);
-    desc = (struct dma_desc *)dev_ptr;
+    ctrl = (struct dma_ring_ctrl *)dev_ptr;
 
-    desc = (struct dma_desc *)dev_ptr;
-        while (!desc->valid) {
-            __dpa_thread_window_read_inv();
-        }
+    consumer_head = ctrl->consumer_head;
+    last_published_head = consumer_head;
+    DOCA_DPA_DEV_LOG_INFO("DPA ring init: producer_tail=%lu, consumer_head=%lu\n",
+                          ctrl->producer_tail, consumer_head);
 
     /* polling descriptor ring in host memory */
     while (1) {
 
-        // desc = (struct dma_desc *)dev_ptr;
-        // while (!desc->valid) {
-        //     __dpa_thread_window_read_inv();
-        // }
+        __dpa_thread_window_read_inv();
+        buf = doca_dpa_dev_buf_array_get_buf(thread_arg->dpa_buf_arr, 0);
+        dev_ptr = doca_dpa_dev_buf_get_external_ptr(buf);
+        ctrl = (struct dma_ring_ctrl *)dev_ptr;
+        consumer_head = ctrl->consumer_head;
+        producer_tail = ctrl->producer_tail;
 
-        /* if consumer is empty, wait */
-        while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, /*consumer_id=*/1) == 1) {
-            DOCA_DPA_DEV_LOG_INFO("Consumer is empty, waiting for messages...\n");
+        while (consumer_head < producer_tail) {
+            buf = doca_dpa_dev_buf_array_get_buf(thread_arg->dpa_buf_arr, (consumer_head & ring_mask) + 1);
+            dev_ptr = doca_dpa_dev_buf_get_external_ptr(buf);
+            desc = (struct dma_desc *)dev_ptr;
+
+            // DOCA_DPA_DEV_LOG_INFO("Read DMA desc: addr=0x%lx, size=%lu\n", desc->addr, desc->size);
+            
+            /* if consumer is empty, wait */
+            while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, /*consumer_id=*/1) == 1) {
+            }
+
+            // DOCA_DPA_DEV_LOG_INFO("Read DMA desc: idx=%lu, addr=0x%lx, size=%lu\n", desc->idx, desc->addr, desc->size);
+            msg.type = COMCH_MSG_TYPE_DMA_COMPLETED;
+            msg.pos = thread_arg->pos;
+            msg.length = (uint32_t)desc->size;
+
+            doca_dpa_dev_comch_producer_dma_copy(producer,
+                                        /*consumer_id=*/1,
+                                        thread_arg->dpu_mmap,
+                                        thread_arg->src_addr + thread_arg->pos,
+                                        thread_arg->host_mmap,
+                                        desc->addr,
+                                        desc->size,
+                                        (uint8_t *)&msg,
+                                        sizeof(struct comch_dma_comp_msg),
+                                        DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS | 
+                                        DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
+
+            thread_arg->pos += desc->size;
+            if (thread_arg->pos >= buf_size) {
+                thread_arg->pos = 0;
+            }
+            
+            consumer_head++;
         }
 
-        msg.type = COMCH_MSG_TYPE_DMA_COMPLETED;
-        msg.pos = thread_arg->pos;
-        msg.length = desc->size;
-
-        if (thread_arg->pos +desc->size > buf_size) {
-            DOCA_DPA_DEV_LOG_INFO("Reached end of buffer, resetting position\n");
+        if (consumer_head - last_published_head >= CONSUMER_HEAD_PUBLISH_BATCH) {
+            ctrl->consumer_head = consumer_head;
+            __dpa_thread_window_writeback();
+            last_published_head = consumer_head;
         }
-        
-        doca_dpa_dev_comch_producer_dma_copy(producer,
-                                    /*consumer_id=*/1,
-                                    thread_arg->dpu_mmap,
-                                    thread_arg->src_addr + thread_arg->pos,
-                                    thread_arg->host_mmap,
-                                    desc->addr,
-                                    desc->size,
-                                    (uint8_t *)&msg,
-                                    sizeof(struct comch_dma_comp_msg),
-                                    DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS | 
-                                    DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
-
-        thread_arg->pos += desc->size;
-        if (thread_arg->pos >= buf_size) {
-            thread_arg->pos = 0;
-        }
-        
-        // desc_idx = (desc_idx + 1) % ring_size;
-        // buf = doca_dpa_dev_buf_array_get_buf(thread_arg->dpa_buf_arr, desc_idx);
-        // dev_ptr = doca_dpa_dev_buf_get_external_ptr(buf);
     }
-}
 
-__dpa_global__ void hello_world(uint64_t arg)
-{
-    struct dpa_thread_arg *thread_arg = (struct dpa_thread_arg *)arg;
+    // while (consumer_head < ctrl->producer_tail) {
+    //     desc_idx = (consumer_head & ring_mask) + 1;
+    //     buf = doca_dpa_dev_buf_array_get_buf(thread_arg->dpa_buf_arr, desc_idx);
+    //     dev_ptr = doca_dpa_dev_buf_get_external_ptr(buf);
+    //     desc = (struct dma_desc *)dev_ptr;
+    //     DOCA_DPA_DEV_LOG_INFO("Read DMA desc: idx=%lu, addr=0x%lx, size=%lu\n", desc->idx, desc->addr, desc->size);
+        
+    //     consumer_head++;
+    // }
 
-    DOCA_DPA_DEV_LOG_INFO("DPA buffer array handle: 0x%lx\n", thread_arg->dpa_buf_arr);
-    doca_dpa_dev_buf_t buf = 0;
-    doca_dpa_dev_uintptr_t dev_ptr = 0;
-    uint64_t buf_len = 0;
-    uintptr_t addr = 0;
-    DOCA_DPA_DEV_LOG_INFO("buf arr: 0x%lx\n", thread_arg->dpa_buf_arr);
-    buf = doca_dpa_dev_buf_array_get_buf(thread_arg->dpa_buf_arr, 0);
-    dev_ptr = doca_dpa_dev_buf_get_external_ptr(buf);
-    buf_len = doca_dpa_dev_buf_get_len(buf);
-    addr = doca_dpa_dev_buf_get_addr(buf);
+    // while (1) {
+    //     __dpa_thread_window_read_inv();
+    //     producer_tail = ctrl->producer_tail;
+    //     while (consumer_head == producer_tail) {
+    //         if (consumer_head != last_published_head) {
+    //             ctrl->consumer_head = consumer_head;
+    //             __dpa_thread_window_writeback();
+    //             last_published_head = consumer_head;
+    //         }
+    //         __dpa_thread_window_read_inv();
+    //         producer_tail = ctrl->producer_tail;
+    //     }
 
-    // handle_msgs(thread_arg);
-    doca_dpa_dev_thread_reschedule();
+    //     buf = doca_dpa_dev_buf_array_get_buf(thread_arg->dpa_buf_arr, (consumer_head & ring_mask) + 1);
+    //     dev_ptr = doca_dpa_dev_buf_get_external_ptr(buf);
+    //     __dpa_thread_window_read_inv();
+    //     desc = (struct dma_desc *)dev_ptr;
+
+    //     /* if consumer is empty, wait */
+    //     while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, /*consumer_id=*/1) == 1) {
+    //     }
+
+    //     // DOCA_DPA_DEV_LOG_INFO("Read DMA desc: idx=%lu, addr=0x%lx, size=%lu\n", desc->idx, desc->addr, desc->size);
+    //     msg.type = COMCH_MSG_TYPE_DMA_COMPLETED;
+    //     msg.pos = thread_arg->pos;
+    //     msg.length = desc->size;
+
+    //     doca_dpa_dev_comch_producer_dma_copy(producer,
+    //                                 /*consumer_id=*/1,
+    //                                 thread_arg->dpu_mmap,
+    //                                 thread_arg->src_addr + thread_arg->pos,
+    //                                 thread_arg->host_mmap,
+    //                                 desc->addr,
+    //                                 desc->size,
+    //                                 (uint8_t *)&msg,
+    //                                 sizeof(struct comch_dma_comp_msg),
+    //                                 DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS | 
+    //                                 DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
+
+    //     thread_arg->pos += desc->size;
+    //     if (thread_arg->pos >= buf_size) {
+    //         thread_arg->pos = 0;
+    //     }
+
+    //     consumer_head++;
+    //     if (consumer_head - last_published_head >= CONSUMER_HEAD_PUBLISH_BATCH) {
+    //         ctrl->consumer_head = consumer_head;
+    //         __dpa_thread_window_writeback();
+    //         last_published_head = consumer_head;
+    //     }
+
+    //     if (consumer_head - last_logged_head >= DMA_RING_LOG_INTERVAL) {
+    //         // DOCA_DPA_DEV_LOG_INFO("DPA ring consume: producer_tail=%lu, consumer_head=%lu\n",
+    //         //                       producer_tail, consumer_head);
+    //         last_logged_head = consumer_head;
+    //     }
+    // }
 }
 
 __dpa_global__ void run_dma_manager(uint64_t arg)
