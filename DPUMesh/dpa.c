@@ -5,19 +5,20 @@
 #include <doca_comch_consumer.h>
 #include <doca_comch_producer.h>
 #include <doca_comch_msgq.h>
+#include <doca_buf.h>
 #include <doca_buf_array.h>
 #include <doca_mmap.h>
 
 #include "object.h"
 #include "dpa_common.h"
 #include "ring.h"
+#include "dma.h"
 #include <arpa/inet.h>
 #include <time.h>
 
 DOCA_LOG_REGISTER(DPA);
 
 /* Kernel function declaration */
-extern doca_dpa_func_t hello_world;
 extern doca_dpa_func_t run_dma_manager;
 extern doca_dpa_func_t thread_init_rpc;
 
@@ -39,21 +40,83 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
 	(void)task_user_data;
 
 	doca_error_t result;
-    uint32_t data_len;
     struct comch_msg *msg;
 
 	struct objects *objs = ctx_user_data.ptr;
 	struct doca_task *task = doca_comch_consumer_task_post_recv_as_task(recv_task);
     
-    data_len = doca_comch_consumer_task_post_recv_get_imm_data_len(recv_task);
     msg = (struct comch_msg *)doca_comch_consumer_task_post_recv_get_imm_data(recv_task);
 
     switch (msg->type) {
         case COMCH_MSG_TYPE_DMA_COMPLETED:
             struct comch_dma_comp_msg *comp_msg = (struct comch_dma_comp_msg *)msg;
-            uint32_t *idx = (uint32_t *)(objs->dma_buffer + comp_msg->pos);
-            // DOCA_LOG_INFO("Received DMA completed message: pos=%u, length=%u, idx: %u",
-            //               comp_msg->pos, comp_msg->length, *idx);
+            struct doca_buf *sbuf = NULL, *dbuf = NULL;
+            void *mmap_addr = NULL;
+            size_t mmap_len = 0;
+            const size_t dst_offset = 10000;
+            doca_error_t result;
+
+            // DOCA_LOG_INFO("Received DMA completed message from DPA, pos=%u, length=%u",
+            //               comp_msg->pos, comp_msg->length);
+
+            result = doca_mmap_get_memrange(objs->local_mmap, &mmap_addr, &mmap_len);
+            if (result != DOCA_SUCCESS) {
+                DOCA_LOG_ERR("Failed to get local mmap range: %s", doca_error_get_descr(result));
+                break;
+            }
+            if (comp_msg->length == 0 ||
+                comp_msg->pos > mmap_len ||
+                comp_msg->length > mmap_len - comp_msg->pos ||
+                dst_offset > mmap_len ||
+                comp_msg->length > mmap_len - dst_offset) {
+                DOCA_LOG_ERR("Invalid DMA copy range: pos=%u, dst_offset=%zu, length=%u, mmap_len=%zu",
+                             comp_msg->pos, dst_offset, comp_msg->length, mmap_len);
+                break;
+            }
+            
+            /* For src doca buffer, data len must be specified */
+            result = doca_buf_inventory_buf_get_by_data(objs->buf_inv,
+                                               objs->local_mmap,
+                                               objs->dma_buffer + comp_msg->pos,
+                                               comp_msg->length,
+                                               &sbuf);
+
+            if (result != DOCA_SUCCESS) {
+                DOCA_LOG_ERR("Failed to get buffer from inventory by addr: %s", doca_error_get_descr(result));
+                break;
+            }
+            // DOCA_LOG_INFO("[sbuf] mmap: %p, buf: %p, pos: %u, length: %lu", 
+            //         objs->local_mmap, objs->dma_buffer, comp_msg->pos, (unsigned long)comp_msg->length);
+
+            /* For dst doca buffer, data is copied to the tail segment */
+            result = doca_buf_inventory_buf_get_by_addr(objs->buf_inv,
+                                               objs->rcvbuf.mmap,
+                                               objs->rcvbuf.buf,
+                                               comp_msg->length,
+                                               &dbuf);
+            if (result != DOCA_SUCCESS) {
+                DOCA_LOG_ERR("Failed to get buffer from inventory by addr: %s", doca_error_get_descr(result));
+                (void)doca_buf_dec_refcount(sbuf, NULL);
+                break;
+            }
+            // DOCA_LOG_INFO("[dbuf] mmap: %p, buf: %p, offset: %zu, length: %lu",
+            //         objs->rcvbuf.mmap, objs->rcvbuf.buf, 0, (unsigned long)comp_msg->length);
+            
+            if (get_num_free_dma_tasks(objs) == 0) {
+                DOCA_LOG_ERR("Failed to get free DMA task for completed message");
+                (void)doca_buf_dec_refcount(dbuf, NULL);
+                (void)doca_buf_dec_refcount(sbuf, NULL);
+                break;
+            }
+
+            result = submit_dma_task(objs, sbuf, dbuf);
+            if (result != DOCA_SUCCESS) {
+                DOCA_LOG_ERR("Failed to submit DMA task for completed message: %s",
+                             doca_error_get_descr(result));
+                break;
+            }
+            // DOCA_LOG_INFO("Submitted DMA task for completed message");
+            
             break;
         default:
             DOCA_LOG_ERR("Received unknown message type: %u", msg->type);
@@ -99,7 +162,6 @@ static void dmesh_doca_dpa_msgq_send_cb(struct doca_comch_producer_task_send *se
 				       union doca_data task_user_data,
 				       union doca_data ctx_user_data)
 {
-    doca_error_t result;
     struct comch_msg msg;
 	(void)task_user_data;
 	
@@ -159,6 +221,7 @@ void dmesh_doca_dpa_comch_msgq_ctx_state_changed_cb(const union doca_data user_d
 							  enum doca_ctx_states prev_state,
 							  enum doca_ctx_states next_state)
 {
+	(void)user_data;
 	(void)ctx;
 	(void)prev_state;
 
@@ -182,7 +245,6 @@ doca_error_t
 init_dpa_objects(struct objects *objs)
 {
     doca_error_t result;
-    struct dmesh_doca_dpa_thread *dpa_thread;
 
     if (!objs->dpa_thread) {
 		objs->dpa_thread = malloc(sizeof(struct dmesh_doca_dpa_thread));
@@ -225,24 +287,6 @@ destroy_dpa:
     doca_dpa_destroy(objs->dpa_thread->dpa);
     objs->dpa_thread->dpa = NULL;
     return result;
-}
-
-doca_error_t
-launch_dpa_kernel(struct dmesh_doca_dpa_thread *dpa_thread)
-{
-    doca_error_t result;
-
-    result = doca_dpa_kernel_launch_update_set(dpa_thread->dpa, 
-                    NULL, 0,
-                    NULL, 0,
-                    1,
-                    &hello_world);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to launch DPA kernel with error = %s", doca_error_get_name(result));
-        return result;
-    }
-
-    return DOCA_SUCCESS;
 }
 
 doca_error_t
@@ -536,7 +580,6 @@ dmesh_doca_dpa_comch_create(struct objects *objs)
 {
     struct dmesh_doca_dpa_comch *comch = objs->dpa_comch;
     struct dmesh_doca_dpa_thread *dpa_thread = objs->dpa_thread;
-    uint32_t max_num_recv, imm_data_len;
     doca_error_t result;
     
     memset(comch, 0, sizeof(*comch));
@@ -615,8 +658,10 @@ dmesh_fill_dpa_thread_arg(struct objects *objs, struct dpa_thread_arg *arg)
 	doca_dpa_dev_completion_t dpa_producer_comp;
 	doca_dpa_dev_comch_producer_t dpa_producer;
 	doca_dpa_dev_comch_consumer_t dpa_consumer;
+#ifdef DOCA_ARCH_DPU
     doca_dpa_dev_buf_arr_t dpa_buf_arr;
     doca_dpa_dev_mmap_t dpu_mmap, host_mmap;
+#endif
 
     comch = objs->dpa_comch;
 
@@ -662,7 +707,7 @@ dmesh_fill_dpa_thread_arg(struct objects *objs, struct dpa_thread_arg *arg)
         return result;
     }
 
-    result = doca_mmap_dev_get_dpa_handle(objs->remote_mmap, objs->dev, &host_mmap);
+    result = doca_mmap_dev_get_dpa_handle(objs->sndbuf.mmap, objs->dev, &host_mmap);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to get mmap DPA handle: %s",
                 doca_error_get_name(result));
@@ -704,6 +749,8 @@ dmesh_doca_run_dpa_thread(struct objects *objs, struct dmesh_doca_dpa_thread *dp
 {
     doca_error_t result;
     struct dpa_thread_arg arg;
+
+    (void)comch;
 
     result = dmesh_fill_dpa_thread_arg(objs, &arg);
     if (result != DOCA_SUCCESS) {
@@ -801,9 +848,7 @@ dmesh_doca_dpa_msgq_send_bulk(struct dmesh_doca_dpa_msgq *msgq, uint32_t num_msg
 	struct doca_comch_producer_task_send *send_task;
     struct doca_task *task;
 	doca_error_t result;
-    int i;
-    struct comch_msg *comch_msg = (struct comch_msg *)msg;
-
+    uint32_t i;
     for (i = 0; i < num_msg; i++) {
         result = doca_comch_producer_task_send_alloc_init(msgq->producer,
                                   NULL,
@@ -835,7 +880,7 @@ setup_dpa_buf_array(struct objects *objs, size_t num_elem, struct doca_mmap *mma
 {
     doca_error_t result;
 
-    result = doca_buf_arr_create(num_elem, &objs->buf_arr);
+    result = doca_buf_arr_create(num_elem + 1, &objs->buf_arr);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to create buffer array: %s", doca_error_get_descr(result));
         return result;
@@ -861,8 +906,6 @@ setup_dpa_buf_array(struct objects *objs, size_t num_elem, struct doca_mmap *mma
 
     return DOCA_SUCCESS;
 
-stop_buf_arr:
-    doca_buf_arr_stop(objs->buf_arr);
 destroy_buf_arr:
     doca_buf_arr_destroy(objs->buf_arr);
     objs->buf_arr = NULL;

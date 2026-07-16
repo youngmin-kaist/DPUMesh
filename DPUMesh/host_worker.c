@@ -24,8 +24,6 @@ void
 run_host_worker(struct objects *objs)
 {
     doca_error_t result;
-    struct timespec last, now, ts = {0, 1000};
-	double elapsed = 0.0;
 
     DOCA_LOG_INFO("Starting Host worker");
 
@@ -53,43 +51,53 @@ run_host_worker(struct objects *objs)
     }
 
     /* allocate local buffer and set mmap for PCI export */
-    result = alloc_buffer_and_set_mmap(&objs->local_mmap, objs->dev,
-                            &objs->dma_buffer, BUFFER_SIZE,
-                           DOCA_ACCESS_FLAG_PCI_READ_WRITE);
+    result = init_dmesh_buffer(objs->dev, &objs->sndbuf, BUFFER_SIZE);
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to allocate DMA resources: %s", doca_error_get_descr(result));
+        DOCA_LOG_ERR("Failed to init dmesh buffer: %s", doca_error_get_descr(result));
+        goto argp_cleanup;
+    }
+
+    result = init_dmesh_buffer(objs->dev, &objs->rcvbuf, BUFFER_SIZE);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to init dmesh buffer: %s", doca_error_get_descr(result));
+        goto argp_cleanup;
+    }
+
+    result = export_dma_buffer(objs);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to export DMA buffer: %s", doca_error_get_descr(result));
         goto argp_cleanup;
     }
 
     /* export DMA buffer mmap to DPU */
-    result = export_mmap_to_remote(objs, objs->local_mmap, 
-                                   objs->dma_buffer, BUFFER_SIZE, 
-                                   DMA_BUFFER, HOST_TO_DPU);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to export mmap and buffer to DPU: %s", doca_error_get_descr(result));
-        goto argp_cleanup;
-    }
+    // result = export_mmap_to_remote(objs, objs->sndbuf.mmap, 
+    //                                objs->sndbuf.buf, objs->sndbuf.size, 
+    //                                DMA_BUFFER, HOST_TO_DPU);
+    // if (result != DOCA_SUCCESS) {
+    //     DOCA_LOG_ERR("Failed to export mmap and buffer to DPU: %s", doca_error_get_descr(result));
+    //     goto argp_cleanup;
+    // }
 
-    result = init_dpa_objects(objs);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to init DPA objects: %s", doca_error_get_descr(result));
-        cleanup_objects(objs);
-        goto argp_cleanup;
-    }
+    // result = init_dpa_objects(objs);
+    // if (result != DOCA_SUCCESS) {
+    //     DOCA_LOG_ERR("Failed to init DPA objects: %s", doca_error_get_descr(result));
+    //     cleanup_objects(objs);
+    //     goto argp_cleanup;
+    // }
 
-    result = dmesh_doca_dpa_thread_create(objs->dpa_thread);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to create DPA thread: %s", doca_error_get_descr(result));
-        cleanup_objects(objs);
-        goto argp_cleanup;
-    }
+    // result = dmesh_doca_dpa_thread_create(objs->dpa_thread);
+    // if (result != DOCA_SUCCESS) {
+    //     DOCA_LOG_ERR("Failed to create DPA thread: %s", doca_error_get_descr(result));
+    //     cleanup_objects(objs);
+    //     goto argp_cleanup;
+    // }
 
-    result = init_comch_dpa_msgq(objs, objs->producer_pe);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to init comch DPA datapath: %s", doca_error_get_descr(result));
-        cleanup_objects(objs);
-        goto argp_cleanup;
-    }
+    // result = init_comch_dpa_msgq(objs, objs->producer_pe);
+    // if (result != DOCA_SUCCESS) {
+    //     DOCA_LOG_ERR("Failed to init comch DPA datapath: %s", doca_error_get_descr(result));
+    //     cleanup_objects(objs);
+    //     goto argp_cleanup;
+    // }
 
     // result = setup_dpa_buf_array(objs, DMA_RING_SIZE, objs->local_mmap);
     // if (result != DOCA_SUCCESS) {
@@ -112,46 +120,38 @@ run_host_worker(struct objects *objs)
     // }
 
     int idx = 9999;
-    int pos = 0;
+    size_t pos = 0;
     struct dma_desc *desc;
-    // time_t prev, cur;
-    // time(&prev);
-    // desc = get_next_dma_desc(objs->dma_ring);
+
     doca_dpa_dev_mmap_t local_mmap;
-    doca_mmap_dev_get_dpa_handle(objs->local_mmap, objs->dev, &local_mmap);
-    struct timespec cur_ts, prev_ts;
-    // desc->mmap = local_mmap;
-    // desc->addr = (uint64_t)objs->dma_buffer + pos;
-    // desc->size = 64;
-    // desc->idx = idx++;
-    // desc->valid = 1;
-    // pos += 64;
-    clock_gettime(CLOCK_MONOTONIC, &prev_ts);
+    doca_mmap_dev_get_dpa_handle(objs->sndbuf.mmap, objs->dev, &local_mmap);
+    
     int msg_size = 8192;
     while (true) {
-        if (doca_pe_progress(objs->pe) == 0)
-            nanosleep(&ts, &ts);
+        // if (doca_pe_progress(objs->pe) == 0)
+            // nanosleep(&ts, &ts);
 
-        clock_gettime(CLOCK_MONOTONIC, &cur_ts);
         desc = get_next_dma_desc(objs->dma_ring);
         desc->mmap = local_mmap;
-        desc->addr = (uint64_t)objs->dma_buffer + pos;
+        desc->addr = (uint64_t)objs->sndbuf.buf + pos;
         *(uint32_t *)desc->addr = idx--;
-        desc->size = msg_size;
-        desc->valid = 1;
+        desc->size = (size_t)msg_size;
+        commit_dma_desc(objs->dma_ring);
         pos += msg_size;
-        if (pos >= BUFFER_SIZE) {
+        if (pos >= objs->sndbuf.size) {
             pos = 0;
         }
         // if (cur_ts.tv_nsec - prev_ts.tv_nsec >= 100) {
         //     prev_ts = cur_ts;
         // }
+        // break;
     }
+    // while(true) {
 
+    // };
     DOCA_LOG_INFO("Finished Host worker");
 
 argp_cleanup:
     clean_argp();
-exit: 
     return;
 }

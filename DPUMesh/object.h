@@ -5,12 +5,27 @@
 #include <doca_pe.h>
 #include <doca_comch.h>
 #include <doca_ctx.h>
+#include <doca_dma.h>
 
+#include <sys/queue.h>
+#include "buffer.h"
 #include "comch_server.h"
 
 struct dmesh_doca_dpa_thread;
 struct dmesh_doca_dpa_comch;
 struct dma_ring;
+struct objects;
+struct dma_task_entry {
+    struct objects *owner;
+    struct doca_dma_task_memcpy *task;
+    doca_error_t result;
+    bool in_free_queue;
+    bool in_submission_queue;
+    bool in_flight;
+    TAILQ_ENTRY(dma_task_entry) entries;
+};
+TAILQ_HEAD(dma_task_queue, dma_task_entry);
+
 typedef uint64_t doca_dpa_dev_comch_producer_t;
 typedef uint64_t doca_dpa_dev_completion_t;
 typedef uint64_t doca_dpa_dev_buf_arr_t;
@@ -36,6 +51,20 @@ struct objects {
     };
     struct doca_comch_connection *connection;
 
+    /* DOCA DMA related objects */
+    struct doca_dma *dma_ctx;
+    struct dma_task_entry *dma_task_entries;
+    int num_dma_tasks;
+    int num_free_dma_tasks;
+    int num_submission_dma_tasks;
+    struct dma_task_queue free_dma_tasks;       
+    struct dma_task_queue submission_dma_tasks;
+
+    /* DMesh application recv/send buffers */
+    struct dmesh_buffer sndbuf;
+    struct dmesh_buffer rcvbuf;
+
+    struct doca_buf_inventory *buf_inv;
     struct doca_mmap *local_mmap;
     struct doca_mmap *remote_mmap;
     void *dma_buffer;

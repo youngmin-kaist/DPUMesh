@@ -116,13 +116,21 @@ static void server_message_recv_callback(struct doca_comch_event_msg_recv *event
 
 	DOCA_LOG_INFO("Received message from client with type = %u", comch_msg->type);
 	switch (comch_msg->type) {
-	case DMESH_MSG_EXPORT_DESC:
+	case DMESH_MSG_EXPORT_RING:
 
-		if (msg_len <= sizeof(struct dmesh_mmap_msg)) {
-			DOCA_LOG_ERR("Received invalid MMAP message from client");
+		if (msg_len < sizeof(struct dmesh_export_ring_msg)) {
+			DOCA_LOG_ERR("Received invalid RING message from client");
 			return;
 		}
-		result = process_mmap_msg(objs, (struct dmesh_mmap_msg *)recv_buffer);
+		result = process_export_ring_msg(objs, (struct dmesh_export_ring_msg *)recv_buffer);
+		break;
+
+	case DMESH_MSG_EXPORT_BUFFER:
+		if (msg_len < sizeof(struct dmesh_export_buf_msg)) {
+			DOCA_LOG_ERR("Received invalid BUFFER message from client");
+			return;
+		}
+		result = process_export_buf_msg(objs, (struct dmesh_export_buf_msg *)recv_buffer);
 		break;
 	default:
 
@@ -349,15 +357,17 @@ start_comch_ctrl_path_server(const char *server_name, struct objects *objs, bool
 {
     doca_error_t result;
     struct doca_ctx *ctx;
-    union doca_data user_data;
+    union doca_data udata;
     uint32_t max_msg_size, max_rq_size;
 
 	/* create a progress engine */
-    result = doca_pe_create(&(objs->pe));
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed creating pe with error = %s", doca_error_get_name(result));
-        return result;
-    }
+	if (!objs->pe) {
+		result = doca_pe_create(&(objs->pe));
+		if (result != DOCA_SUCCESS) {
+			DOCA_LOG_ERR("Failed creating pe with error = %s", doca_error_get_name(result));
+			return result;
+		}
+	}
 
 	/* The event-driven driver arms this PE (doca_pe_request_notification). In the
 	 * default SELECTIVE event mode an armed PE only progresses contexts that
@@ -383,12 +393,6 @@ start_comch_ctrl_path_server(const char *server_name, struct objects *objs, bool
         DOCA_LOG_ERR("Failed adding pe context to server with error = %s", doca_error_get_name(result));
         goto destroy_server;
     }
-
-    // result = doca_ctx_set_state_changed_cb(ctx, server_state_changed_callback);
-    // if (result != DOCA_SUCCESS) {
-    //     DOCA_LOG_ERR("Failed setting state change callback with error = %s", doca_error_get_name(result));
-    //     goto destroy_server;
-    // }
 
     result = doca_comch_server_task_send_set_conf(objs->cc_server,
                 server_send_task_completion_callback,
@@ -448,8 +452,8 @@ start_comch_ctrl_path_server(const char *server_name, struct objects *objs, bool
         goto destroy_server;
     }
 
-    user_data.ptr = (void *)objs;
-    result = doca_ctx_set_user_data(ctx, user_data);
+    udata.ptr = (void *)objs;
+    result = doca_ctx_set_user_data(ctx, udata);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to set ctx user data with error = %s", doca_error_get_name(result));
         goto destroy_server;

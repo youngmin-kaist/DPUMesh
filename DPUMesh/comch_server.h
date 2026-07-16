@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <doca_comch.h>
 #include <doca_ctx.h>
+#include <doca_pe.h>
 
 struct objects; /* Forward declaration */
 struct dmesh_doca_objects; /* Forward declaration */

@@ -130,7 +130,6 @@ void expired_consumer_callback(struct doca_comch_event_consumer *event,
 void clean_comch_consumer(struct doca_comch_consumer *consumer, struct doca_pe *pe)
 {
 	doca_error_t result;
-
 	if (consumer != NULL) {
 		result = doca_comch_consumer_destroy(consumer);
 		if (result != DOCA_SUCCESS)
@@ -262,8 +261,7 @@ static void consumer_recv_task_comp_cb(struct doca_comch_consumer_task_post_recv
 		goto err_out;
 	}
 
-	// DOCA_LOG_INFO("Received message number: %d", i);
-	// DOCA_LOG_INFO("Message received: '%.*d'", (int)recv_msg_len, (char *)recv_msg);
+	DOCA_LOG_INFO("Message received: '%.*s'", (int)recv_msg_len, (char *)recv_msg);
 
 	/* reset data_len to receive data */
 	doca_buf_reset_data_len(buf);
@@ -326,7 +324,6 @@ static doca_error_t prepare_consumer_tasks(struct doca_comch_consumer *consumer,
 	struct doca_comch_consumer_task_post_recv *consumer_task;
 	struct doca_buf *buf;
 	struct doca_task *task_obj;
-	union doca_data user_data;
 	doca_error_t result;
 	int i;
 
@@ -423,12 +420,6 @@ init_comch_datapath_consumer(struct objects *objs)
         .ctx_user_data = objs,
         .ctx_state_changed_cb = consumer_state_changed_cb
     };
-	int i;
-
-	struct timespec last, now;
-	double elapsed;
-	clock_gettime(CLOCK_MONOTONIC, &last);
-    
     objs->consumer_mem = calloc(1, sizeof(struct local_mem_bufs));
     if (!objs->consumer_mem) {
         DOCA_LOG_ERR("Failed to allocate memory for consumer mem buffers");
@@ -469,11 +460,4 @@ init_comch_datapath_consumer(struct objects *objs)
 	} while (state != DOCA_CTX_STATE_RUNNING);
 
 	return DOCA_SUCCESS;
-err:
-	clean_comch_consumer(objs->consumer, objs->consumer_pe);
-	objs->consumer = NULL;
-	objs->consumer_pe = NULL;
-	clean_local_mem_bufs(cmem);
-	free(cmem);
-    return objs->consumer_result;
 }

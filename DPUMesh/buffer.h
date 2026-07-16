@@ -12,6 +12,12 @@
 
 #define CACHE_ALIGN 64 /* Cache line alignment for performance */
 
+struct dmesh_buffer {
+    struct doca_mmap *mmap;
+    void *buf;
+    size_t size;
+};
+
 enum buf_inv_type {
 	BUF_INV_TYPE_INVENTORY = 0,
 	BUF_INV_TYPE_POOL = 1
@@ -34,6 +40,8 @@ doca_error_t init_local_mem_bufs(struct local_mem_bufs *local, struct doca_dev *
 
 void clean_local_mem_bufs(struct local_mem_bufs *local);
 
+doca_error_t 
+init_dmesh_buffer(struct doca_dev *dev, struct dmesh_buffer *dmesh_buf, size_t buf_size);
 
 doca_error_t
 alloc_buffer_and_set_mmap(struct doca_mmap **mmap, struct doca_dev *dev,

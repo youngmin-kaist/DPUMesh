@@ -58,6 +58,12 @@ struct comch_msg {
 	};
 } __attribute__((__packed__, aligned(4)));
 
+struct dma_ring_ctrl {
+	volatile uint64_t producer_tail;
+	volatile uint64_t consumer_head;
+	uint8_t reserved[48];
+} __attribute__((aligned(64)));
+
 struct dma_desc {
 	doca_dpa_dev_mmap_t mmap; 	// 4B
 	uint64_t addr;			   // 8B

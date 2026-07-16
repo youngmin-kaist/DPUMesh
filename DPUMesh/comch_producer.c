@@ -104,7 +104,8 @@ static void producer_send_task_completion_err_callback(struct doca_comch_produce
  * @data_path [in]: CC data path resources
  * @return: DOCA_SUCCESS on success and DOCA_ERROR otherwise
  */
-static doca_error_t prepare_producer_tasks(struct doca_comch_producer *producer, struct local_mem_bufs *pmem,
+static doca_error_t __attribute__((unused))
+prepare_producer_tasks(struct doca_comch_producer *producer, struct local_mem_bufs *pmem,
 											uint32_t remote_consumer_id)
 {
 	struct doca_comch_producer_task_send *producer_task;
@@ -295,10 +296,6 @@ init_comch_datapath_producer(struct objects *objs)
         .tv_sec = 0,
         .tv_nsec = SLEEP_IN_NANOS,
     };
-	struct timespec last, now;
-	double elapsed;
-	clock_gettime(CLOCK_MONOTONIC, &last);
-
     struct comch_producer_cb_config producer_cb_cfg = {
         .send_task_comp_cb = producer_send_task_completion_callback,
         .send_task_comp_err_cb = producer_send_task_completion_err_callback,

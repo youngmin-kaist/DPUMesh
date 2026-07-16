@@ -5,13 +5,17 @@
 #include <doca_pe.h>
 #include <doca_comch.h>
 
+#include "dma.h"
+
 DOCA_LOG_REGISTER(OBJECT);
 
 void
 cleanup_objects(struct objects *objs)
 {
     doca_error_t result;
-    
+
+    cleanup_dma_tasks(objs);
+
     if (objs->cc_server) {
         result = doca_comch_server_destroy(objs->cc_server);
         if(result != DOCA_SUCCESS) {
