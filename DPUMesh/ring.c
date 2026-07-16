@@ -42,19 +42,9 @@ int setup_dma_ring(struct objects *objs, size_t size)
     memset(ring->buffer, 0, sizeof(struct dma_ring_ctrl) + ring->size * sizeof(struct dma_desc));
     ring->ctrl = (struct dma_ring_ctrl *)ring->buffer;
     ring->descs = (struct dma_desc *)((uint8_t *)ring->buffer + sizeof(struct dma_ring_ctrl));
-    
-    /* export mmap to DPU */
-    result = export_dma_ring(objs);
-    // result = export_mmap_to_remote(objs, ring->mmap,
-    //                                ring->buffer,
-    //                                sizeof(struct dma_ring_ctrl) + ring->size * sizeof(struct dma_desc),
-    //                                DMA_RING, HOST_TO_DPU);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to export mmap and buffer to DPU: %s", doca_error_get_descr(result));
-        free(objs->dma_ring);
-        destroy_mmap_and_free_buffer(ring->mmap, ring->buffer);
-        return result;
-    }
+
+    /* The ring metadata is exported to the DPU later, together with the
+     * send/receive buffers, in a single message (export_dma_metadata). */
     return 0;
 }
 

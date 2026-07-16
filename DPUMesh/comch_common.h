@@ -14,36 +14,29 @@ enum msg_direction {
 };
 
 enum dmesh_msg_type {
-    DMESH_MSG_EXPORT_BUFFER = 1,
-    DMESH_MSG_EXPORT_RING = 2,
-    DMESH_MSG_EXPORT_DPA_COMP = 3,
+    DMESH_MSG_EXPORT_METADATA = 1,
+    DMESH_MSG_EXPORT_DPA_COMP = 2,
 };
 
-enum mmap_type {
-    DMA_BUFFER = 1,
-    DMA_RING = 2,
-};
-
-struct dmesh_export_buf_msg {
+/* Single control-path message carrying all host-side DMA metadata: the DMA
+ * ring, the send buffer and the receive buffer (address, size and PCI export
+ * descriptor for each). Sent once by the host after all three are allocated. */
+struct dmesh_export_metadata_msg {
     enum dmesh_msg_type type;
-    enum mmap_type mmap_type;
-    void *rcvbuf;
+    /* DMA ring */
+    void *ring_buf;
+    size_t ring_buf_len;
+    size_t ring_desc_len;
+    /* send/receive DMA buffers */
     void *sndbuf;
-    size_t rcvbuf_len;
+    void *rcvbuf;
     size_t sndbuf_len;
-    size_t rcv_desc_len;
+    size_t rcvbuf_len;
     size_t snd_desc_len;
-    uint8_t rcv_desc[512];
+    size_t rcv_desc_len;
+    uint8_t ring_desc[512];
     uint8_t snd_desc[512];
-};
-
-struct dmesh_export_ring_msg {
-    enum dmesh_msg_type type;
-    enum mmap_type mmap_type;
-    void *buf;
-    size_t buf_len;
-    size_t desc_len;
-    uint8_t desc[512];
+    uint8_t rcv_desc[512];
 };
 
 typedef uint64_t doca_dpa_dev_comch_consumer_completion_t;
@@ -61,24 +54,17 @@ struct dmesh_dpa_comp_msg {
 
 struct dmesh_comch_msg {
     enum dmesh_msg_type type;
-    union 
+    union
     {
-        struct dmesh_export_buf_msg export_buf_msg;
-        struct dmesh_export_ring_msg export_ring_msg;
+        struct dmesh_export_metadata_msg export_metadata_msg;
         struct dmesh_dpa_comp_msg dpa_comp_msg;
     };
 };
 
 doca_error_t
-export_dma_buffer(struct objects *objs);
+export_dma_metadata(struct objects *objs);
 doca_error_t
-export_dma_ring(struct objects *objs);
-doca_error_t
-export_mmap_to_remote(struct objects *objs, struct doca_mmap *mmap, void *buffer, size_t buf_size, enum mmap_type mmap_type, enum msg_direction direction);
-doca_error_t
-process_export_ring_msg(struct objects *objs, struct dmesh_export_ring_msg *export_ring_msg);
-doca_error_t
-process_export_buf_msg(struct objects *objs, struct dmesh_export_buf_msg *export_buf_msg);
+process_export_metadata_msg(struct objects *objs, struct dmesh_export_metadata_msg *metadata_msg);
 doca_error_t
 process_dpa_comp_msg(struct objects *objs, struct dmesh_dpa_comp_msg *dpa_comp_msg);
 #endif // COMCH_COMMON_H

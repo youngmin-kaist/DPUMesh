@@ -63,20 +63,12 @@ run_host_worker(struct objects *objs)
         goto argp_cleanup;
     }
 
-    result = export_dma_buffer(objs);
+    /* export DMA ring + send/receive buffer metadata to DPU in one message */
+    result = export_dma_metadata(objs);
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to export DMA buffer: %s", doca_error_get_descr(result));
+        DOCA_LOG_ERR("Failed to export DMA metadata: %s", doca_error_get_descr(result));
         goto argp_cleanup;
     }
-
-    /* export DMA buffer mmap to DPU */
-    // result = export_mmap_to_remote(objs, objs->sndbuf.mmap, 
-    //                                objs->sndbuf.buf, objs->sndbuf.size, 
-    //                                DMA_BUFFER, HOST_TO_DPU);
-    // if (result != DOCA_SUCCESS) {
-    //     DOCA_LOG_ERR("Failed to export mmap and buffer to DPU: %s", doca_error_get_descr(result));
-    //     goto argp_cleanup;
-    // }
 
     // result = init_dpa_objects(objs);
     // if (result != DOCA_SUCCESS) {

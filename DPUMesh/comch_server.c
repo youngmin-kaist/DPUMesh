@@ -116,21 +116,12 @@ static void server_message_recv_callback(struct doca_comch_event_msg_recv *event
 
 	DOCA_LOG_INFO("Received message from client with type = %u", comch_msg->type);
 	switch (comch_msg->type) {
-	case DMESH_MSG_EXPORT_RING:
-
-		if (msg_len < sizeof(struct dmesh_export_ring_msg)) {
-			DOCA_LOG_ERR("Received invalid RING message from client");
+	case DMESH_MSG_EXPORT_METADATA:
+		if (msg_len < sizeof(struct dmesh_export_metadata_msg)) {
+			DOCA_LOG_ERR("Received invalid METADATA message from client");
 			return;
 		}
-		result = process_export_ring_msg(objs, (struct dmesh_export_ring_msg *)recv_buffer);
-		break;
-
-	case DMESH_MSG_EXPORT_BUFFER:
-		if (msg_len < sizeof(struct dmesh_export_buf_msg)) {
-			DOCA_LOG_ERR("Received invalid BUFFER message from client");
-			return;
-		}
-		result = process_export_buf_msg(objs, (struct dmesh_export_buf_msg *)recv_buffer);
+		result = process_export_metadata_msg(objs, (struct dmesh_export_metadata_msg *)recv_buffer);
 		break;
 	default:
 
@@ -680,10 +671,12 @@ dmesh_doca_ctrl_advance(struct objects *objs, enum dmesh_doca_init_state *out_st
 		break;
 
 	case DMESH_DOCA_STATE_AWAIT_REMOTE:
-		if (objs->ring_mmap == NULL || objs->remote_mmap == NULL)
-			break; /* not ready yet: awaiting host DMA_RING + DMA_BUFFER exports */
+		/* All three remote mmaps arrive in a single metadata message
+		 * (process_export_metadata_msg), so they become ready together. */
+		if (objs->ring_mmap == NULL || objs->sndbuf.mmap == NULL || objs->rcvbuf.mmap == NULL)
+			break; /* not ready yet: awaiting host metadata export */
 
-		DOCA_LOG_INFO("Received ring and remote mmaps; completing DPA setup");
+		DOCA_LOG_INFO("Received remote DMA metadata; completing DPA setup");
 
 		result = setup_dpa_buf_array(objs, DMA_RING_SIZE, objs->ring_mmap);
 		if (result != DOCA_SUCCESS) {
@@ -696,6 +689,12 @@ dmesh_doca_ctrl_advance(struct objects *objs, enum dmesh_doca_init_state *out_st
 						   DOCA_ACCESS_FLAG_PCI_READ_WRITE);
 		if (result != DOCA_SUCCESS) {
 			DOCA_LOG_ERR("Failed to allocate DMA buffer: %s", doca_error_get_name(result));
+			goto error;
+		}
+
+		result = init_dma_tasks(objs, 8192);
+		if (result != DOCA_SUCCESS) {
+			DOCA_LOG_ERR("Failed to init DMA tasks: %s", doca_error_get_name(result));
 			goto error;
 		}
 
