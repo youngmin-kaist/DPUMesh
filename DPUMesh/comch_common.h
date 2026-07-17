@@ -18,11 +18,26 @@ enum dmesh_msg_type {
     DMESH_MSG_EXPORT_DPA_COMP = 2,
 };
 
+/* Identity of the flow carried by a dmesh connection. The DMA path has no
+ * TCP/IP headers, so what the kernel used to provide on a TCP accept (peer
+ * address) and what iptables interception used to provide (original
+ * destination) must be conveyed explicitly by the host shim.
+ * ips/ports are little-endian host order (both PCIe endpoints are LE). */
+struct dmesh_flow_id {
+    uint32_t src_ip;
+    uint32_t dst_ip;            /* ORIGINAL destination (pre-rewrite) */
+    uint16_t src_port;
+    uint16_t dst_port;
+    char src_workload[64];      /* source workload identity (pod/SA), NUL-terminated */
+};
+
 /* Single control-path message carrying all host-side DMA metadata: the DMA
  * ring, the send buffer and the receive buffer (address, size and PCI export
- * descriptor for each). Sent once by the host after all three are allocated. */
+ * descriptor for each), plus the flow identity. Sent once by the host after
+ * the flow is opened and all buffers are allocated. */
 struct dmesh_export_metadata_msg {
     enum dmesh_msg_type type;
+    struct dmesh_flow_id flow;
     /* DMA ring */
     void *ring_buf;
     size_t ring_buf_len;

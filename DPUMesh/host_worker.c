@@ -19,6 +19,7 @@
 #include <doca_dpa.h>
 #include <time.h>
 #include <pthread.h>
+#include <arpa/inet.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -179,6 +180,18 @@ host_worker_thread(void *arg)
         free(objs);
         return NULL;
     }
+
+    /* Flow identity for this worker's connection. A real host shim fills
+     * this from the intercepted pod flow; the benchmark synthesizes it
+     * (destination overridable via DMESH_DST_IP / DMESH_DST_PORT). */
+    const char *dst_ip_env = getenv("DMESH_DST_IP");
+    const char *dst_port_env = getenv("DMESH_DST_PORT");
+    objs->flow.src_ip = inet_addr("127.0.0.1");
+    objs->flow.src_port = (uint16_t)(40000 + ctx->idx);
+    objs->flow.dst_ip = inet_addr(dst_ip_env != NULL ? dst_ip_env : "127.0.0.1");
+    objs->flow.dst_port = (uint16_t)(dst_port_env != NULL ? atoi(dst_port_env) : 8080);
+    snprintf(objs->flow.src_workload, sizeof(objs->flow.src_workload),
+             "host-worker-%d", ctx->idx);
 
     /* spread connections across the DPU worker servers round-robin */
     int num_dpu_workers = ctx->gcfg->num_dpu_workers > 0 ? ctx->gcfg->num_dpu_workers : 1;

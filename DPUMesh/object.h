@@ -10,6 +10,7 @@
 #include <sys/queue.h>
 #include "buffer.h"
 #include "comch_server.h"
+#include "comch_common.h"
 
 struct dmesh_doca_dpa_thread;
 struct dmesh_doca_dpa_comch;
@@ -71,6 +72,9 @@ struct dmesh_conn {
     struct doca_comch_consumer *consumer;
     uint32_t remote_consumer_id;
 
+    /* flow identity received in the metadata message */
+    struct dmesh_flow_id flow;
+
     /* remote metadata from this connection's host */
     struct doca_mmap *ring_mmap;
     struct dmesh_buffer sndbuf;
@@ -121,6 +125,10 @@ struct objects {
     /* DMesh application recv/send buffers */
     struct dmesh_buffer sndbuf;
     struct dmesh_buffer rcvbuf;
+
+    /* (host side) identity of the flow this worker carries; copied into the
+     * metadata message by export_dma_metadata */
+    struct dmesh_flow_id flow;
 
     struct doca_mmap *local_mmap;
     struct doca_mmap *remote_mmap;

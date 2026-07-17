@@ -37,6 +37,7 @@ export_dma_metadata(struct objects *objs)
     }
 
     msg->type = DMESH_MSG_EXPORT_METADATA;
+    msg->flow = objs->flow;
 
     /* DMA ring */
     result = doca_mmap_export_pci(objs->dma_ring->mmap, objs->dev, &export_desc, &export_desc_len);
@@ -92,11 +93,20 @@ process_export_metadata_msg(struct dmesh_conn *conn, struct dmesh_export_metadat
     struct objects *objs = conn->objs;
     doca_error_t result;
 
-    DOCA_LOG_INFO("Received export metadata message: ring_buf=%p, ring_buf_len=%zu, "
-                  "sndbuf=%p, sndbuf_len=%zu, rcvbuf=%p, rcvbuf_len=%zu",
+    conn->flow = metadata_msg->flow;
+    conn->flow.src_workload[sizeof(conn->flow.src_workload) - 1] = '\0';
+
+    DOCA_LOG_INFO("Received export metadata message: flow %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u (%s), "
+                  "ring_buf=%p, ring_buf_len=%zu, sndbuf_len=%zu, rcvbuf_len=%zu",
+                  conn->flow.src_ip & 0xff, (conn->flow.src_ip >> 8) & 0xff,
+                  (conn->flow.src_ip >> 16) & 0xff, (conn->flow.src_ip >> 24) & 0xff,
+                  conn->flow.src_port,
+                  conn->flow.dst_ip & 0xff, (conn->flow.dst_ip >> 8) & 0xff,
+                  (conn->flow.dst_ip >> 16) & 0xff, (conn->flow.dst_ip >> 24) & 0xff,
+                  conn->flow.dst_port,
+                  conn->flow.src_workload,
                   metadata_msg->ring_buf, metadata_msg->ring_buf_len,
-                  metadata_msg->sndbuf, metadata_msg->sndbuf_len,
-                  metadata_msg->rcvbuf, metadata_msg->rcvbuf_len);
+                  metadata_msg->sndbuf_len, metadata_msg->rcvbuf_len);
 
     /* DMA ring */
     result = doca_mmap_create_from_export(NULL, metadata_msg->ring_desc,
