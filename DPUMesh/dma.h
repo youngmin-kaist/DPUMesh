@@ -13,6 +13,9 @@ struct doca_dma_task_memcpy;
 /* Size of the local DMA buffer allocated on the DPU for PCI export. */
 #define BUFFER_SIZE (1024 * 1024)
 
+/* DMA memcpy tasks allocated for each connection's private DMA engine */
+#define DMA_TASKS_PER_CONN 2048
+
 doca_error_t
 alloc_buffer_and_set_mmap(struct doca_mmap **mmap, struct doca_dev *dev,
                         void **buffer, size_t buffer_size, uint32_t access_mask);
@@ -20,40 +23,57 @@ alloc_buffer_and_set_mmap(struct doca_mmap **mmap, struct doca_dev *dev,
 doca_error_t
 init_dma_resources(struct objects *objs);
 
+/* Create this connection's private DMA engine: doca_dma ctx (own QP, connected
+ * to the shared consumer PE), buf inventory and task pool. */
 doca_error_t
-init_dma_tasks(struct objects *objs, int num_tasks);
+init_dma_tasks(struct dmesh_conn *conn, int num_tasks);
 
 void
-cleanup_dma_tasks(struct objects *objs);
+cleanup_dma_tasks(struct dmesh_conn *conn);
 
 doca_error_t
-submit_dma_task(struct objects *objs, const struct doca_buf *src, struct doca_buf *dst);
+submit_dma_task(struct dmesh_conn *conn, const struct doca_buf *src, struct doca_buf *dst);
 
 doca_error_t
-enqueue_dma_task(struct objects *objs, const struct doca_buf *src, struct doca_buf *dst);
+enqueue_dma_task(struct dmesh_conn *conn, const struct doca_buf *src, struct doca_buf *dst);
 
 /* Submit up to max_tasks queued tasks. A max_tasks value of zero processes the entire queue. */
 doca_error_t
-progress_dma_submission_queue(struct objects *objs, int max_tasks, int *num_submitted);
+progress_dma_submission_queue(struct dmesh_conn *conn, int max_tasks, int *num_submitted);
 
 struct doca_dma_task_memcpy *
-get_free_dma_task(struct objects *objs);
+get_free_dma_task(struct dmesh_conn *conn);
 
 doca_error_t
-put_free_dma_task(struct objects *objs, struct doca_dma_task_memcpy *dma_task);
+put_free_dma_task(struct dmesh_conn *conn, struct doca_dma_task_memcpy *dma_task);
 
 struct doca_dma_task_memcpy *
-get_submission_dma_task(struct objects *objs);
+get_submission_dma_task(struct dmesh_conn *conn);
 
 doca_error_t
-put_submission_dma_task(struct objects *objs, struct doca_dma_task_memcpy *dma_task);
+put_submission_dma_task(struct dmesh_conn *conn, struct doca_dma_task_memcpy *dma_task);
 
 int
-get_num_free_dma_tasks(const struct objects *objs);
+get_num_free_dma_tasks(const struct dmesh_conn *conn);
 
 int
-get_num_submission_dma_tasks(const struct objects *objs);
+get_num_submission_dma_tasks(const struct dmesh_conn *conn);
 
 doca_error_t
 send_dma_request_to_dpa(struct dmesh_conn *conn);
+
+/* Submit the second-stage copy (connection staging buffer -> rcvbuf) as a DMA
+ * task. Returns DOCA_ERROR_AGAIN when all DMA tasks are in flight (nothing is
+ * leaked); other errors are non-retryable. */
+doca_error_t
+dmesh_dma_copy_to_rcvbuf(struct dmesh_conn *conn, uint32_t pos, uint32_t length);
+
+/* Queue a copy that found no free DMA task on this connection; retried as
+ * tasks complete. Drops (counted) if the connection's pending ring is full. */
+void
+dmesh_dma_defer_copy(struct dmesh_conn *conn, uint32_t pos, uint32_t length);
+
+/* Submit as many of this connection's deferred copies as task capacity allows */
+void
+dmesh_dma_pending_drain(struct dmesh_conn *conn);
 #endif  /* DMA_H_ */

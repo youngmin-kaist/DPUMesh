@@ -51,7 +51,6 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
     switch (msg->type) {
         case COMCH_MSG_TYPE_DMA_COMPLETED:
             struct comch_dma_comp_msg *comp_msg = (struct comch_dma_comp_msg *)msg;
-            struct doca_buf *sbuf = NULL, *dbuf = NULL;
             void *mmap_addr = NULL;
             size_t mmap_len = 0;
             const size_t dst_offset = 10000;
@@ -75,57 +74,16 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
                 break;
             }
             
-            /* For src doca buffer, data len must be specified */
-            result = doca_buf_inventory_buf_get_by_data(objs->buf_inv,
-                                               conn->local_mmap,
-                                               conn->dma_buffer + comp_msg->pos,
-                                               comp_msg->length,
-                                               &sbuf);
-
-            if (result != DOCA_SUCCESS) {
-                DOCA_LOG_ERR("Failed to get buffer from inventory by addr: %s", doca_error_get_descr(result));
-                break;
-            }
-            // DOCA_LOG_INFO("[sbuf] mmap: %p, buf: %p, pos: %u, length: %lu", 
-            //         objs->local_mmap, objs->dma_buffer, comp_msg->pos, (unsigned long)comp_msg->length);
-
-            /* For dst doca buffer, data is copied to the tail segment */
-            result = doca_buf_inventory_buf_get_by_addr(objs->buf_inv,
-                                               conn->rcvbuf.mmap,
-                                               conn->rcvbuf.buf,
-                                               comp_msg->length,
-                                               &dbuf);
-            if (result != DOCA_SUCCESS) {
-                DOCA_LOG_ERR("Failed to get buffer from inventory by addr: %s", doca_error_get_descr(result));
-                (void)doca_buf_dec_refcount(sbuf, NULL);
-                break;
-            }
-            // DOCA_LOG_INFO("[dbuf] mmap: %p, buf: %p, offset: %zu, length: %lu",
-            //         objs->rcvbuf.mmap, objs->rcvbuf.buf, 0, (unsigned long)comp_msg->length);
-            
-            if (get_num_free_dma_tasks(objs) == 0) {
-                DOCA_LOG_ERR("Failed to get free DMA task for completed message");
-                (void)doca_buf_dec_refcount(dbuf, NULL);
-                (void)doca_buf_dec_refcount(sbuf, NULL);
-                break;
-            }
-
-            result = submit_dma_task(objs, sbuf, dbuf);
-            if (result != DOCA_SUCCESS) {
-                DOCA_LOG_ERR("Failed to submit DMA task for completed message: %s",
+            result = dmesh_dma_copy_to_rcvbuf(conn, comp_msg->pos, comp_msg->length);
+            if (result == DOCA_ERROR_AGAIN) {
+                /* All DMA tasks are in flight (inflow from multiple connections
+                 * exceeds DMA completion rate): defer the copy; it is retried
+                 * from the DMA completion callback as tasks free up. */
+                dmesh_dma_defer_copy(conn, comp_msg->pos, comp_msg->length);
+            } else if (result != DOCA_SUCCESS) {
+                DOCA_LOG_ERR("Failed to submit DMA copy for completed message: %s",
                              doca_error_get_descr(result));
-                /* On DOCA_ERROR_AGAIN the bufs were never attached to a task, so
-                 * they are still ours to release. On any other failure
-                 * submit_dma_task already returned the task via
-                 * put_free_dma_task, which released both bufs. */
-                if (result == DOCA_ERROR_AGAIN) {
-                    (void)doca_buf_dec_refcount(dbuf, NULL);
-                    (void)doca_buf_dec_refcount(sbuf, NULL);
-                }
-                break;
             }
-            // DOCA_LOG_INFO("Submitted DMA task for completed message");
-            
             break;
         default:
             DOCA_LOG_ERR("Received unknown message type: %u", msg->type);

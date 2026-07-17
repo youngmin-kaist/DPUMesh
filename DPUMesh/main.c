@@ -65,6 +65,7 @@ int main(int argc, char **argv)
     gcfg.mode = HOST_MODE;
 #endif
     gcfg.num_threads = 1;
+    gcfg.num_dpu_workers = 1;
 
     /* parse cmdline arguments */
     result = init_argp(NULL, &gcfg, argc, argv);
@@ -98,12 +99,9 @@ int main(int argc, char **argv)
         /* one thread per connection; count set via -t/--threads */
         run_host_workers(&gcfg);
     } else {
-        /* Event-driven (on-demand) control path. Set DPUMESH_BUSY_POLL=1 to run
-         * the original busy-poll worker for comparison. */
-        if (getenv("DPUMESH_BUSY_POLL") != NULL)
-            run_dpu_worker(&objs);
-        else
-            run_dpu_worker_event_driven(&objs);
+        /* shared-nothing worker threads, one comch server each (-t/--threads).
+         * Set DPUMESH_BUSY_POLL=1 to run the busy-poll variant for comparison. */
+        run_dpu_workers(&gcfg);
     }
         
 //     result = init_comch_ctrl_path_server("DPUMesh", &objs, true);

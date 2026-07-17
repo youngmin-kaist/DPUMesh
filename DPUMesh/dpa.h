@@ -10,7 +10,8 @@
 
 #define CC_DPA_MAX_MSG_NUM  512
 
-/* Number of DPA threads pre-created at startup and handed out per connection */
+/* Number of DPA threads pre-created per DPU worker thread and handed out per
+ * connection (each worker owns a private pool - shared-nothing design) */
 #define DPA_THREAD_POOL_SIZE 8
 
 struct objects;

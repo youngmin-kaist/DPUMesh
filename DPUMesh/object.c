@@ -72,8 +72,11 @@ void
 cleanup_objects(struct objects *objs)
 {
     doca_error_t result;
+    int i;
 
-    cleanup_dma_tasks(objs);
+    /* tear down each connection's private DMA engine */
+    for (i = 0; i < DMESH_MAX_CONNECTIONS; i++)
+        cleanup_dma_tasks(&objs->conns[i]);
 
     if (objs->cc_server) {
         result = doca_comch_server_destroy(objs->cc_server);

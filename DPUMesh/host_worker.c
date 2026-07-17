@@ -19,6 +19,7 @@
 #include <doca_dpa.h>
 #include <time.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -26,14 +27,14 @@
 
 DOCA_LOG_REGISTER(HOST_WORKER);
 void
-run_host_worker(struct objects *objs)
+run_host_worker(struct objects *objs, const char *server_name)
 {
     doca_error_t result;
 
-    DOCA_LOG_INFO("Starting Host worker");
+    DOCA_LOG_INFO("Starting Host worker, connecting to server '%s'", server_name);
 
     /* initialize DOCA Comch client objects */
-    result = init_comch_ctrl_path_client("DPUMesh", objs, true);
+    result = init_comch_ctrl_path_client(server_name, objs, true);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to init comch control path client: %s", doca_error_get_descr(result));
         cleanup_objects(objs);
@@ -162,6 +163,7 @@ host_worker_thread(void *arg)
 {
     struct host_worker_thread_ctx *ctx = arg;
     struct objects *objs;
+    char server_name[32];
     doca_error_t result;
 
     objs = calloc(1, sizeof(*objs));
@@ -178,8 +180,12 @@ host_worker_thread(void *arg)
         return NULL;
     }
 
-    DOCA_LOG_INFO("worker %d: connecting to DPU", ctx->idx);
-    run_host_worker(objs);
+    /* spread connections across the DPU worker servers round-robin */
+    int num_dpu_workers = ctx->gcfg->num_dpu_workers > 0 ? ctx->gcfg->num_dpu_workers : 1;
+    snprintf(server_name, sizeof(server_name), "DPUMesh%d", ctx->idx % num_dpu_workers);
+
+    DOCA_LOG_INFO("worker %d: connecting to DPU server '%s'", ctx->idx, server_name);
+    run_host_worker(objs, server_name);
 
     /* run_host_worker only returns on error (the data loop never exits) */
     DOCA_LOG_ERR("worker %d: exited", ctx->idx);

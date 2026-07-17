@@ -678,8 +678,15 @@ dmesh_doca_conn_advance(struct dmesh_conn *conn)
 			goto error;
 		}
 
-		DOCA_LOG_INFO("Setting up datapath consumer and DPA msgq for connection %p",
+		DOCA_LOG_INFO("Setting up DMA engine, datapath consumer and DPA msgq for connection %p",
 			      (void *)conn->connection);
+
+		/* private DMA engine (own QP + task pool) for this connection */
+		result = init_dma_tasks(conn, DMA_TASKS_PER_CONN);
+		if (result != DOCA_SUCCESS) {
+			DOCA_LOG_ERR("Failed to init DMA tasks: %s", doca_error_get_name(result));
+			goto error;
+		}
 
 		result = init_comch_datapath_consumer(conn);
 		if (result != DOCA_SUCCESS) {
@@ -784,11 +791,7 @@ dmesh_doca_ctrl_advance(struct objects *objs, enum dmesh_doca_init_state *out_st
 			goto error;
 		}
 
-		result = init_dma_tasks(objs, 8192);
-		if (result != DOCA_SUCCESS) {
-			DOCA_LOG_ERR("Failed to init DMA tasks: %s", doca_error_get_name(result));
-			goto error;
-		}
+		/* DMA engines are per connection now (created in DMESH_CONN_NEW) */
 
 		objs->phase = DMESH_DOCA_STATE_RUNNING;
 	}

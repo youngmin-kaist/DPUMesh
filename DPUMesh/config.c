@@ -48,6 +48,20 @@ static doca_error_t num_threads_callback(void *param, void *config)
     return DOCA_SUCCESS;
 }
 
+static doca_error_t num_dpu_workers_callback(void *param, void *config)
+{
+    struct global_config *gcfg = (struct global_config *)config;
+    int num_dpu_workers = *(int *)param;
+
+    if (num_dpu_workers <= 0) {
+        DOCA_LOG_ERR("Number of DPU workers must be greater than zero");
+        return DOCA_ERROR_INVALID_VALUE;
+    }
+
+    gcfg->num_dpu_workers = num_dpu_workers;
+    return DOCA_SUCCESS;
+}
+
 static doca_error_t rep_pci_addr_callback(void *param, void *config)
 {
 	struct global_config *gcfg = (struct global_config *)config;
@@ -72,7 +86,8 @@ doca_error_t
 init_argp(const char *program_name, void *config, int argc, char **argv)
 {
     doca_error_t result;
-    struct doca_argp_param *dev_pci_addr_param, *rep_pci_addr_param, *num_threads_param;
+    struct doca_argp_param *dev_pci_addr_param, *rep_pci_addr_param, *num_threads_param,
+                           *num_dpu_workers_param;
 
     result = doca_argp_init(program_name, config);
     if (result != DOCA_SUCCESS) {
@@ -127,6 +142,23 @@ init_argp(const char *program_name, void *config, int argc, char **argv)
     doca_argp_param_set_callback(num_threads_param, num_threads_callback);
     doca_argp_param_set_type(num_threads_param, DOCA_ARGP_TYPE_INT);
     result = doca_argp_register_param(num_threads_param);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to register program param: %s", doca_error_get_descr(result));
+        goto exit;
+    }
+
+    result = doca_argp_param_create(&num_dpu_workers_param);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to create ARGP param: %s", doca_error_get_descr(result));
+        goto exit;
+    }
+    doca_argp_param_set_short_name(num_dpu_workers_param, "d");
+    doca_argp_param_set_long_name(num_dpu_workers_param, "dpu-workers");
+    doca_argp_param_set_description(num_dpu_workers_param,
+                    "(host only) Number of DPU worker servers to spread connections over (default 1)");
+    doca_argp_param_set_callback(num_dpu_workers_param, num_dpu_workers_callback);
+    doca_argp_param_set_type(num_dpu_workers_param, DOCA_ARGP_TYPE_INT);
+    result = doca_argp_register_param(num_dpu_workers_param);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to register program param: %s", doca_error_get_descr(result));
         goto exit;

@@ -1,5 +1,6 @@
 #include "object.h"
 #include "comch_server.h"
+#include "common.h"
 #include "dpa.h"
 #include "comch_consumer.h"
 #include "comch_common.h"
@@ -16,6 +17,9 @@
 #include <errno.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 DOCA_LOG_REGISTER(DPU_WORKER);
 
@@ -29,14 +33,28 @@ report_throughput(struct objects *objs, struct timespec *last)
     elapsed = (now.tv_sec - last->tv_sec) +
               (now.tv_nsec - last->tv_nsec) / 1e9;
     if (elapsed >= 1.0) {
-        if (objs->sent_msg_cnt > 0 || objs->recv_msg_cnt > 0)
-            DOCA_LOG_INFO("elapsed: %.2f, sent: %d/s, recv: %d/s",
-                          elapsed, objs->sent_msg_cnt, objs->recv_msg_cnt);
+        if (objs->sent_msg_cnt > 0 || objs->recv_msg_cnt > 0) {
+            int pending = 0;
+            long dropped = 0;
+            int i;
+
+            for (i = 0; i < DMESH_MAX_CONNECTIONS; i++) {
+                pending += objs->conns[i].dma_pending_cnt;
+                dropped += objs->conns[i].dma_dropped_copies;
+            }
+            DOCA_LOG_INFO("[worker %d] elapsed: %.2f, sent: %d/s, recv: %d/s, dma_pending: %d, dma_dropped: %ld",
+                          objs->worker_idx, elapsed, objs->sent_msg_cnt, objs->recv_msg_cnt,
+                          pending, dropped);
+        }
         objs->sent_msg_cnt = 0;
         objs->recv_msg_cnt = 0;
         *last = now;
     }
 }
+
+/* Max consumer-PE events processed per loop iteration. Bounds the drain so the
+ * throughput report and control-path advance still run under sustained load. */
+#define DATA_DRAIN_BUDGET 8192
 
 /*
  * Baseline (busy-poll) DPU worker.
@@ -47,16 +65,16 @@ report_throughput(struct objects *objs, struct timespec *last)
  * own state machine by dmesh_doca_ctrl_advance(). Both PEs are busy-polled.
  */
 void
-run_dpu_worker(struct objects *objs)
+run_dpu_worker(struct objects *objs, const char *server_name)
 {
     doca_error_t result;
     enum dmesh_doca_init_state state;
     struct timespec last;
 
-    DOCA_LOG_INFO("Starting DPU worker (busy-poll)");
+    DOCA_LOG_INFO("Starting DPU worker %d (busy-poll), server '%s'", objs->worker_idx, server_name);
 
     /* start the control-path server (non-blocking; creates objs->pe) */
-    result = start_comch_ctrl_path_server("DPUMesh", objs, true);
+    result = start_comch_ctrl_path_server(server_name, objs, true);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to start comch control path server: %s", doca_error_get_descr(result));
         cleanup_objects(objs);
@@ -84,7 +102,7 @@ run_dpu_worker(struct objects *objs)
     }
 
 argp_cleanup:
-    clean_argp();
+    return;
 }
 
 /*
@@ -99,7 +117,7 @@ argp_cleanup:
  * via FFI.
  */
 void
-run_dpu_worker_event_driven(struct objects *objs)
+run_dpu_worker_event_driven(struct objects *objs, const char *server_name)
 {
     doca_error_t result;
     enum dmesh_doca_init_state state;
@@ -107,10 +125,10 @@ run_dpu_worker_event_driven(struct objects *objs)
     struct epoll_event ev;
     struct timespec last;
 
-    DOCA_LOG_INFO("Starting DPU worker (event-driven)");
+    DOCA_LOG_INFO("Starting DPU worker %d (event-driven), server '%s'", objs->worker_idx, server_name);
 
     /* Start the control-path server without blocking on the host connection. */
-    result = start_comch_ctrl_path_server("DPUMesh", objs, true);
+    result = start_comch_ctrl_path_server(server_name, objs, true);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to start comch control path server: %s", doca_error_get_descr(result));
         cleanup_objects(objs);
@@ -165,6 +183,8 @@ run_dpu_worker_event_driven(struct objects *objs)
 
     clock_gettime(CLOCK_MONOTONIC, &last);
     while (true) {
+        int drained;
+
         /* Arm first so events pending now (or arriving during the drain below)
          * signal the fds; then process everything currently ready without
          * blocking. This closes the race where a setup step's internal
@@ -185,8 +205,14 @@ run_dpu_worker_event_driven(struct objects *objs)
             DOCA_LOG_ERR("Failed to drain control PE: %s", doca_error_get_descr(result));
             goto fail;
         }
-        while (doca_pe_progress(objs->consumer_pe) != 0)
-            ;
+
+        /* Bounded data-path drain: under sustained load the consumer PE always
+         * has more work, so an unbounded drain-to-zero would starve the
+         * throughput report and the control path. */
+        for (drained = 0; drained < DATA_DRAIN_BUDGET; drained++) {
+            if (doca_pe_progress(objs->consumer_pe) == 0)
+                break;
+        }
 
         result = dmesh_doca_ctrl_advance(objs, &state);
         if (result != DOCA_SUCCESS || state == DMESH_DOCA_STATE_ERROR) {
@@ -196,7 +222,12 @@ run_dpu_worker_event_driven(struct objects *objs)
 
         report_throughput(objs, &last);
 
-        /* Sleep until either PE signals the next event. */
+        /* Budget exhausted means more data-path work is pending: loop again
+         * without sleeping (stats and control path still ran above). */
+        if (drained >= DATA_DRAIN_BUDGET)
+            continue;
+
+        /* Idle: sleep until either PE signals the next event. */
         if (epoll_wait(epfd, &ev, 1, -1) < 0) {
             if (errno == EINTR)
                 continue;
@@ -215,12 +246,109 @@ run_dpu_worker_event_driven(struct objects *objs)
             DOCA_LOG_ERR("Failed to clear consumer PE notification: %s", doca_error_get_descr(result));
             goto fail;
         }
-        while (doca_pe_progress(objs->consumer_pe) != 0)
-            ;
-        /* Connection state machines advance at the top of the next iteration. */
+        /* Work is processed by the bounded drain at the top of the next
+         * iteration (arming in PROGRESS_ALL mode clears prior notifications). */
     }
 
 fail:
     close(epfd);
     cleanup_objects(objs);
+}
+
+struct dpu_worker_thread_ctx {
+    const struct global_config *gcfg;
+    int idx;
+};
+
+/*
+ * One DPU worker thread: fully shared-nothing. Opens its own device and
+ * representor handles, runs its own comch server ("DPUMesh<idx>"), owns its
+ * own control/consumer PEs, DPA instance + thread pool and connection slots.
+ * No DOCA object is shared across worker threads, so no locking is needed.
+ */
+static void *
+dpu_worker_thread(void *arg)
+{
+    struct dpu_worker_thread_ctx *ctx = arg;
+    struct objects *objs;
+    char server_name[32];
+    doca_error_t result;
+
+    objs = calloc(1, sizeof(*objs));
+    if (objs == NULL) {
+        DOCA_LOG_ERR("worker %d: failed to allocate objects", ctx->idx);
+        return NULL;
+    }
+    objs->worker_idx = ctx->idx;
+
+    result = open_doca_device_with_pci(ctx->gcfg->dev_pci_addr, NULL, &objs->dev);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("worker %d: failed to open DOCA device: %s",
+                     ctx->idx, doca_error_get_descr(result));
+        free(objs);
+        return NULL;
+    }
+
+    result = open_doca_device_rep_with_pci(objs->dev,
+                                           DOCA_DEVINFO_REP_FILTER_NET,
+                                           ctx->gcfg->dev_rep_pci_addr,
+                                           &objs->rep_dev);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("worker %d: failed to open DOCA device representor: %s",
+                     ctx->idx, doca_error_get_descr(result));
+        doca_dev_close(objs->dev);
+        free(objs);
+        return NULL;
+    }
+
+    snprintf(server_name, sizeof(server_name), "DPUMesh%d", ctx->idx);
+
+    if (getenv("DPUMESH_BUSY_POLL") != NULL)
+        run_dpu_worker(objs, server_name);
+    else
+        run_dpu_worker_event_driven(objs, server_name);
+
+    /* workers only return on error */
+    DOCA_LOG_ERR("worker %d: exited", ctx->idx);
+    free(objs);
+    return NULL;
+}
+
+void
+run_dpu_workers(const struct global_config *gcfg)
+{
+    pthread_t *threads;
+    struct dpu_worker_thread_ctx *ctxs;
+    int num_threads = gcfg->num_threads > 0 ? gcfg->num_threads : 1;
+    int i;
+
+    DOCA_LOG_INFO("Starting %d DPU worker thread(s); servers DPUMesh0..DPUMesh%d, "
+                  "%d connections and %d DPA threads each",
+                  num_threads, num_threads - 1,
+                  DMESH_MAX_CONNECTIONS, DPA_THREAD_POOL_SIZE);
+
+    threads = calloc(num_threads, sizeof(*threads));
+    ctxs = calloc(num_threads, sizeof(*ctxs));
+    if (threads == NULL || ctxs == NULL) {
+        DOCA_LOG_ERR("Failed to allocate DPU worker thread state");
+        free(threads);
+        free(ctxs);
+        return;
+    }
+
+    for (i = 0; i < num_threads; i++) {
+        ctxs[i].gcfg = gcfg;
+        ctxs[i].idx = i;
+        if (pthread_create(&threads[i], NULL, dpu_worker_thread, &ctxs[i]) != 0) {
+            DOCA_LOG_ERR("Failed to create DPU worker thread %d", i);
+            break;
+        }
+    }
+
+    /* workers run forever; join blocks unless a worker errors out */
+    for (i = i - 1; i >= 0; i--)
+        pthread_join(threads[i], NULL);
+
+    free(threads);
+    free(ctxs);
 }

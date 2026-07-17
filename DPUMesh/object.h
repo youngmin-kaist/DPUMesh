@@ -16,8 +16,9 @@ struct dmesh_doca_dpa_comch;
 struct dmesh_dpa_thread_pool;
 struct dma_ring;
 struct objects;
+struct dmesh_conn;
 struct dma_task_entry {
-    struct objects *owner;
+    struct dmesh_conn *owner;
     struct doca_dma_task_memcpy *task;
     doca_error_t result;
     bool in_free_queue;
@@ -33,7 +34,8 @@ typedef uint64_t doca_dpa_dev_buf_arr_t;
 
 #define MAX_CONSUMERS 16
 
-/* Keep in sync with DPA_THREAD_POOL_SIZE (dpa.h): one DPA thread per connection */
+/* Keep in sync with DPA_THREAD_POOL_SIZE (dpa.h): one DPA thread per connection.
+ * This is the per-worker-thread limit; total = num_threads x this. */
 #define DMESH_MAX_CONNECTIONS 8
 
 /* Per-connection init state, advanced by dmesh_doca_ctrl_advance() */
@@ -44,6 +46,15 @@ enum dmesh_conn_state {
     DMESH_CONN_RUNNING,            /* DPA thread running, DMA request sent */
     DMESH_CONN_ERROR,              /* a setup step failed; slot parked */
 };
+
+/* A second-stage copy (staging buffer -> rcvbuf) deferred because all of this
+ * connection's DMA tasks were in flight. Retried as tasks complete
+ * (dmesh_dma_pending_drain). */
+struct dma_pending_copy {
+    uint32_t pos;
+    uint32_t length;
+};
+#define DMA_PENDING_MAX 8192
 
 /* All DPU-side state owned by one host connection. The shared infrastructure
  * (device, PEs, comch server, DPA instance/pool, DMA engine) stays in
@@ -68,6 +79,23 @@ struct dmesh_conn {
     struct doca_buf_arr *buf_arr;
     struct doca_mmap *local_mmap;             /* local DMA staging buffer */
     void *dma_buffer;
+
+    /* Per-connection DMA engine: own doca_dma ctx (own QP) + task pool +
+     * buf inventory, so connections cannot starve each other's copies. */
+    struct doca_dma *dma_ctx;
+    struct doca_buf_inventory *buf_inv;
+    struct dma_task_entry *dma_task_entries;
+    int num_dma_tasks;
+    int num_free_dma_tasks;
+    int num_submission_dma_tasks;
+    struct dma_task_queue free_dma_tasks;
+    struct dma_task_queue submission_dma_tasks;
+
+    /* Copies deferred while this connection's task pool was exhausted */
+    struct dma_pending_copy *dma_pending;     /* ring of DMA_PENDING_MAX */
+    int dma_pending_head;
+    int dma_pending_cnt;
+    long dma_dropped_copies;
 };
 
 /* DOCA objects for DPUMesh thread */
@@ -80,6 +108,7 @@ struct dmesh_doca_objects {
 };
 
 struct objects {
+    int worker_idx;                 /* index of the owning worker thread */
     struct doca_dev *dev;
     struct doca_dev_rep *rep_dev;
     struct doca_pe *pe;
@@ -89,20 +118,10 @@ struct objects {
     };
     struct doca_comch_connection *connection;
 
-    /* DOCA DMA related objects */
-    struct doca_dma *dma_ctx;
-    struct dma_task_entry *dma_task_entries;
-    int num_dma_tasks;
-    int num_free_dma_tasks;
-    int num_submission_dma_tasks;
-    struct dma_task_queue free_dma_tasks;       
-    struct dma_task_queue submission_dma_tasks;
-
     /* DMesh application recv/send buffers */
     struct dmesh_buffer sndbuf;
     struct dmesh_buffer rcvbuf;
 
-    struct doca_buf_inventory *buf_inv;
     struct doca_mmap *local_mmap;
     struct doca_mmap *remote_mmap;
     void *dma_buffer;
