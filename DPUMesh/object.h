@@ -46,6 +46,9 @@ enum dmesh_conn_state {
     DMESH_CONN_AWAIT_METADATA,     /* consumer + msgq ready; awaiting host metadata msg */
     DMESH_CONN_RUNNING,            /* DPA thread running, DMA request sent */
     DMESH_CONN_ERROR,              /* a setup step failed; slot parked */
+    /* appended to keep wire numbering stable */
+    DMESH_CONN_CONSUMER_STARTING,  /* consumer ctx started; waiting for it to
+                                      reach RUNNING (peer registration) */
 };
 
 /* A second-stage copy (staging buffer -> rcvbuf) deferred because all of this

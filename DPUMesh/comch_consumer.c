@@ -460,13 +460,10 @@ init_comch_datapath_consumer(struct dmesh_conn *conn)
         return result;
     }
 
-	enum doca_ctx_states state;
-	do {
-		doca_pe_progress(objs->consumer_pe);
-		doca_pe_progress(objs->pe);
-
-		doca_ctx_get_state(doca_comch_consumer_as_ctx(conn->consumer), &state);
-	} while (state != DOCA_CTX_STATE_RUNNING);
-
+	/* The consumer registration handshake completes asynchronously; the
+	 * connection state machine (DMESH_CONN_CONSUMER_STARTING) polls the ctx
+	 * state on subsequent advances. Blocking here is forbidden: if the peer
+	 * dies mid-handshake the ctx never reaches RUNNING, and a blocking wait
+	 * would wedge the whole event-driven driver. */
 	return DOCA_SUCCESS;
 }

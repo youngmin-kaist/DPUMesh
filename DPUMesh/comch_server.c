@@ -700,8 +700,34 @@ dmesh_doca_conn_advance(struct dmesh_conn *conn)
 			goto error;
 		}
 
-		conn->state = DMESH_CONN_AWAIT_METADATA;
+		conn->state = DMESH_CONN_CONSUMER_STARTING;
 		break;
+
+	case DMESH_CONN_CONSUMER_STARTING: {
+		/* The consumer registration handshake with the peer is asynchronous;
+		 * poll its ctx state (progressed by the driver's consumer-PE drain).
+		 * If the peer died mid-handshake the ctx falls back to IDLE - park
+		 * the slot instead of waiting forever. */
+		enum doca_ctx_states cstate;
+
+		if (conn->consumer == NULL ||
+		    doca_ctx_get_state(doca_comch_consumer_as_ctx(conn->consumer), &cstate) != DOCA_SUCCESS) {
+			DOCA_LOG_ERR("Consumer vanished during startup for connection %p",
+				     (void *)conn->connection);
+			goto error;
+		}
+
+		if (cstate == DOCA_CTX_STATE_RUNNING) {
+			DOCA_LOG_INFO("Consumer running for connection %p", (void *)conn->connection);
+			conn->state = DMESH_CONN_AWAIT_METADATA;
+		} else if (cstate == DOCA_CTX_STATE_IDLE) {
+			DOCA_LOG_ERR("Consumer registration failed for connection %p (peer gone?)",
+				     (void *)conn->connection);
+			goto error;
+		}
+		/* STARTING/STOPPING: not ready yet; retry on the next advance */
+		break;
+	}
 
 	case DMESH_CONN_AWAIT_METADATA:
 		/* All three remote mmaps arrive in a single metadata message
