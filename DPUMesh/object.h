@@ -157,8 +157,10 @@ struct objects {
 	doca_error_t consumer_result;		  /* Holds result will be updated in consumer callbacks */
 	bool consumer_finish;			  /* Controls whether consumer progress loop should be run */
     
-    int recv_msg_cnt;                  /* Counts number of messages received by consumer */
-    int sent_msg_cnt;
+    /* Monotonic message counters, incremented only by the owning worker
+     * thread; the stats reporter thread reads them and computes deltas. */
+    long recv_msg_cnt;
+    long sent_msg_cnt;
 
     long unsigned int start_time_ns;
     long unsigned int end_time_ns;

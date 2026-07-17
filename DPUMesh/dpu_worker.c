@@ -23,35 +23,6 @@
 
 DOCA_LOG_REGISTER(DPU_WORKER);
 
-static void
-report_throughput(struct objects *objs, struct timespec *last)
-{
-    struct timespec now;
-    double elapsed;
-
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    elapsed = (now.tv_sec - last->tv_sec) +
-              (now.tv_nsec - last->tv_nsec) / 1e9;
-    if (elapsed >= 1.0) {
-        if (objs->sent_msg_cnt > 0 || objs->recv_msg_cnt > 0) {
-            int pending = 0;
-            long dropped = 0;
-            int i;
-
-            for (i = 0; i < DMESH_MAX_CONNECTIONS; i++) {
-                pending += objs->conns[i].dma_pending_cnt;
-                dropped += objs->conns[i].dma_dropped_copies;
-            }
-            DOCA_LOG_INFO("[worker %d] elapsed: %.2f, sent: %d/s, recv: %d/s, dma_pending: %d, dma_dropped: %ld",
-                          objs->worker_idx, elapsed, objs->sent_msg_cnt, objs->recv_msg_cnt,
-                          pending, dropped);
-        }
-        objs->sent_msg_cnt = 0;
-        objs->recv_msg_cnt = 0;
-        *last = now;
-    }
-}
-
 /* Max consumer-PE events processed per loop iteration. Bounds the drain so the
  * throughput report and control-path advance still run under sustained load. */
 #define DATA_DRAIN_BUDGET 8192
@@ -69,7 +40,6 @@ run_dpu_worker(struct objects *objs, const char *server_name)
 {
     doca_error_t result;
     enum dmesh_doca_init_state state;
-    struct timespec last;
 
     DOCA_LOG_INFO("Starting DPU worker %d (busy-poll), server '%s'", objs->worker_idx, server_name);
 
@@ -89,7 +59,6 @@ run_dpu_worker(struct objects *objs, const char *server_name)
         goto argp_cleanup;
     }
 
-    clock_gettime(CLOCK_MONOTONIC, &last);
     while (true) {
         doca_pe_progress(objs->pe);
         doca_pe_progress(objs->consumer_pe);
@@ -97,8 +66,6 @@ run_dpu_worker(struct objects *objs, const char *server_name)
         result = dmesh_doca_ctrl_advance(objs, &state);
         if (result != DOCA_SUCCESS)
             DOCA_LOG_ERR("Control-path advance failed: %s", doca_error_get_descr(result));
-
-        report_throughput(objs, &last);
     }
 
 argp_cleanup:
@@ -123,7 +90,6 @@ run_dpu_worker_event_driven(struct objects *objs, const char *server_name)
     enum dmesh_doca_init_state state;
     int ctrl_fd, data_fd, epfd;
     struct epoll_event ev;
-    struct timespec last;
 
     DOCA_LOG_INFO("Starting DPU worker %d (event-driven), server '%s'", objs->worker_idx, server_name);
 
@@ -181,7 +147,6 @@ run_dpu_worker_event_driven(struct objects *objs, const char *server_name)
         goto fail;
     }
 
-    clock_gettime(CLOCK_MONOTONIC, &last);
     while (true) {
         int drained;
 
@@ -220,10 +185,8 @@ run_dpu_worker_event_driven(struct objects *objs, const char *server_name)
             goto fail;
         }
 
-        report_throughput(objs, &last);
-
         /* Budget exhausted means more data-path work is pending: loop again
-         * without sleeping (stats and control path still ran above). */
+         * without sleeping (the control path still ran above). */
         if (drained >= DATA_DRAIN_BUDGET)
             continue;
 
@@ -257,6 +220,7 @@ fail:
 
 struct dpu_worker_thread_ctx {
     const struct global_config *gcfg;
+    struct objects *objs;   /* allocated by the spawner; read by the reporter */
     int idx;
 };
 
@@ -270,22 +234,16 @@ static void *
 dpu_worker_thread(void *arg)
 {
     struct dpu_worker_thread_ctx *ctx = arg;
-    struct objects *objs;
+    struct objects *objs = ctx->objs;
     char server_name[32];
     doca_error_t result;
 
-    objs = calloc(1, sizeof(*objs));
-    if (objs == NULL) {
-        DOCA_LOG_ERR("worker %d: failed to allocate objects", ctx->idx);
-        return NULL;
-    }
     objs->worker_idx = ctx->idx;
 
     result = open_doca_device_with_pci(ctx->gcfg->dev_pci_addr, NULL, &objs->dev);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("worker %d: failed to open DOCA device: %s",
                      ctx->idx, doca_error_get_descr(result));
-        free(objs);
         return NULL;
     }
 
@@ -297,7 +255,6 @@ dpu_worker_thread(void *arg)
         DOCA_LOG_ERR("worker %d: failed to open DOCA device representor: %s",
                      ctx->idx, doca_error_get_descr(result));
         doca_dev_close(objs->dev);
-        free(objs);
         return NULL;
     }
 
@@ -310,7 +267,6 @@ dpu_worker_thread(void *arg)
 
     /* workers only return on error */
     DOCA_LOG_ERR("worker %d: exited", ctx->idx);
-    free(objs);
     return NULL;
 }
 
@@ -320,7 +276,9 @@ run_dpu_workers(const struct global_config *gcfg)
     pthread_t *threads;
     struct dpu_worker_thread_ctx *ctxs;
     int num_threads = gcfg->num_threads > 0 ? gcfg->num_threads : 1;
-    int i;
+    long prev_sent = 0, prev_recv = 0;
+    struct timespec last, now;
+    int i, started;
 
     DOCA_LOG_INFO("Starting %d DPU worker thread(s); servers DPUMesh0..DPUMesh%d, "
                   "%d connections and %d DPA threads each",
@@ -337,6 +295,11 @@ run_dpu_workers(const struct global_config *gcfg)
     }
 
     for (i = 0; i < num_threads; i++) {
+        ctxs[i].objs = calloc(1, sizeof(*ctxs[i].objs));
+        if (ctxs[i].objs == NULL) {
+            DOCA_LOG_ERR("Failed to allocate worker %d objects", i);
+            break;
+        }
         ctxs[i].gcfg = gcfg;
         ctxs[i].idx = i;
         if (pthread_create(&threads[i], NULL, dpu_worker_thread, &ctxs[i]) != 0) {
@@ -344,10 +307,48 @@ run_dpu_workers(const struct global_config *gcfg)
             break;
         }
     }
+    started = i;
 
-    /* workers run forever; join blocks unless a worker errors out */
-    for (i = i - 1; i >= 0; i--)
-        pthread_join(threads[i], NULL);
+    /* Stats reporter: workers only ever increment their own (monotonic)
+     * counters; this thread reads them all once a second and reports the
+     * aggregate delta. Torn/late reads only skew stats momentarily, so no
+     * synchronization is needed and the data path stays shared-nothing. */
+    clock_gettime(CLOCK_MONOTONIC, &last);
+    while (started > 0) {
+        struct timespec ts = {.tv_sec = 1, .tv_nsec = 0};
+        long sent = 0, recv = 0, dropped = 0;
+        int pending = 0;
+        double elapsed;
+        int w, c;
+
+        nanosleep(&ts, NULL);
+
+        for (w = 0; w < started; w++) {
+            struct objects *objs = ctxs[w].objs;
+
+            sent += objs->sent_msg_cnt;
+            recv += objs->recv_msg_cnt;
+            for (c = 0; c < DMESH_MAX_CONNECTIONS; c++) {
+                pending += objs->conns[c].dma_pending_cnt;
+                dropped += objs->conns[c].dma_dropped_copies;
+            }
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        elapsed = (now.tv_sec - last.tv_sec) +
+                  (now.tv_nsec - last.tv_nsec) / 1e9;
+        last = now;
+
+        if (sent != prev_sent || recv != prev_recv)
+            DOCA_LOG_INFO("TOTAL(%d workers): elapsed: %.2f, sent: %.0f/s, recv: %.0f/s, "
+                          "dma_pending: %d, dma_dropped: %ld",
+                          started, elapsed,
+                          (sent - prev_sent) / elapsed,
+                          (recv - prev_recv) / elapsed,
+                          pending, dropped);
+        prev_sent = sent;
+        prev_recv = recv;
+    }
 
     free(threads);
     free(ctxs);
