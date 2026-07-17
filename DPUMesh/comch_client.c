@@ -96,11 +96,8 @@ static void client_message_recv_callback(struct doca_comch_event_msg_recv *event
 	switch (comch_msg->type)
 	{
 	case DMESH_MSG_EXPORT_METADATA:
-		if (msg_len < sizeof(struct dmesh_export_metadata_msg)) {
-			DOCA_LOG_ERR("Received invalid METADATA message from server");
-			return;
-		}
-		result = process_export_metadata_msg(objs, (struct dmesh_export_metadata_msg *)recv_buffer);
+		/* The DPU never exports DMA metadata to the host in the current flow */
+		DOCA_LOG_WARN("Ignoring unexpected METADATA message from server");
 		break;
 	case DMESH_MSG_EXPORT_DPA_COMP:
 		DOCA_LOG_INFO("Received DPA completion handles from server");

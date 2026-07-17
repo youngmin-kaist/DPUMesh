@@ -64,6 +64,7 @@ int main(int argc, char **argv)
 #else
     gcfg.mode = HOST_MODE;
 #endif
+    gcfg.num_threads = 1;
 
     /* parse cmdline arguments */
     result = init_argp(NULL, &gcfg, argc, argv);
@@ -94,7 +95,8 @@ int main(int argc, char **argv)
     DOCA_LOG_INFO("Start %s application.", gcfg.mode == DPU_MODE ? "DPU" : "Host");
 
     if (gcfg.mode == HOST_MODE) {
-        run_host_worker(&objs);
+        /* one thread per connection; count set via -t/--threads */
+        run_host_workers(&gcfg);
     } else {
         /* Event-driven (on-demand) control path. Set DPUMESH_BUSY_POLL=1 to run
          * the original busy-poll worker for comparison. */

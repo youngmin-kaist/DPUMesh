@@ -12,15 +12,20 @@
 #include "dpa_common.h"
 #include "ring.h"
 
+#include "common.h"
+
 #include <doca_log.h>
 #include <doca_buf_array.h>
 #include <doca_dpa.h>
 #include <time.h>
+#include <pthread.h>
+#include <stdlib.h>
+#include <string.h>
 
 #define BUFFER_SIZE (1024 * 1024)
 
 DOCA_LOG_REGISTER(HOST_WORKER);
-void 
+void
 run_host_worker(struct objects *objs)
 {
     doca_error_t result;
@@ -32,42 +37,42 @@ run_host_worker(struct objects *objs)
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to init comch control path client: %s", doca_error_get_descr(result));
         cleanup_objects(objs);
-        goto argp_cleanup;
+        return;
     }
-    
+
     /* initialize DOCA Comch producer objects */
     result = init_comch_datapath_producer(objs);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to send message over comch data path: %s", doca_error_get_descr(result));
         cleanup_objects(objs);
-        goto argp_cleanup;
+        return;
     }
 
     /* setup DMA ring */
     result = setup_dma_ring(objs, DMA_RING_SIZE);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to setup DMA ring: %s", doca_error_get_descr(result));
-        goto argp_cleanup;
+        return;
     }
 
     /* allocate local buffer and set mmap for PCI export */
     result = init_dmesh_buffer(objs->dev, &objs->sndbuf, BUFFER_SIZE);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to init dmesh buffer: %s", doca_error_get_descr(result));
-        goto argp_cleanup;
+        return;
     }
 
     result = init_dmesh_buffer(objs->dev, &objs->rcvbuf, BUFFER_SIZE);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to init dmesh buffer: %s", doca_error_get_descr(result));
-        goto argp_cleanup;
+        return;
     }
 
     /* export DMA ring + send/receive buffer metadata to DPU in one message */
     result = export_dma_metadata(objs);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to export DMA metadata: %s", doca_error_get_descr(result));
-        goto argp_cleanup;
+        return;
     }
 
     // result = init_dpa_objects(objs);
@@ -138,12 +143,82 @@ run_host_worker(struct objects *objs)
         // }
         // break;
     }
-    // while(true) {
 
-    // };
     DOCA_LOG_INFO("Finished Host worker");
+}
 
-argp_cleanup:
-    clean_argp();
-    return;
+struct host_worker_thread_ctx {
+    const struct global_config *gcfg;
+    int idx;
+};
+
+/*
+ * One host worker thread = one connection to the DPU. Each thread opens its
+ * own DOCA device handle and owns a private struct objects, so threads share
+ * no DOCA state and need no locking.
+ */
+static void *
+host_worker_thread(void *arg)
+{
+    struct host_worker_thread_ctx *ctx = arg;
+    struct objects *objs;
+    doca_error_t result;
+
+    objs = calloc(1, sizeof(*objs));
+    if (objs == NULL) {
+        DOCA_LOG_ERR("worker %d: failed to allocate objects", ctx->idx);
+        return NULL;
+    }
+
+    result = open_doca_device_with_pci(ctx->gcfg->dev_pci_addr, NULL, &objs->dev);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("worker %d: failed to open DOCA device: %s",
+                     ctx->idx, doca_error_get_descr(result));
+        free(objs);
+        return NULL;
+    }
+
+    DOCA_LOG_INFO("worker %d: connecting to DPU", ctx->idx);
+    run_host_worker(objs);
+
+    /* run_host_worker only returns on error (the data loop never exits) */
+    DOCA_LOG_ERR("worker %d: exited", ctx->idx);
+    free(objs);
+    return NULL;
+}
+
+void
+run_host_workers(const struct global_config *gcfg)
+{
+    pthread_t *threads;
+    struct host_worker_thread_ctx *ctxs;
+    int num_threads = gcfg->num_threads > 0 ? gcfg->num_threads : 1;
+    int i;
+
+    DOCA_LOG_INFO("Starting %d host worker thread(s), one connection each", num_threads);
+
+    threads = calloc(num_threads, sizeof(*threads));
+    ctxs = calloc(num_threads, sizeof(*ctxs));
+    if (threads == NULL || ctxs == NULL) {
+        DOCA_LOG_ERR("Failed to allocate worker thread state");
+        free(threads);
+        free(ctxs);
+        return;
+    }
+
+    for (i = 0; i < num_threads; i++) {
+        ctxs[i].gcfg = gcfg;
+        ctxs[i].idx = i;
+        if (pthread_create(&threads[i], NULL, host_worker_thread, &ctxs[i]) != 0) {
+            DOCA_LOG_ERR("Failed to create host worker thread %d", i);
+            break;
+        }
+    }
+
+    /* workers run forever; join blocks unless a worker errors out */
+    for (i = i - 1; i >= 0; i--)
+        pthread_join(threads[i], NULL);
+
+    free(threads);
+    free(ctxs);
 }

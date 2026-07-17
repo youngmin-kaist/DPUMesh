@@ -61,10 +61,12 @@ struct dmesh_comch_msg {
     };
 };
 
+struct dmesh_conn;
+
 doca_error_t
 export_dma_metadata(struct objects *objs);
 doca_error_t
-process_export_metadata_msg(struct objects *objs, struct dmesh_export_metadata_msg *metadata_msg);
+process_export_metadata_msg(struct dmesh_conn *conn, struct dmesh_export_metadata_msg *metadata_msg);
 doca_error_t
 process_dpa_comp_msg(struct objects *objs, struct dmesh_dpa_comp_msg *dpa_comp_msg);
 #endif // COMCH_COMMON_H

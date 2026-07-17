@@ -78,6 +78,10 @@ void server_new_consumer_callback(struct doca_comch_event_consumer *event,
 	objs = (struct objects *)(user_data.ptr);
 	objs->remote_consumer_id = id;
 
+	struct dmesh_conn *conn = dmesh_conn_get(objs, comch_connection);
+	if (conn != NULL)
+		conn->remote_consumer_id = id;
+
 	DOCA_LOG_INFO("Got a new remote consumer with ID = [%d]", id);
 }
 
@@ -242,7 +246,7 @@ static void consumer_recv_task_comp_cb(struct doca_comch_consumer_task_post_recv
 
 	(void)task_user_data;
 
-	objs = (struct objects *)(ctx_user_data.ptr);
+	objs = ((struct dmesh_conn *)(ctx_user_data.ptr))->objs;
 	objs->recv_msg_cnt++;
 
 	buf = doca_comch_consumer_task_post_recv_get_buf(task);
@@ -302,7 +306,8 @@ static void consumer_recv_task_comp_err_cb(struct doca_comch_consumer_task_post_
 
 	(void)task_user_data;
 
-	objs = (struct objects *)(ctx_user_data.ptr);
+	struct dmesh_conn *conn = (struct dmesh_conn *)(ctx_user_data.ptr);
+	objs = conn->objs;
 	objs->consumer_result = doca_task_get_status(doca_comch_consumer_task_post_recv_as_task(task));
 	DOCA_LOG_ERR("Consumer failed to recv message with error = %s",
 		     doca_error_get_name(objs->consumer_result));
@@ -310,7 +315,7 @@ static void consumer_recv_task_comp_err_cb(struct doca_comch_consumer_task_post_
 	buf = doca_comch_consumer_task_post_recv_get_buf(task);
 	(void)doca_buf_dec_refcount(buf, NULL);
 	doca_task_free(doca_comch_consumer_task_post_recv_as_task(task));
-	(void)doca_ctx_stop(doca_comch_consumer_as_ctx(objs->consumer));
+	(void)doca_ctx_stop(doca_comch_consumer_as_ctx(conn->consumer));
 }
 
 /**
@@ -368,8 +373,9 @@ static void consumer_state_changed_cb(const union doca_data user_data,
 	(void)ctx;
 	(void)prev_state;
 
-	struct objects *objs = (struct objects *)user_data.ptr;
-	
+	struct dmesh_conn *conn = (struct dmesh_conn *)user_data.ptr;
+	struct objects *objs = conn->objs;
+
 	switch (next_state) {
 	case DOCA_CTX_STATE_IDLE:
 		DOCA_LOG_INFO("CC consumer context has been stopped");
@@ -389,11 +395,11 @@ static void consumer_state_changed_cb(const union doca_data user_data,
 		break;
 	case DOCA_CTX_STATE_RUNNING:
 		DOCA_LOG_INFO("CC consumer context is running, pref_state:%d, Receiving message from producer, waiting finish", prev_state);
-		objs->consumer_result = prepare_consumer_tasks(objs->consumer, objs->consumer_mem);
+		objs->consumer_result = prepare_consumer_tasks(conn->consumer, conn->consumer_mem);
 		if (objs->consumer_result != DOCA_SUCCESS) {
 			DOCA_LOG_ERR("Failed to submit consumer recv task with error = %s",
 				     doca_error_get_name(objs->consumer_result));
-			(void)doca_ctx_stop(doca_comch_consumer_as_ctx(objs->consumer));
+			(void)doca_ctx_stop(doca_comch_consumer_as_ctx(conn->consumer));
 		}
 		break;
 	case DOCA_CTX_STATE_STOPPING:
@@ -410,22 +416,23 @@ static void consumer_state_changed_cb(const union doca_data user_data,
 
 
 doca_error_t
-init_comch_datapath_consumer(struct objects *objs)
+init_comch_datapath_consumer(struct dmesh_conn *conn)
 {
+    struct objects *objs = conn->objs;
     doca_error_t result;
     struct local_mem_bufs *cmem;
     struct comch_consumer_cb_config consumer_cb_cfg = {
         .recv_task_comp_cb = consumer_recv_task_comp_cb,
         .recv_task_comp_err_cb = consumer_recv_task_comp_err_cb,
-        .ctx_user_data = objs,
+        .ctx_user_data = conn,
         .ctx_state_changed_cb = consumer_state_changed_cb
     };
-    objs->consumer_mem = calloc(1, sizeof(struct local_mem_bufs));
-    if (!objs->consumer_mem) {
+    conn->consumer_mem = calloc(1, sizeof(struct local_mem_bufs));
+    if (!conn->consumer_mem) {
         DOCA_LOG_ERR("Failed to allocate memory for consumer mem buffers");
         return DOCA_ERROR_NO_MEMORY;
     }
-    cmem = objs->consumer_mem;
+    cmem = conn->consumer_mem;
 
     /* setup connsumer's mmap and doca_buf infrastructure */
     cmem->need_alloc_mem = true;
@@ -438,16 +445,18 @@ init_comch_datapath_consumer(struct objects *objs)
 	doca_comch_consumer_cap_get_max_consumers(doca_dev_as_devinfo(objs->dev), &max_consumers);
 	DOCA_LOG_INFO("Device supports max %u concurrent consumers", max_consumers);
 
-	result = init_comch_consumer(objs->connection,
+	/* The consumer belongs to this connection; the PE is shared across all
+	 * connections (created once, lazily, on the first consumer). */
+	result = init_comch_consumer(conn->connection,
 					cmem->mmap,
 					&consumer_cb_cfg,
-					&(objs->consumer),
+					&(conn->consumer),
 					&(objs->consumer_pe));
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to init a consumer with error = %s", doca_error_get_name(result));
         clean_local_mem_bufs(cmem); 
         free(cmem);
-        objs->consumer_mem = NULL;
+        conn->consumer_mem = NULL;
         return result;
     }
 
@@ -456,7 +465,7 @@ init_comch_datapath_consumer(struct objects *objs)
 		doca_pe_progress(objs->consumer_pe);
 		doca_pe_progress(objs->pe);
 
-		doca_ctx_get_state(doca_comch_consumer_as_ctx(objs->consumer), &state);
+		doca_ctx_get_state(doca_comch_consumer_as_ctx(conn->consumer), &state);
 	} while (state != DOCA_CTX_STATE_RUNNING);
 
 	return DOCA_SUCCESS;

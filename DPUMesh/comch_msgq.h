@@ -6,9 +6,10 @@
 #include <doca_comch_msgq.h>
 
 struct objects;
+struct dmesh_conn;
 struct doca_pe;
 
-doca_error_t 
-init_comch_dpa_msgq(struct objects *objs, struct doca_pe *pe);
+doca_error_t
+init_comch_dpa_msgq(struct dmesh_conn *conn, struct doca_pe *pe);
 
 #endif // COMCH_MSGQ_H

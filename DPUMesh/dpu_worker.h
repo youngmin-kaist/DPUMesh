@@ -2,14 +2,13 @@
 #define DPU_WORKER_H
 
 struct objects;
+
+/* Multi-connection DPU worker, busy-poll variant: shared infra built up front,
+ * then both PEs are busy-polled while per-connection state machines advance. */
 void run_dpu_worker(struct objects *objs);
 
-/* Event-driven (on-demand) variant of run_dpu_worker: replaces the control-path
- * busy-poll waits with epoll on the control PE notification fd. */
+/* Event-driven (on-demand) variant: epoll on both PE notification fds; the
+ * process sleeps until the control or data path actually has work. */
 void run_dpu_worker_event_driven(struct objects *objs);
-
-/* Steady-state data-path loop (busy-polls objs->consumer_pe), extracted so both
- * the baseline and the event-driven worker can reuse it. Does not return. */
-void dmesh_doca_run_datapath(struct objects *objs);
 
 #endif // DPU_WORKER_H

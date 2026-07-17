@@ -34,6 +34,20 @@ static doca_error_t pci_addr_callback(void *param, void *config)
     return DOCA_SUCCESS;
 }
 
+static doca_error_t num_threads_callback(void *param, void *config)
+{
+    struct global_config *gcfg = (struct global_config *)config;
+    int num_threads = *(int *)param;
+
+    if (num_threads <= 0) {
+        DOCA_LOG_ERR("Number of threads must be greater than zero");
+        return DOCA_ERROR_INVALID_VALUE;
+    }
+
+    gcfg->num_threads = num_threads;
+    return DOCA_SUCCESS;
+}
+
 static doca_error_t rep_pci_addr_callback(void *param, void *config)
 {
 	struct global_config *gcfg = (struct global_config *)config;
@@ -54,11 +68,11 @@ static doca_error_t rep_pci_addr_callback(void *param, void *config)
 	return DOCA_SUCCESS;
 }
 
-doca_error_t 
+doca_error_t
 init_argp(const char *program_name, void *config, int argc, char **argv)
 {
     doca_error_t result;
-    struct doca_argp_param *dev_pci_addr_param, *rep_pci_addr_param;
+    struct doca_argp_param *dev_pci_addr_param, *rep_pci_addr_param, *num_threads_param;
 
     result = doca_argp_init(program_name, config);
     if (result != DOCA_SUCCESS) {
@@ -92,11 +106,28 @@ init_argp(const char *program_name, void *config, int argc, char **argv)
 					"DOCA device representor PCI address (needed only on DPU)");
     doca_argp_param_set_callback(rep_pci_addr_param, rep_pci_addr_callback);
     doca_argp_param_set_type(rep_pci_addr_param, DOCA_ARGP_TYPE_STRING);
-#ifdef DOCA_ARCH_DPU    
+#ifdef DOCA_ARCH_DPU
     doca_argp_param_set_mandatory(rep_pci_addr_param);
 #endif
     result = doca_argp_register_param(rep_pci_addr_param);
-    if (result != DOCA_SUCCESS) {   
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to register program param: %s", doca_error_get_descr(result));
+        goto exit;
+    }
+
+    result = doca_argp_param_create(&num_threads_param);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to create ARGP param: %s", doca_error_get_descr(result));
+        goto exit;
+    }
+    doca_argp_param_set_short_name(num_threads_param, "t");
+    doca_argp_param_set_long_name(num_threads_param, "threads");
+    doca_argp_param_set_description(num_threads_param,
+                    "Number of host worker threads; each opens one connection to the DPU (default 1)");
+    doca_argp_param_set_callback(num_threads_param, num_threads_callback);
+    doca_argp_param_set_type(num_threads_param, DOCA_ARGP_TYPE_INT);
+    result = doca_argp_register_param(num_threads_param);
+    if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to register program param: %s", doca_error_get_descr(result));
         goto exit;
     }

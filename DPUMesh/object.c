@@ -1,5 +1,7 @@
 #include "object.h"
 
+#include <string.h>
+
 #include <doca_log.h>
 #include <doca_dev.h>
 #include <doca_pe.h>
@@ -8,6 +10,63 @@
 #include "dma.h"
 
 DOCA_LOG_REGISTER(OBJECT);
+
+struct dmesh_conn *
+dmesh_conn_get(struct objects *objs, struct doca_comch_connection *connection)
+{
+    int i;
+
+    if (connection == NULL)
+        return NULL;
+
+    for (i = 0; i < DMESH_MAX_CONNECTIONS; i++) {
+        if (objs->conns[i].state != DMESH_CONN_FREE &&
+            objs->conns[i].connection == connection)
+            return &objs->conns[i];
+    }
+    return NULL;
+}
+
+struct dmesh_conn *
+dmesh_conn_open(struct objects *objs, struct doca_comch_connection *connection)
+{
+    struct dmesh_conn *conn;
+    int i;
+
+    conn = dmesh_conn_get(objs, connection);
+    if (conn != NULL)
+        return conn;
+
+    for (i = 0; i < DMESH_MAX_CONNECTIONS; i++) {
+        conn = &objs->conns[i];
+        if (conn->state == DMESH_CONN_FREE) {
+            memset(conn, 0, sizeof(*conn));
+            conn->objs = objs;
+            conn->connection = connection;
+            conn->state = DMESH_CONN_NEW;
+            DOCA_LOG_INFO("Bound connection %p to slot %d", (void *)connection, i);
+            return conn;
+        }
+    }
+
+    DOCA_LOG_WARN("No free connection slot (max %d)", DMESH_MAX_CONNECTIONS);
+    return NULL;
+}
+
+void
+dmesh_conn_close(struct objects *objs, struct doca_comch_connection *connection)
+{
+    struct dmesh_conn *conn = dmesh_conn_get(objs, connection);
+
+    if (conn == NULL)
+        return;
+
+    /* NOTE: consumer/msgq/mmaps/buf_arr of this slot are not torn down yet
+     * (no full per-connection teardown exists); the slot is only unbound. */
+    conn->state = DMESH_CONN_FREE;
+    conn->connection = NULL;
+    DOCA_LOG_INFO("Unbound connection %p from slot %ld", (void *)connection, conn - objs->conns);
+}
 
 void
 cleanup_objects(struct objects *objs)

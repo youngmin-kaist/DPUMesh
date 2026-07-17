@@ -42,7 +42,8 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
 	doca_error_t result;
     struct comch_msg *msg;
 
-	struct objects *objs = ctx_user_data.ptr;
+	struct dmesh_conn *conn = ctx_user_data.ptr;
+	struct objects *objs = conn->objs;
 	struct doca_task *task = doca_comch_consumer_task_post_recv_as_task(recv_task);
     
     msg = (struct comch_msg *)doca_comch_consumer_task_post_recv_get_imm_data(recv_task);
@@ -59,7 +60,7 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
             // DOCA_LOG_INFO("Received DMA completed message from DPA, pos=%u, length=%u",
             //               comp_msg->pos, comp_msg->length);
 
-            result = doca_mmap_get_memrange(objs->local_mmap, &mmap_addr, &mmap_len);
+            result = doca_mmap_get_memrange(conn->local_mmap, &mmap_addr, &mmap_len);
             if (result != DOCA_SUCCESS) {
                 DOCA_LOG_ERR("Failed to get local mmap range: %s", doca_error_get_descr(result));
                 break;
@@ -76,8 +77,8 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
             
             /* For src doca buffer, data len must be specified */
             result = doca_buf_inventory_buf_get_by_data(objs->buf_inv,
-                                               objs->local_mmap,
-                                               objs->dma_buffer + comp_msg->pos,
+                                               conn->local_mmap,
+                                               conn->dma_buffer + comp_msg->pos,
                                                comp_msg->length,
                                                &sbuf);
 
@@ -90,8 +91,8 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
 
             /* For dst doca buffer, data is copied to the tail segment */
             result = doca_buf_inventory_buf_get_by_addr(objs->buf_inv,
-                                               objs->rcvbuf.mmap,
-                                               objs->rcvbuf.buf,
+                                               conn->rcvbuf.mmap,
+                                               conn->rcvbuf.buf,
                                                comp_msg->length,
                                                &dbuf);
             if (result != DOCA_SUCCESS) {
@@ -113,6 +114,14 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
             if (result != DOCA_SUCCESS) {
                 DOCA_LOG_ERR("Failed to submit DMA task for completed message: %s",
                              doca_error_get_descr(result));
+                /* On DOCA_ERROR_AGAIN the bufs were never attached to a task, so
+                 * they are still ours to release. On any other failure
+                 * submit_dma_task already returned the task via
+                 * put_free_dma_task, which released both bufs. */
+                if (result == DOCA_ERROR_AGAIN) {
+                    (void)doca_buf_dec_refcount(dbuf, NULL);
+                    (void)doca_buf_dec_refcount(sbuf, NULL);
+                }
                 break;
             }
             // DOCA_LOG_INFO("Submitted DMA task for completed message");
@@ -166,8 +175,8 @@ static void dmesh_doca_dpa_msgq_send_cb(struct doca_comch_producer_task_send *se
 	(void)task_user_data;
 	
     
-    struct objects *objs = (struct objects *)ctx_user_data.ptr;
-    objs->sent_msg_cnt++;
+    struct dmesh_conn *conn = (struct dmesh_conn *)ctx_user_data.ptr;
+    conn->objs->sent_msg_cnt++;
     
     // DOCA_LOG_INFO("Sent msg to DPA successfully, cnt: %d", objs->sent_msg_cnt);
     doca_comch_producer_task_send_set_imm_data(send_task, (uint8_t *)&msg, sizeof(struct comch_msg));
@@ -246,10 +255,10 @@ init_dpa_objects(struct objects *objs)
 {
     doca_error_t result;
 
-    if (!objs->dpa_thread) {
-		objs->dpa_thread = malloc(sizeof(struct dmesh_doca_dpa_thread));
-		if (!objs->dpa_thread) {
-			DOCA_LOG_ERR("Failed to allocate memory for dpa_thread");
+    if (!objs->dpa_pool) {
+		objs->dpa_pool = calloc(1, sizeof(struct dmesh_dpa_thread_pool));
+		if (!objs->dpa_pool) {
+			DOCA_LOG_ERR("Failed to allocate memory for DPA thread pool");
 			return DOCA_ERROR_NO_MEMORY;
 		}
 	}
@@ -262,19 +271,19 @@ init_dpa_objects(struct objects *objs)
 		}
 	}
 
-    result = doca_dpa_create(objs->dev, &objs->dpa_thread->dpa);
+    result = doca_dpa_create(objs->dev, &objs->dpa_pool->dpa);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to create DOCA DPA with error = %s", doca_error_get_name(result));
         return result;
     }
 
-    result = doca_dpa_set_app(objs->dpa_thread->dpa, DPU_mesh_dpa_app);
+    result = doca_dpa_set_app(objs->dpa_pool->dpa, DPU_mesh_dpa_app);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to set DPA application with error = %s", doca_error_get_name(result));
         goto destroy_dpa;
     }
 
-    result = doca_dpa_start(objs->dpa_thread->dpa);
+    result = doca_dpa_start(objs->dpa_pool->dpa);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to start DOCA DPA with error = %s", doca_error_get_name(result));
         goto destroy_dpa;
@@ -284,9 +293,83 @@ init_dpa_objects(struct objects *objs)
     return DOCA_SUCCESS;
 
 destroy_dpa:
-    doca_dpa_destroy(objs->dpa_thread->dpa);
-    objs->dpa_thread->dpa = NULL;
+    doca_dpa_destroy(objs->dpa_pool->dpa);
+    objs->dpa_pool->dpa = NULL;
     return result;
+}
+
+doca_error_t
+dmesh_dpa_thread_pool_init(struct objects *objs)
+{
+    struct dmesh_dpa_thread_pool *pool = objs->dpa_pool;
+    doca_error_t result;
+    int i;
+
+    if (pool == NULL || pool->dpa == NULL) {
+        DOCA_LOG_ERR("DPA thread pool: init_dpa_objects must run first");
+        return DOCA_ERROR_BAD_STATE;
+    }
+
+    for (i = 0; i < DPA_THREAD_POOL_SIZE; i++) {
+        pool->threads[i].dpa = pool->dpa;
+        result = dmesh_doca_dpa_thread_create(&pool->threads[i]);
+        if (result != DOCA_SUCCESS) {
+            DOCA_LOG_ERR("Failed to create DPA pool thread %d: %s", i, doca_error_get_name(result));
+            return result;
+        }
+        pool->owner[i] = NULL;
+    }
+    pool->size = DPA_THREAD_POOL_SIZE;
+
+    DOCA_LOG_INFO("Created DPA thread pool with %d threads", pool->size);
+    return DOCA_SUCCESS;
+}
+
+struct dmesh_doca_dpa_thread *
+dmesh_dpa_thread_pool_alloc(struct objects *objs, struct doca_comch_connection *conn)
+{
+    struct dmesh_dpa_thread_pool *pool = objs->dpa_pool;
+    int i;
+
+    if (pool == NULL || pool->size == 0 || conn == NULL)
+        return NULL;
+
+    /* already assigned to this connection? return the same thread */
+    for (i = 0; i < pool->size; i++) {
+        if (pool->owner[i] == conn)
+            return &pool->threads[i];
+    }
+
+    for (i = 0; i < pool->size; i++) {
+        if (pool->owner[i] == NULL) {
+            pool->owner[i] = conn;
+            DOCA_LOG_INFO("Assigned DPA pool thread %d to connection %p", i, (void *)conn);
+            return &pool->threads[i];
+        }
+    }
+
+    DOCA_LOG_WARN("DPA thread pool exhausted (%d threads in use)", pool->size);
+    return NULL;
+}
+
+void
+dmesh_dpa_thread_pool_release(struct objects *objs, struct doca_comch_connection *conn)
+{
+    struct dmesh_dpa_thread_pool *pool = objs->dpa_pool;
+    int i;
+
+    if (pool == NULL || conn == NULL)
+        return;
+
+    for (i = 0; i < pool->size; i++) {
+        if (pool->owner[i] == conn) {
+            pool->owner[i] = NULL;
+            if (objs->dpa_thread == &pool->threads[i])
+                objs->dpa_thread = NULL;
+            DOCA_LOG_INFO("Released DPA pool thread %d from connection %p", i, (void *)conn);
+            return;
+        }
+    }
 }
 
 doca_error_t
@@ -576,12 +659,21 @@ dmesh_doca_dpa_msgq_create(const struct dmesh_doca_dpa_msgq_create_attr *attr,
 }
 
 doca_error_t
-dmesh_doca_dpa_comch_create(struct objects *objs)
+dmesh_doca_dpa_comch_create(struct dmesh_conn *conn)
 {
-    struct dmesh_doca_dpa_comch *comch = objs->dpa_comch;
-    struct dmesh_doca_dpa_thread *dpa_thread = objs->dpa_thread;
+    struct dmesh_doca_dpa_comch *comch;
+    struct dmesh_doca_dpa_thread *dpa_thread = conn->dpa_thread;
     doca_error_t result;
-    
+
+    if (conn->dpa_comch == NULL) {
+        conn->dpa_comch = malloc(sizeof(struct dmesh_doca_dpa_comch));
+        if (conn->dpa_comch == NULL) {
+            DOCA_LOG_ERR("Failed to allocate memory for connection dpa_comch");
+            return DOCA_ERROR_NO_MEMORY;
+        }
+    }
+    comch = conn->dpa_comch;
+
     memset(comch, 0, sizeof(*comch));
 
     result = doca_comch_consumer_completion_create(&(comch->consumer_comp));
@@ -650,8 +742,10 @@ dmesh_doca_dpa_comch_create(struct objects *objs)
  * @return: DOCA_SUCCESS on success and DOCA_ERROR otherwise
  */
 static doca_error_t 
-dmesh_fill_dpa_thread_arg(struct objects *objs, struct dpa_thread_arg *arg)
+dmesh_fill_dpa_thread_arg(struct dmesh_conn *conn, struct dpa_thread_arg *arg)
 {
+    struct objects *objs = conn->objs;
+    (void)objs;
     doca_error_t result;
     struct dmesh_doca_dpa_comch *comch;
     doca_dpa_dev_comch_consumer_completion_t dpa_consumer_comp;
@@ -663,7 +757,7 @@ dmesh_fill_dpa_thread_arg(struct objects *objs, struct dpa_thread_arg *arg)
     doca_dpa_dev_mmap_t dpu_mmap, host_mmap;
 #endif
 
-    comch = objs->dpa_comch;
+    comch = conn->dpa_comch;
 
     result = doca_comch_consumer_completion_get_dpa_handle(comch->consumer_comp, &dpa_consumer_comp);
     if (result != DOCA_SUCCESS) {
@@ -693,21 +787,21 @@ dmesh_fill_dpa_thread_arg(struct objects *objs, struct dpa_thread_arg *arg)
     }
     
 #ifdef DOCA_ARCH_DPU
-    result = doca_buf_arr_get_dpa_handle(objs->buf_arr, &dpa_buf_arr);
+    result = doca_buf_arr_get_dpa_handle(conn->buf_arr, &dpa_buf_arr);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to get buf array DPA handle: %s",
                 doca_error_get_name(result));
         return result;
     }
 
-    result = doca_mmap_dev_get_dpa_handle(objs->local_mmap, objs->dev, &dpu_mmap);
+    result = doca_mmap_dev_get_dpa_handle(conn->local_mmap, objs->dev, &dpu_mmap);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to get mmap DPA handle: %s",
                 doca_error_get_name(result));
         return result;
     }
 
-    result = doca_mmap_dev_get_dpa_handle(objs->sndbuf.mmap, objs->dev, &host_mmap);
+    result = doca_mmap_dev_get_dpa_handle(conn->sndbuf.mmap, objs->dev, &host_mmap);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to get mmap DPA handle: %s",
                 doca_error_get_name(result));
@@ -725,7 +819,7 @@ dmesh_fill_dpa_thread_arg(struct objects *objs, struct dpa_thread_arg *arg)
         .buf_arr_size = DMA_RING_SIZE,
         .host_mmap = host_mmap,
         .dpu_mmap = dpu_mmap,
-        .src_addr = objs->dma_buffer,
+        .src_addr = conn->dma_buffer,
         .buf_size = 1024 * 1024,
         .pos = 0,
 #endif
@@ -745,14 +839,13 @@ dmesh_fill_dpa_thread_arg(struct objects *objs, struct dpa_thread_arg *arg)
  *
  */
 doca_error_t
-dmesh_doca_run_dpa_thread(struct objects *objs, struct dmesh_doca_dpa_thread *dpa_thread, struct dmesh_doca_dpa_comch *comch)
+dmesh_doca_run_dpa_thread(struct dmesh_conn *conn)
 {
+    struct dmesh_doca_dpa_thread *dpa_thread = conn->dpa_thread;
     doca_error_t result;
     struct dpa_thread_arg arg;
 
-    (void)comch;
-
-    result = dmesh_fill_dpa_thread_arg(objs, &arg);
+    result = dmesh_fill_dpa_thread_arg(conn, &arg);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to fill dpa thread argument - %s",
             doca_error_get_name(result));
@@ -876,29 +969,29 @@ dmesh_doca_dpa_msgq_send_bulk(struct dmesh_doca_dpa_msgq *msgq, uint32_t num_msg
 }
 
 doca_error_t
-setup_dpa_buf_array(struct objects *objs, size_t num_elem, struct doca_mmap *mmap)
+setup_dpa_buf_array(struct dmesh_conn *conn, size_t num_elem, struct doca_mmap *mmap)
 {
     doca_error_t result;
 
-    result = doca_buf_arr_create(num_elem + 1, &objs->buf_arr);
+    result = doca_buf_arr_create(num_elem + 1, &conn->buf_arr);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to create buffer array: %s", doca_error_get_descr(result));
         return result;
     }
 
-    result = doca_buf_arr_set_target_dpa(objs->buf_arr, objs->dpa_thread->dpa);
+    result = doca_buf_arr_set_target_dpa(conn->buf_arr, conn->dpa_thread->dpa);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to set buffer array target DPA: %s", doca_error_get_descr(result));
         goto destroy_buf_arr;
     }
 
-    result = doca_buf_arr_set_params(objs->buf_arr, mmap, sizeof(struct dma_desc), 0);
+    result = doca_buf_arr_set_params(conn->buf_arr, mmap, sizeof(struct dma_desc), 0);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to set buffer array params: %s", doca_error_get_descr(result));
         goto destroy_buf_arr;
     }
 
-    result = doca_buf_arr_start(objs->buf_arr);
+    result = doca_buf_arr_start(conn->buf_arr);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to start buffer array: %s", doca_error_get_descr(result));
         goto destroy_buf_arr;
@@ -907,7 +1000,7 @@ setup_dpa_buf_array(struct objects *objs, size_t num_elem, struct doca_mmap *mma
     return DOCA_SUCCESS;
 
 destroy_buf_arr:
-    doca_buf_arr_destroy(objs->buf_arr);
-    objs->buf_arr = NULL;
+    doca_buf_arr_destroy(conn->buf_arr);
+    conn->buf_arr = NULL;
     return result;
 }

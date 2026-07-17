@@ -9,18 +9,15 @@
 struct objects; /* Forward declaration */
 struct dmesh_doca_objects; /* Forward declaration */
 
-/* Init state machine for the event-driven (on-demand) control path.
- * Progresses SERVER_STARTED -> AWAIT_CONNECTION -> AWAIT_REMOTE -> RUNNING.
- * DPA objects + thread are created up front (before the host connects);
- * consumer + DPA msgq are set up once connected; the rest of the init runs
- * once BOTH remote mmaps (ring + buffer) have arrived. See
+/* Global init state for the event-driven (on-demand) control path. Once the
+ * shared infrastructure (DPA instance + thread pool, consumer PE, DMA engine)
+ * is built the server is RUNNING and serves connections; each connection has
+ * its own state machine (enum dmesh_conn_state, struct dmesh_conn). See
  * dmesh_doca_ctrl_advance(). */
 enum dmesh_doca_init_state {
-	DMESH_DOCA_STATE_ERROR = -1,		 /* a DOCA phase failed */
-	DMESH_DOCA_STATE_SERVER_STARTED = 0,	 /* server ctx started; DPA not yet created */
-	DMESH_DOCA_STATE_AWAIT_CONNECTION = 1, /* DPA objects+thread created; awaiting host connection */
-	DMESH_DOCA_STATE_AWAIT_REMOTE = 2,	 /* connected; consumer+msgq set up; awaiting ring_mmap + remote_mmap */
-	DMESH_DOCA_STATE_RUNNING = 3,		 /* run_dpa_thread + send_dma done; init complete */
+	DMESH_DOCA_STATE_ERROR = -1,		 /* shared infrastructure setup failed */
+	DMESH_DOCA_STATE_SERVER_STARTED = 0,	 /* server ctx started; infra not yet created */
+	DMESH_DOCA_STATE_RUNNING = 1,		 /* infra ready; serving connections */
 };
 
 #define CC_SEND_TASK_NUM 1024 /* Number of CC send tasks  */

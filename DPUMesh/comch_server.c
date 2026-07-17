@@ -121,7 +121,20 @@ static void server_message_recv_callback(struct doca_comch_event_msg_recv *event
 			DOCA_LOG_ERR("Received invalid METADATA message from client");
 			return;
 		}
-		result = process_export_metadata_msg(objs, (struct dmesh_export_metadata_msg *)recv_buffer);
+		{
+			struct dmesh_conn *conn = dmesh_conn_get(objs, comch_connection);
+
+			if (conn == NULL) {
+				/* Metadata can arrive before the connection event was
+				 * processed; bind the slot here. */
+				conn = dmesh_conn_open(objs, comch_connection);
+			}
+			if (conn == NULL) {
+				DOCA_LOG_ERR("No connection slot for metadata message");
+				return;
+			}
+			result = process_export_metadata_msg(conn, (struct dmesh_export_metadata_msg *)recv_buffer);
+		}
 		break;
 	default:
 
@@ -212,6 +225,19 @@ static void server_connection_event_callback(struct doca_comch_event_connection_
 	objs->connection = comch_connection;
 
 	DOCA_LOG_INFO("New connection established with client");
+
+	/* Bind a connection slot and assign a pre-created DPA thread to it. Both
+	 * are pure memory operations, so they are safe inside this event callback.
+	 * The pool may not exist yet if the client connects before the first
+	 * advance() runs; dmesh_doca_conn_advance retries the assignment then. */
+	struct dmesh_conn *conn = dmesh_conn_open(objs, comch_connection);
+	if (conn == NULL) {
+		DOCA_LOG_ERR("Connection rejected: no free connection slot");
+		return;
+	}
+	conn->dpa_thread = dmesh_dpa_thread_pool_alloc(objs, comch_connection);
+	if (conn->dpa_thread == NULL)
+		DOCA_LOG_WARN("No DPA thread assigned to new connection yet");
 }
 
 /**
@@ -225,11 +251,27 @@ static void server_disconnection_event_callback(struct doca_comch_event_connecti
 						struct doca_comch_connection *comch_connection,
 						uint8_t change_success)
 {
+	union doca_data user_data;
+	struct doca_comch_server *comch_server;
+	struct objects *objs;
+	doca_error_t result;
+
 	(void)event;
-	(void)comch_connection;
 
 	if (change_success == 0)
 		DOCA_LOG_ERR("Failed disconnection received");
+
+	/* Return the DPA thread owned by this connection to the pool */
+	comch_server = doca_comch_server_get_server_ctx(comch_connection);
+	if (comch_server == NULL)
+		return;
+	result = doca_ctx_get_user_data(doca_comch_server_as_ctx(comch_server), &user_data);
+	if (result != DOCA_SUCCESS || user_data.ptr == NULL)
+		return;
+
+	objs = (struct objects *)user_data.ptr;
+	dmesh_dpa_thread_pool_release(objs, comch_connection);
+	dmesh_conn_close(objs, comch_connection);
 }
 
 doca_error_t
@@ -617,20 +659,107 @@ dmesh_doca_ctrl_clear_and_drain(struct objects *objs, int fd)
 	return DOCA_SUCCESS;
 }
 
+/* Advance one connection's setup state machine. A failure parks only this
+ * connection (DMESH_CONN_ERROR); other connections keep running. */
+static void
+dmesh_doca_conn_advance(struct dmesh_conn *conn)
+{
+	struct objects *objs = conn->objs;
+	doca_error_t result;
+
+	switch (conn->state) {
+	case DMESH_CONN_NEW:
+		/* The connection callback normally assigns a pool thread; retry here
+		 * in case the client connected before the pool existed. */
+		if (conn->dpa_thread == NULL)
+			conn->dpa_thread = dmesh_dpa_thread_pool_alloc(objs, conn->connection);
+		if (conn->dpa_thread == NULL) {
+			DOCA_LOG_ERR("No DPA thread available for connection %p", (void *)conn->connection);
+			goto error;
+		}
+
+		DOCA_LOG_INFO("Setting up datapath consumer and DPA msgq for connection %p",
+			      (void *)conn->connection);
+
+		result = init_comch_datapath_consumer(conn);
+		if (result != DOCA_SUCCESS) {
+			DOCA_LOG_ERR("Failed to init datapath consumer: %s", doca_error_get_name(result));
+			goto error;
+		}
+
+		result = init_comch_dpa_msgq(conn, objs->consumer_pe);
+		if (result != DOCA_SUCCESS) {
+			DOCA_LOG_ERR("Failed to init comch DPA msgq: %s", doca_error_get_name(result));
+			goto error;
+		}
+
+		conn->state = DMESH_CONN_AWAIT_METADATA;
+		break;
+
+	case DMESH_CONN_AWAIT_METADATA:
+		/* All three remote mmaps arrive in a single metadata message
+		 * (process_export_metadata_msg), so they become ready together. */
+		if (conn->ring_mmap == NULL || conn->sndbuf.mmap == NULL || conn->rcvbuf.mmap == NULL)
+			break; /* not ready yet: awaiting this host's metadata export */
+
+		DOCA_LOG_INFO("Received remote DMA metadata; completing DPA setup for connection %p",
+			      (void *)conn->connection);
+
+		result = setup_dpa_buf_array(conn, DMA_RING_SIZE, conn->ring_mmap);
+		if (result != DOCA_SUCCESS) {
+			DOCA_LOG_ERR("Failed to setup DPA buffer array: %s", doca_error_get_name(result));
+			goto error;
+		}
+
+		result = alloc_buffer_and_set_mmap(&conn->local_mmap, objs->dev,
+						   &conn->dma_buffer, BUFFER_SIZE,
+						   DOCA_ACCESS_FLAG_PCI_READ_WRITE);
+		if (result != DOCA_SUCCESS) {
+			DOCA_LOG_ERR("Failed to allocate DMA buffer: %s", doca_error_get_name(result));
+			goto error;
+		}
+
+		result = dmesh_doca_run_dpa_thread(conn);
+		if (result != DOCA_SUCCESS) {
+			DOCA_LOG_ERR("Failed to run DPA thread: %s", doca_error_get_name(result));
+			goto error;
+		}
+
+		result = send_dma_request_to_dpa(conn);
+		if (result != DOCA_SUCCESS) {
+			DOCA_LOG_ERR("Failed to send DMA request to DPA: %s", doca_error_get_name(result));
+			goto error;
+		}
+
+		conn->state = DMESH_CONN_RUNNING;
+		DOCA_LOG_INFO("Connection %p is running", (void *)conn->connection);
+		break;
+
+	case DMESH_CONN_FREE:
+	case DMESH_CONN_RUNNING:
+	case DMESH_CONN_ERROR:
+	default:
+		break;
+	}
+	return;
+
+error:
+	conn->state = DMESH_CONN_ERROR;
+}
+
 doca_error_t
 dmesh_doca_ctrl_advance(struct objects *objs, enum dmesh_doca_init_state *out_state)
 {
 	doca_error_t result;
+	int i;
 
 	if (objs == NULL || out_state == NULL)
 		return DOCA_ERROR_INVALID_VALUE;
 
-	switch (objs->phase) {
-	case DMESH_DOCA_STATE_SERVER_STARTED:
-		/* Create the DPA objects and DPA thread up front: neither depends on
-		 * the host connection, so building them now removes work from the
-		 * critical path once the connection arrives. */
-		DOCA_LOG_INFO("Creating DPA objects and DPA thread");
+	/* One-time shared infrastructure: DPA instance, thread pool, the shared
+	 * consumer PE and the DMA engine. None of it depends on a connection. */
+	if (objs->phase == DMESH_DOCA_STATE_SERVER_STARTED) {
+		DOCA_LOG_INFO("Creating DPA objects, thread pool, consumer PE and DMA engine");
 
 		result = init_dpa_objects(objs);
 		if (result != DOCA_SUCCESS) {
@@ -638,57 +767,20 @@ dmesh_doca_ctrl_advance(struct objects *objs, enum dmesh_doca_init_state *out_st
 			goto error;
 		}
 
-		result = dmesh_doca_dpa_thread_create(objs->dpa_thread);
+		result = dmesh_dpa_thread_pool_init(objs);
 		if (result != DOCA_SUCCESS) {
-			DOCA_LOG_ERR("Failed to create DPA thread: %s", doca_error_get_name(result));
+			DOCA_LOG_ERR("Failed to init DPA thread pool: %s", doca_error_get_name(result));
 			goto error;
 		}
 
-		objs->phase = DMESH_DOCA_STATE_AWAIT_CONNECTION;
-		break;
-
-	case DMESH_DOCA_STATE_AWAIT_CONNECTION:
-		if (objs->connection == NULL)
-			break; /* not ready yet: host has not connected */
-
-		/* Connection established: the consumer needs the connection, and the
-		 * DPA msgq needs both the consumer PE and the DPA thread created above. */
-		DOCA_LOG_INFO("Host connected; setting up datapath consumer and DPA msgq");
-
-		result = init_comch_datapath_consumer(objs);
+		result = doca_pe_create(&objs->consumer_pe);
 		if (result != DOCA_SUCCESS) {
-			DOCA_LOG_ERR("Failed to init datapath consumer: %s", doca_error_get_name(result));
+			DOCA_LOG_ERR("Failed to create consumer PE: %s", doca_error_get_name(result));
 			goto error;
 		}
-
-		result = init_comch_dpa_msgq(objs, objs->consumer_pe);
+		result = doca_pe_set_event_mode(objs->consumer_pe, DOCA_PE_EVENT_MODE_PROGRESS_ALL);
 		if (result != DOCA_SUCCESS) {
-			DOCA_LOG_ERR("Failed to init comch DPA msgq: %s", doca_error_get_name(result));
-			goto error;
-		}
-
-		objs->phase = DMESH_DOCA_STATE_AWAIT_REMOTE;
-		break;
-
-	case DMESH_DOCA_STATE_AWAIT_REMOTE:
-		/* All three remote mmaps arrive in a single metadata message
-		 * (process_export_metadata_msg), so they become ready together. */
-		if (objs->ring_mmap == NULL || objs->sndbuf.mmap == NULL || objs->rcvbuf.mmap == NULL)
-			break; /* not ready yet: awaiting host metadata export */
-
-		DOCA_LOG_INFO("Received remote DMA metadata; completing DPA setup");
-
-		result = setup_dpa_buf_array(objs, DMA_RING_SIZE, objs->ring_mmap);
-		if (result != DOCA_SUCCESS) {
-			DOCA_LOG_ERR("Failed to setup DPA buffer array: %s", doca_error_get_name(result));
-			goto error;
-		}
-
-		result = alloc_buffer_and_set_mmap(&objs->local_mmap, objs->dev,
-						   &objs->dma_buffer, BUFFER_SIZE,
-						   DOCA_ACCESS_FLAG_PCI_READ_WRITE);
-		if (result != DOCA_SUCCESS) {
-			DOCA_LOG_ERR("Failed to allocate DMA buffer: %s", doca_error_get_name(result));
+			DOCA_LOG_ERR("Failed to set consumer PE event mode: %s", doca_error_get_name(result));
 			goto error;
 		}
 
@@ -698,25 +790,13 @@ dmesh_doca_ctrl_advance(struct objects *objs, enum dmesh_doca_init_state *out_st
 			goto error;
 		}
 
-		result = dmesh_doca_run_dpa_thread(objs, objs->dpa_thread, objs->dpa_comch);
-		if (result != DOCA_SUCCESS) {
-			DOCA_LOG_ERR("Failed to run DPA thread: %s", doca_error_get_name(result));
-			goto error;
-		}
-
-		result = send_dma_request_to_dpa(objs);
-		if (result != DOCA_SUCCESS) {
-			DOCA_LOG_ERR("Failed to send DMA request to DPA: %s", doca_error_get_name(result));
-			goto error;
-		}
-
 		objs->phase = DMESH_DOCA_STATE_RUNNING;
-		break;
+	}
 
-	case DMESH_DOCA_STATE_RUNNING:
-	case DMESH_DOCA_STATE_ERROR:
-	default:
-		break;
+	/* Serve every bound connection; each has its own state machine. */
+	for (i = 0; i < DMESH_MAX_CONNECTIONS; i++) {
+		if (objs->conns[i].state != DMESH_CONN_FREE)
+			dmesh_doca_conn_advance(&objs->conns[i]);
 	}
 
 	*out_state = objs->phase;

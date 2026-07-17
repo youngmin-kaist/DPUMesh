@@ -12,7 +12,7 @@ struct global_config {
     enum program_mode mode;
     char dev_pci_addr[DOCA_DEVINFO_PCI_ADDR_SIZE];  /* DOCA device PCI address */
     char dev_rep_pci_addr[DOCA_DEVINFO_REP_PCI_ADDR_SIZE];  /* DOCA device representor PCI address */
-
+    int num_threads;    /* host worker threads; each opens one connection to the DPU */
 };
 
 /*

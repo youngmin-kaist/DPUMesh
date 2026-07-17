@@ -87,8 +87,9 @@ export_dma_metadata(struct objects *objs)
  * and both remote buffer mmaps in one shot.
  */
 doca_error_t
-process_export_metadata_msg(struct objects* objs, struct dmesh_export_metadata_msg *metadata_msg)
+process_export_metadata_msg(struct dmesh_conn *conn, struct dmesh_export_metadata_msg *metadata_msg)
 {
+    struct objects *objs = conn->objs;
     doca_error_t result;
 
     DOCA_LOG_INFO("Received export metadata message: ring_buf=%p, ring_buf_len=%zu, "
@@ -100,7 +101,7 @@ process_export_metadata_msg(struct objects* objs, struct dmesh_export_metadata_m
     /* DMA ring */
     result = doca_mmap_create_from_export(NULL, metadata_msg->ring_desc,
                                             metadata_msg->ring_desc_len,
-                                            objs->dev, &objs->ring_mmap);
+                                            objs->dev, &conn->ring_mmap);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to create remote mmap for DMA ring from export desc with error = %s",
                      doca_error_get_name(result));
@@ -110,34 +111,34 @@ process_export_metadata_msg(struct objects* objs, struct dmesh_export_metadata_m
     /* send buffer */
     result = doca_mmap_create_from_export(NULL, metadata_msg->snd_desc,
                                             metadata_msg->snd_desc_len,
-                                            objs->dev, &objs->sndbuf.mmap);
+                                            objs->dev, &conn->sndbuf.mmap);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to create remote mmap for send buffer from export desc with error = %s",
                      doca_error_get_name(result));
         goto destroy_ring_mmap;
     }
-    objs->sndbuf.buf = metadata_msg->sndbuf;
-    objs->sndbuf.size = metadata_msg->sndbuf_len;
+    conn->sndbuf.buf = metadata_msg->sndbuf;
+    conn->sndbuf.size = metadata_msg->sndbuf_len;
 
     /* receive buffer */
     result = doca_mmap_create_from_export(NULL, metadata_msg->rcv_desc,
                                             metadata_msg->rcv_desc_len,
-                                            objs->dev, &objs->rcvbuf.mmap);
+                                            objs->dev, &conn->rcvbuf.mmap);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to create remote mmap for receive buffer from export desc with error = %s",
                      doca_error_get_name(result));
         goto destroy_sndbuf_mmap;
     }
-    objs->rcvbuf.buf = metadata_msg->rcvbuf;
-    objs->rcvbuf.size = metadata_msg->rcvbuf_len;
+    conn->rcvbuf.buf = metadata_msg->rcvbuf;
+    conn->rcvbuf.size = metadata_msg->rcvbuf_len;
 
-    result = doca_mmap_start(objs->sndbuf.mmap);
+    result = doca_mmap_start(conn->sndbuf.mmap);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to start send buffer mmap with error = %s", doca_error_get_name(result));
         goto destroy_rcvbuf_mmap;
     }
 
-    result = doca_mmap_start(objs->rcvbuf.mmap);
+    result = doca_mmap_start(conn->rcvbuf.mmap);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to start receive buffer mmap with error = %s", doca_error_get_name(result));
         goto destroy_rcvbuf_mmap;
@@ -148,14 +149,14 @@ process_export_metadata_msg(struct objects* objs, struct dmesh_export_metadata_m
     return DOCA_SUCCESS;
 
 destroy_rcvbuf_mmap:
-    doca_mmap_destroy(objs->rcvbuf.mmap);
-    objs->rcvbuf.mmap = NULL;
+    doca_mmap_destroy(conn->rcvbuf.mmap);
+    conn->rcvbuf.mmap = NULL;
 destroy_sndbuf_mmap:
-    doca_mmap_destroy(objs->sndbuf.mmap);
-    objs->sndbuf.mmap = NULL;
+    doca_mmap_destroy(conn->sndbuf.mmap);
+    conn->sndbuf.mmap = NULL;
 destroy_ring_mmap:
-    doca_mmap_destroy(objs->ring_mmap);
-    objs->ring_mmap = NULL;
+    doca_mmap_destroy(conn->ring_mmap);
+    conn->ring_mmap = NULL;
     return result;
 }
 

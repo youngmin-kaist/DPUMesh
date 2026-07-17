@@ -42,29 +42,31 @@ init_dma_resources(struct objects *objs)
 }
 
 doca_error_t
-send_dma_request_to_dpa(struct objects *objs)
+send_dma_request_to_dpa(struct dmesh_conn *conn)
 {
 #ifndef DOCA_ARCH_DPU
-    (void)objs;
+    (void)conn;
     DOCA_LOG_ERR("Sending a DMA request to DPA is only supported on DPU");
     return DOCA_ERROR_NOT_SUPPORTED;
 #else
+    struct objects *objs = conn->objs;
     doca_error_t result;
     doca_dpa_dev_mmap_t src_mmap, dst_mmap;
     struct comch_dma_req_msg dma_req_msg;
 
-    while (objs->sndbuf.mmap == NULL || objs->rcvbuf.mmap == NULL) {
-        doca_pe_progress(objs->pe);
+    if (conn->sndbuf.mmap == NULL || conn->rcvbuf.mmap == NULL) {
+        DOCA_LOG_ERR("Remote buffers are not ready for this connection");
+        return DOCA_ERROR_BAD_STATE;
     }
 
-    result = doca_mmap_dev_get_dpa_handle(objs->sndbuf.mmap, objs->dev, &src_mmap);
+    result = doca_mmap_dev_get_dpa_handle(conn->sndbuf.mmap, objs->dev, &src_mmap);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to get local mmap DPA handle: %s",
                      doca_error_get_descr(result));
         return result;
     }
 
-    result = doca_mmap_dev_get_dpa_handle(objs->local_mmap, objs->dev, &dst_mmap);
+    result = doca_mmap_dev_get_dpa_handle(conn->local_mmap, objs->dev, &dst_mmap);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to get remote mmap DPA handle: %s",
                      doca_error_get_descr(result));
@@ -76,8 +78,8 @@ send_dma_request_to_dpa(struct objects *objs)
     dma_req_msg.dpa_producer_comp = objs->remote_dpa_producer_comp;
     dma_req_msg.src_mmap = src_mmap;
     dma_req_msg.dst_mmap = dst_mmap;
-    dma_req_msg.src_addr = (uint64_t)objs->sndbuf.buf;
-    dma_req_msg.dst_addr = (uint64_t)objs->dma_buffer;
+    dma_req_msg.src_addr = (uint64_t)conn->sndbuf.buf;
+    dma_req_msg.dst_addr = (uint64_t)conn->dma_buffer;
     dma_req_msg.length = 1024;
     DOCA_LOG_INFO("Sending DMA request to DPA: producer: 0x%lx, src_mmap=%u, dst_mmap=%u, src_addr=0x%lx, dst_addr=0x%lx, length=%u",
                     dma_req_msg.dpa_producer,          
@@ -87,7 +89,7 @@ send_dma_request_to_dpa(struct objects *objs)
                   dma_req_msg.dst_addr,
                   dma_req_msg.length);
 
-    result = dmesh_doca_dpa_msgq_send(&objs->dpa_comch->send,
+    result = dmesh_doca_dpa_msgq_send(&conn->dpa_comch->send,
                               &dma_req_msg,
                               sizeof(dma_req_msg));
     if (result != DOCA_SUCCESS) {
@@ -215,8 +217,14 @@ init_dma_tasks(struct objects *objs, int num_tasks)
     int i = 0;
     uint64_t max_buf_size;
 
-    /* create DOCA buffer inventory */
-    result = doca_buf_inventory_create(1024, &objs->buf_inv);
+    if (num_tasks <= 0) {
+        DOCA_LOG_ERR("Requested number of DMA tasks must be greater than zero");
+        return DOCA_ERROR_INVALID_VALUE;
+    }
+
+    /* Each in-flight DMA task holds two bufs (src + dst); size the inventory so
+     * the free-task queue, not the inventory, is what limits in-flight work. */
+    result = doca_buf_inventory_create(2 * (size_t)num_tasks + 16, &objs->buf_inv);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to create buffer inventory: %s", doca_error_get_descr(result));
         return result;
@@ -299,8 +307,11 @@ init_dma_tasks(struct objects *objs, int num_tasks)
     ctx_user_data.ptr = objs;
     doca_ctx_set_user_data(dma_ctx, ctx_user_data);
 
-    /* Connect the PE to the DMA context */
-    result = doca_pe_connect_ctx(objs->pe, dma_ctx);
+    /* DMA completions are data-path work: connect to the consumer PE, which the
+     * steady-state datapath loop progresses. The control PE is not progressed
+     * after init in the event-driven worker, so completions (and the buf
+     * inventory returns they trigger) would never run there. */
+    result = doca_pe_connect_ctx(objs->consumer_pe, dma_ctx);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to connect PE to DMA context: %s",
                      doca_error_get_descr(result));

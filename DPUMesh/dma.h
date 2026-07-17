@@ -7,6 +7,7 @@
 #include <doca_mmap.h>
 
 struct objects;
+struct dmesh_conn;
 struct doca_dma_task_memcpy;
 
 /* Size of the local DMA buffer allocated on the DPU for PCI export. */
@@ -54,5 +55,5 @@ int
 get_num_submission_dma_tasks(const struct objects *objs);
 
 doca_error_t
-send_dma_request_to_dpa(struct objects *objs);
+send_dma_request_to_dpa(struct dmesh_conn *conn);
 #endif  /* DMA_H_ */

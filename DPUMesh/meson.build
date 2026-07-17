@@ -16,6 +16,8 @@ inc_dirs += include_directories('/opt/mellanox/doca/include/')
 inc_dirs += include_directories('../')
 
 sample_dependencies = []
+# POSIX threads for the multi-threaded host worker
+sample_dependencies += dependency('threads')
 # Required for all DOCA programs
 sample_dependencies += dependency('doca-common')
 # The DOCA library of the sample itself

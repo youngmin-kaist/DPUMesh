@@ -23,9 +23,10 @@ struct comch_consumer_cb_config {
 };
 
 struct objects; /* Forward declaration */
+struct dmesh_conn; /* Forward declaration */
 
 doca_error_t
-init_comch_datapath_consumer(struct objects *objs);
+init_comch_datapath_consumer(struct dmesh_conn *conn);
 
 void
 clean_comch_consumer(struct doca_comch_consumer *consumer, struct doca_pe *pe);
