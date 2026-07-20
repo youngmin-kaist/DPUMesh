@@ -16,11 +16,19 @@ struct dpa_thread_arg {
 	uint32_t buf_arr_size;
 
     doca_dpa_dev_mmap_t host_mmap;
-	
+
 	doca_dpa_dev_mmap_t dpu_mmap;
 	uint64_t src_addr;
 	uint32_t buf_size;
 	uint32_t pos;
+
+	/* producer_dma_copy microbenchmark (DMESH_DPA_BENCH_* env vars on the DPU
+	 * app; bench_mode 0 = off -> normal ring-polling datapath) */
+	uint64_t bench_host_addr;   /* host sndbuf base VA (DMA source) */
+	uint32_t bench_host_size;   /* host sndbuf length */
+	uint32_t bench_mode;        /* 0=off, 1=throughput, 2=latency */
+	uint32_t bench_msg_size;    /* bytes per copy (max 8192 on this platform) */
+	uint32_t bench_num_ops;     /* copies per run */
 
 } __attribute__((__packed__, aligned(8)));
 
@@ -31,8 +39,9 @@ enum comch_msg_type {
 
 struct comch_dma_comp_msg {
 	enum comch_msg_type type;
-	uint32_t pos;
-	uint32_t length;
+	uint32_t pos;       /* staging offset of the (batched) copy */
+	uint32_t length;    /* total bytes covered by this message */
+	uint32_t count;     /* number of descriptors coalesced into this copy */
 };
 
 typedef uint64_t doca_dpa_dev_completion_t;

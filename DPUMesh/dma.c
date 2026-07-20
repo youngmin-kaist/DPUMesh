@@ -423,6 +423,15 @@ init_dma_tasks(struct dmesh_conn *conn, int num_tasks)
     conn->dma_pending_head = 0;
     conn->dma_pending_cnt = 0;
 
+    /* Completed-recv segment ring for zero-copy delivery to the Rust side */
+    conn->recv_segs = calloc(DMESH_RECV_SEG_MAX, sizeof(*conn->recv_segs));
+    if (conn->recv_segs == NULL) {
+        result = DOCA_ERROR_NO_MEMORY;
+        goto destroy_dma;
+    }
+    conn->recv_seg_head = 0;
+    conn->recv_seg_cnt = 0;
+
     /* Allocate DMA tasks and put all of them in the free-task queue. */
     conn->dma_task_entries = calloc(num_tasks, sizeof(*conn->dma_task_entries));
     if (conn->dma_task_entries == NULL) {
@@ -723,6 +732,11 @@ cleanup_dma_tasks(struct dmesh_conn *conn)
     conn->dma_pending = NULL;
     conn->dma_pending_head = 0;
     conn->dma_pending_cnt = 0;
+
+    free(conn->recv_segs);
+    conn->recv_segs = NULL;
+    conn->recv_seg_head = 0;
+    conn->recv_seg_cnt = 0;
 
     doca_dma_destroy(conn->dma_ctx);
     conn->dma_ctx = NULL;

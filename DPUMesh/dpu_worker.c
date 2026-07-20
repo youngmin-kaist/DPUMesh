@@ -309,6 +309,12 @@ run_dpu_workers(const struct global_config *gcfg)
     }
     started = i;
 
+    /* Bench helper: exit the process once the aggregate recv count reaches
+     * DMESH_BENCH_EXIT_OPS (set by the bench driver so a test ends as soon as
+     * all completion messages arrived; exit also flushes the DPA device log). */
+    const char *bexit_env = getenv("DMESH_BENCH_EXIT_OPS");
+    long bench_exit_ops = bexit_env != NULL ? atol(bexit_env) : 0;
+
     /* Stats reporter: workers only ever increment their own (monotonic)
      * counters; this thread reads them all once a second and reports the
      * aggregate delta. Torn/late reads only skew stats momentarily, so no
@@ -348,6 +354,13 @@ run_dpu_workers(const struct global_config *gcfg)
                           pending, dropped);
         prev_sent = sent;
         prev_recv = recv;
+
+        if (bench_exit_ops > 0 && recv >= bench_exit_ops) {
+            DOCA_LOG_INFO("bench: recv target %ld reached (recv=%ld), exiting", bench_exit_ops, recv);
+            sleep(1);      /* let the DPA device-log stream drain */
+            fflush(NULL);
+            _exit(0);      /* DOCA teardown hangs with busy-polling workers */
+        }
     }
 
     free(threads);

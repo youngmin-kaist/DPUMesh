@@ -60,6 +60,15 @@ struct dma_pending_copy {
 };
 #define DMA_PENDING_MAX 8192
 
+/* A completed recv segment: bytes the DPA DMA-copied into the connection's
+ * staging buffer at [pos, pos+len). Consumed zero-copy by the Rust side, which
+ * reads directly from the mapped staging region. */
+struct dmesh_recv_seg {
+    uint32_t pos;
+    uint32_t len;
+};
+#define DMESH_RECV_SEG_MAX 8192
+
 /* All DPU-side state owned by one host connection. The shared infrastructure
  * (device, PEs, comch server, DPA instance/pool, DMA engine) stays in
  * struct objects; everything a second connection would clash on lives here. */
@@ -103,6 +112,15 @@ struct dmesh_conn {
     int dma_pending_head;
     int dma_pending_cnt;
     long dma_dropped_copies;
+
+    /* Completed recv segments, produced by the recv callback and popped by the
+     * Rust driver (single worker thread owns both sides - no locking). The
+     * Rust DmeshIo then reads the bytes directly from the staging buffer
+     * (conn->dma_buffer + pos), so there is no extra copy on the DPU. */
+    struct dmesh_recv_seg *recv_segs;         /* ring of DMESH_RECV_SEG_MAX */
+    int recv_seg_head;                        /* consumer (Rust pop) */
+    int recv_seg_cnt;
+    long recv_seg_dropped;                    /* segments lost to a full ring */
 };
 
 /* DOCA objects for DPUMesh thread */
@@ -172,6 +190,7 @@ struct objects {
      * thread; the stats reporter thread reads them and computes deltas. */
     long recv_msg_cnt;
     long sent_msg_cnt;
+    long recv_bytes;                /* payload bytes received via DMA */
 
     long unsigned int start_time_ns;
     long unsigned int end_time_ns;

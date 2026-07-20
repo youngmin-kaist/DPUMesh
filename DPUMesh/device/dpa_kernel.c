@@ -122,6 +122,15 @@ static void handle_msgs(struct dpa_thread_arg *thread_arg)
 }
 #define CONSUMER_HEAD_PUBLISH_BATCH 1
 #define DMA_RING_LOG_INTERVAL 1024
+/* Max descriptors / bytes coalesced into a single DMA copy + completion
+ * message. HARD CONSTRAINT: single DPA DMA transfers above 8192B do not work
+ * on this platform, so a coalesced copy must never exceed 8192B (coalescing
+ * therefore only helps messages smaller than 8KB). */
+#define DMA_BATCH_MAX_DESCS 8
+#define DMA_BATCH_MAX_BYTES 8192
+/* Ring the doorbell only every N submissions (and at the end of a burst);
+ * intermediate copies are enqueued without FLUSH. */
+#define DMA_FLUSH_BATCH 32
 
 static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
 {
@@ -138,6 +147,7 @@ static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
     uint32_t ring_size = thread_arg->buf_arr_size;
     uint32_t ring_mask = ring_size - 1;
     uint32_t buf_size = thread_arg->buf_size;
+    uint32_t unflushed = 0;
 
     DOCA_DPA_DEV_LOG_INFO("Polling descriptor ring with size %u, buf_size: %u\n", ring_size, buf_size);
     
@@ -161,39 +171,80 @@ static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
         producer_tail = ctrl->producer_tail;
 
         while (consumer_head < producer_tail) {
+            uint64_t batch_src;
+            uint32_t batch_len, batch_cnt;
+            uint32_t dst_room = buf_size - (uint32_t)thread_arg->pos;
+
             buf = doca_dpa_dev_buf_array_get_buf(thread_arg->dpa_buf_arr, (consumer_head & ring_mask) + 1);
             dev_ptr = doca_dpa_dev_buf_get_external_ptr(buf);
             desc = (struct dma_desc *)dev_ptr;
 
-            // DOCA_DPA_DEV_LOG_INFO("Read DMA desc: addr=0x%lx, size=%lu\n", desc->addr, desc->size);
-            
+            batch_src = desc->addr;
+            batch_len = (uint32_t)desc->size;
+            batch_cnt = 1;
+
+            /* Coalesce contiguous descriptors into one DMA copy: one WQE, one
+             * doorbell and one completion message then cover the whole batch,
+             * amortizing the fixed per-operation cost. The host writes
+             * messages back-to-back in sndbuf, so descriptors are contiguous
+             * except at the buffer wrap; the batch also may not cross the
+             * staging-buffer wrap on the destination side. */
+            // while (batch_cnt < DMA_BATCH_MAX_DESCS &&
+            //        consumer_head + batch_cnt < producer_tail) {
+            //     buf = doca_dpa_dev_buf_array_get_buf(thread_arg->dpa_buf_arr,
+            //                                          ((consumer_head + batch_cnt) & ring_mask) + 1);
+            //     dev_ptr = doca_dpa_dev_buf_get_external_ptr(buf);
+            //     desc = (struct dma_desc *)dev_ptr;
+
+            //     if (desc->addr != batch_src + batch_len)   /* source discontinuity (wrap) */
+            //         break;
+            //     if (batch_len + desc->size > dst_room)     /* staging wrap on destination */
+            //         break;
+            //     if (batch_len + desc->size > DMA_BATCH_MAX_BYTES)
+            //         break;
+            //     batch_len += (uint32_t)desc->size;
+            //     batch_cnt++;
+            // }
+
             /* if consumer is empty, wait */
             while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, /*consumer_id=*/1) == 1) {
             }
 
-            // DOCA_DPA_DEV_LOG_INFO("Read DMA desc: idx=%lu, addr=0x%lx, size=%lu\n", desc->idx, desc->addr, desc->size);
             msg.type = COMCH_MSG_TYPE_DMA_COMPLETED;
             msg.pos = thread_arg->pos;
-            msg.length = (uint32_t)desc->size;
+            msg.length = batch_len;
+            msg.count = batch_cnt;
 
-            doca_dpa_dev_comch_producer_dma_copy(producer,
-                                        /*consumer_id=*/1,
-                                        thread_arg->dpu_mmap,
-                                        thread_arg->src_addr + thread_arg->pos,
-                                        thread_arg->host_mmap,
-                                        desc->addr,
-                                        desc->size,
-                                        (uint8_t *)&msg,
-                                        sizeof(struct comch_dma_comp_msg),
-                                        DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS | 
-                                        DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
+            /* Batch doorbells: only every DMA_FLUSH_BATCH submissions - or on
+             * the last pending batch of this burst - carries FLUSH. */
+            {
+                uint64_t submit_flags = DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS;
 
-            thread_arg->pos += desc->size;
+                unflushed++;
+                if (unflushed >= DMA_FLUSH_BATCH ||
+                    consumer_head + batch_cnt >= producer_tail) {
+                    submit_flags |= DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH;
+                    unflushed = 0;
+                }
+
+                doca_dpa_dev_comch_producer_dma_copy(producer,
+                                            /*consumer_id=*/1,
+                                            thread_arg->dpu_mmap,
+                                            thread_arg->src_addr + thread_arg->pos,
+                                            thread_arg->host_mmap,
+                                            batch_src,
+                                            batch_len,
+                                            (uint8_t *)&msg,
+                                            sizeof(struct comch_dma_comp_msg),
+                                            submit_flags);
+            }
+
+            thread_arg->pos += batch_len;
             if (thread_arg->pos >= buf_size) {
                 thread_arg->pos = 0;
             }
-            
-            consumer_head++;
+
+            consumer_head += batch_cnt;
         }
 
         if (consumer_head - last_published_head >= CONSUMER_HEAD_PUBLISH_BATCH) {
@@ -272,6 +323,125 @@ static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
     // }
 }
 
+/*
+ * producer_dma_copy microbenchmark: copy bench_msg_size bytes from the host
+ * sndbuf to the DPU staging buffer bench_num_ops times, straight from this DPA
+ * thread. Throughput mode pipelines copies (credit-gated, doorbell every
+ * DMA_FLUSH_BATCH); latency mode serializes: FLUSH each copy and poll the
+ * producer completion before issuing the next. Results are reported in
+ * __dpa_thread_time() ticks; the DPU-side recv counters give the wall-clock
+ * cross-check.
+ */
+static void run_dma_copy_bench(struct dpa_thread_arg *a)
+{
+    doca_dpa_dev_comch_producer_t producer = a->dpa_producer;
+    doca_dpa_dev_completion_element_t comp;
+    struct comch_dma_comp_msg msg = {0};
+    uint32_t size = a->bench_msg_size;
+    uint32_t n = a->bench_num_ops;
+    uint64_t dst_pos = 0, src_pos = 0;
+    uint64_t t0, t1;
+    uint32_t i;
+
+    msg.type = COMCH_MSG_TYPE_DMA_COMPLETED;
+    msg.length = size;
+    msg.count = 1;
+
+    DOCA_DPA_DEV_LOG_INFO("BENCH start: mode=%u size=%u ops=%u host=0x%lx/%u dpu=0x%lx/%u\n",
+                          a->bench_mode, size, n,
+                          a->bench_host_addr, a->bench_host_size,
+                          a->src_addr, a->buf_size);
+
+    if (a->bench_mode == 1) {
+        /* throughput: keep the pipe full, doorbell in batches; the final copy
+         * carries a completion report so t1 covers full drain */
+        t0 = __dpa_thread_time();
+        for (i = 0; i < n; i++) {
+            uint64_t flags;
+
+            if (i == n - 1)
+                flags = DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH; /* reported */
+            else if ((i & (DMA_FLUSH_BATCH - 1)) == DMA_FLUSH_BATCH - 1)
+                flags = DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS |
+                        DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH;
+            else
+                flags = DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS;
+
+            while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, /*consumer_id=*/1) == 1) {
+            }
+
+            msg.pos = (uint32_t)dst_pos;
+            doca_dpa_dev_comch_producer_dma_copy(producer,
+                                                 /*consumer_id=*/1,
+                                                 a->dpu_mmap,
+                                                 a->src_addr + dst_pos,
+                                                 a->host_mmap,
+                                                 a->bench_host_addr + src_pos,
+                                                 size,
+                                                 (uint8_t *)&msg,
+                                                 sizeof(struct comch_dma_comp_msg),
+                                                 flags);
+
+            dst_pos += size;
+            if (dst_pos + size > a->buf_size)
+                dst_pos = 0;
+            src_pos += size;
+            if (src_pos + size > a->bench_host_size)
+                src_pos = 0;
+        }
+        while (doca_dpa_dev_get_completion(a->dpa_producer_comp, &comp) == 0) {
+        }
+        t1 = __dpa_thread_time();
+        doca_dpa_dev_completion_ack(a->dpa_producer_comp, 1);
+        DOCA_DPA_DEV_LOG_INFO("BENCH_TPUT size=%u ops=%u ticks=%lu\n", size, n, t1 - t0);
+    } else {
+        /* latency: one copy at a time, completion-polled. Per-op deltas use
+         * the cycle counter; the 1 MHz thread timer over the whole run
+         * calibrates cycles -> ns. */
+        uint64_t total = 0, tmin = (uint64_t)-1, tmax = 0, d;
+        uint64_t run_t0 = __dpa_thread_time();
+
+        for (i = 0; i < n; i++) {
+            while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, /*consumer_id=*/1) == 1) {
+            }
+
+            t0 = __dpa_thread_cycles();
+            msg.pos = (uint32_t)dst_pos;
+            doca_dpa_dev_comch_producer_dma_copy(producer,
+                                                 /*consumer_id=*/1,
+                                                 a->dpu_mmap,
+                                                 a->src_addr + dst_pos,
+                                                 a->host_mmap,
+                                                 a->bench_host_addr + src_pos,
+                                                 size,
+                                                 (uint8_t *)&msg,
+                                                 sizeof(struct comch_dma_comp_msg),
+                                                 DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
+            while (doca_dpa_dev_get_completion(a->dpa_producer_comp, &comp) == 0) {
+            }
+            t1 = __dpa_thread_cycles();
+            doca_dpa_dev_completion_ack(a->dpa_producer_comp, 1);
+
+            d = t1 - t0;
+            total += d;
+            if (d < tmin)
+                tmin = d;
+            if (d > tmax)
+                tmax = d;
+
+            dst_pos += size;
+            if (dst_pos + size > a->buf_size)
+                dst_pos = 0;
+            src_pos += size;
+            if (src_pos + size > a->bench_host_size)
+                src_pos = 0;
+        }
+        DOCA_DPA_DEV_LOG_INFO("BENCH_LAT size=%u ops=%u total_cycles=%lu min=%lu max=%lu run_us=%lu\n",
+                              size, n, total, tmin, tmax,
+                              __dpa_thread_time() - run_t0);
+    }
+}
+
 __dpa_global__ void run_dma_manager(uint64_t arg)
 {
     struct dpa_thread_arg *thread_arg = (struct dpa_thread_arg *)arg;
@@ -280,7 +450,18 @@ __dpa_global__ void run_dma_manager(uint64_t arg)
     DOCA_DPA_DEV_LOG_INFO("DPA buffer array handle: 0x%lx, size: %u\n", thread_arg->dpa_buf_arr, thread_arg->buf_arr_size);
     DOCA_DPA_DEV_LOG_INFO("DPU mmap: %u, addr: %p host mmap: %u\n", thread_arg->dpu_mmap, thread_arg->src_addr, thread_arg->host_mmap);
 
+    if (thread_arg->bench_mode != 0) {
+        run_dma_copy_bench(thread_arg);
+        /* run once per thread activation only */
+        thread_arg->bench_mode = 0;
+        doca_dpa_dev_thread_reschedule();
+    }
+
+    /* bench-only launch (host-driven): no descriptor ring to poll */
+    if (thread_arg->dpa_buf_arr == 0)
+        doca_dpa_dev_thread_reschedule();
+
     poll_desc_ring(thread_arg);
-    
+
     doca_dpa_dev_thread_reschedule();
 }

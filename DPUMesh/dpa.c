@@ -15,6 +15,7 @@
 #include "dma.h"
 #include <arpa/inet.h>
 #include <time.h>
+#include <stdlib.h>
 
 DOCA_LOG_REGISTER(DPA);
 
@@ -50,39 +51,62 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
 
     switch (msg->type) {
         case COMCH_MSG_TYPE_DMA_COMPLETED:
-            struct comch_dma_comp_msg *comp_msg = (struct comch_dma_comp_msg *)msg;
-            void *mmap_addr = NULL;
-            size_t mmap_len = 0;
-            const size_t dst_offset = 10000;
-            doca_error_t result;
+            // struct comch_dma_comp_msg *comp_msg = (struct comch_dma_comp_msg *)msg;
+            // void *mmap_addr = NULL;
+            // size_t mmap_len = 0;
+            // const size_t dst_offset = 10000;
+            // doca_error_t result;
 
-            // DOCA_LOG_INFO("Received DMA completed message from DPA, pos=%u, length=%u",
-            //               comp_msg->pos, comp_msg->length);
+            // // DOCA_LOG_INFO("Received DMA completed message from DPA, pos=%u, length=%u",
+            // //               comp_msg->pos, comp_msg->length);
 
-            result = doca_mmap_get_memrange(conn->local_mmap, &mmap_addr, &mmap_len);
-            if (result != DOCA_SUCCESS) {
-                DOCA_LOG_ERR("Failed to get local mmap range: %s", doca_error_get_descr(result));
-                break;
-            }
-            if (comp_msg->length == 0 ||
-                comp_msg->pos > mmap_len ||
-                comp_msg->length > mmap_len - comp_msg->pos ||
-                dst_offset > mmap_len ||
-                comp_msg->length > mmap_len - dst_offset) {
-                DOCA_LOG_ERR("Invalid DMA copy range: pos=%u, dst_offset=%zu, length=%u, mmap_len=%zu",
-                             comp_msg->pos, dst_offset, comp_msg->length, mmap_len);
-                break;
-            }
+            // result = doca_mmap_get_memrange(conn->local_mmap, &mmap_addr, &mmap_len);
+            // if (result != DOCA_SUCCESS) {
+            //     DOCA_LOG_ERR("Failed to get local mmap range: %s", doca_error_get_descr(result));
+            //     break;
+            // }
+            // if (comp_msg->length == 0 ||
+            //     comp_msg->pos > mmap_len ||
+            //     comp_msg->length > mmap_len - comp_msg->pos ||
+            //     dst_offset > mmap_len ||
+            //     comp_msg->length > mmap_len - dst_offset) {
+            //     DOCA_LOG_ERR("Invalid DMA copy range: pos=%u, dst_offset=%zu, length=%u, mmap_len=%zu",
+            //                  comp_msg->pos, dst_offset, comp_msg->length, mmap_len);
+            //     break;
+            // }
             
-            result = dmesh_dma_copy_to_rcvbuf(conn, comp_msg->pos, comp_msg->length);
-            if (result == DOCA_ERROR_AGAIN) {
-                /* All DMA tasks are in flight (inflow from multiple connections
-                 * exceeds DMA completion rate): defer the copy; it is retried
-                 * from the DMA completion callback as tasks free up. */
-                dmesh_dma_defer_copy(conn, comp_msg->pos, comp_msg->length);
-            } else if (result != DOCA_SUCCESS) {
-                DOCA_LOG_ERR("Failed to submit DMA copy for completed message: %s",
-                             doca_error_get_descr(result));
+            // objs->recv_bytes += comp_msg->length;
+
+            // result = dmesh_dma_copy_to_rcvbuf(conn, comp_msg->pos, comp_msg->length);
+            // if (result == DOCA_ERROR_AGAIN) {
+            //     /* All DMA tasks are in flight (inflow from multiple connections
+            //      * exceeds DMA completion rate): defer the copy; it is retried
+            //      * from the DMA completion callback as tasks free up. */
+            //     dmesh_dma_defer_copy(conn, comp_msg->pos, comp_msg->length);
+            // } else if (result != DOCA_SUCCESS) {
+            //     DOCA_LOG_ERR("Failed to submit DMA copy for completed message: %s",
+            //                  doca_error_get_descr(result));
+            // }
+
+            /* Enqueue the completed segment for zero-copy delivery to the Rust
+             * side, which reads directly from conn->dma_buffer + pos. One
+             * message covers a batch of `count` descriptors ([pos, pos+length)
+             * is contiguous in the staging buffer by construction). */
+            {
+                struct comch_dma_comp_msg *cm = (struct comch_dma_comp_msg *)msg;
+
+                objs->recv_bytes += cm->length;
+                if (cm->count > 1)
+                    objs->recv_msg_cnt += cm->count - 1; /* +1 more below */
+
+                if (conn->recv_seg_cnt < DMESH_RECV_SEG_MAX) {
+                    int tail = (conn->recv_seg_head + conn->recv_seg_cnt) % DMESH_RECV_SEG_MAX;
+                    conn->recv_segs[tail].pos = cm->pos;
+                    conn->recv_segs[tail].len = cm->length;
+                    conn->recv_seg_cnt++;
+                } else {
+                    conn->recv_seg_dropped++;
+                }
             }
             break;
         default:
@@ -782,6 +806,29 @@ dmesh_fill_dpa_thread_arg(struct dmesh_conn *conn, struct dpa_thread_arg *arg)
         .pos = 0,
 #endif
     };
+
+#ifdef DOCA_ARCH_DPU
+    /* producer_dma_copy microbenchmark: DMESH_DPA_BENCH_MODE=1 (throughput) or
+     * 2 (latency) makes the DPA thread run the bench loop before the normal
+     * ring-polling datapath. Source is this connection's host sndbuf. */
+    {
+        const char *env = getenv("DMESH_DPA_BENCH_MODE");
+
+        if (env != NULL && atoi(env) > 0) {
+            arg->bench_mode = (uint32_t)atoi(env);
+            arg->bench_msg_size = 4096;
+            arg->bench_num_ops = 100000;
+            if ((env = getenv("DMESH_DPA_BENCH_SIZE")) != NULL && atoi(env) > 0)
+                arg->bench_msg_size = (uint32_t)atoi(env);
+            if ((env = getenv("DMESH_DPA_BENCH_OPS")) != NULL && atoi(env) > 0)
+                arg->bench_num_ops = (uint32_t)atoi(env);
+            arg->bench_host_addr = (uint64_t)conn->sndbuf.buf;
+            arg->bench_host_size = (uint32_t)conn->sndbuf.size;
+            DOCA_LOG_INFO("DPA bench enabled: mode=%u size=%u ops=%u",
+                          arg->bench_mode, arg->bench_msg_size, arg->bench_num_ops);
+        }
+    }
+#endif
 
     DOCA_LOG_INFO("dpa_consumer_comp: 0x%lx, dpa_producer_comp: 0x%lx, dpa_consumer: 0x%lx, dpa_producer: 0x%lx",
         arg->dpa_consumer_comp,
