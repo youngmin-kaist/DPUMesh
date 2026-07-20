@@ -126,6 +126,10 @@ run_host_worker(struct objects *objs, const char *server_name)
     doca_mmap_dev_get_dpa_handle(objs->sndbuf.mmap, objs->dev, &local_mmap);
     
     int msg_size = 8192;
+    const char *msg_size_env = getenv("DMESH_MSG_SIZE");
+    if (msg_size_env != NULL && atoi(msg_size_env) > 0)
+        msg_size = atoi(msg_size_env);
+    DOCA_LOG_INFO("Host worker msg_size = %d bytes", msg_size);
     while (true) {
         // if (doca_pe_progress(objs->pe) == 0)
             // nanosleep(&ts, &ts);
