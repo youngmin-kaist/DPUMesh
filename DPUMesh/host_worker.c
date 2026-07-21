@@ -23,6 +23,11 @@
 #include <time.h>
 #include <pthread.h>
 #include <arpa/inet.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <fcntl.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,6 +42,415 @@ extern doca_dpa_func_t thread_init_rpc;
 extern double diff_sec(const struct timespec *start, const struct timespec *end);
 
 DOCA_LOG_REGISTER(HOST_WORKER);
+
+/*
+ * Reverse (response) path, host side. Once the DPU has exported this
+ * connection's rcv_ring + tx_staging (objs->reverse_ready), the host launches a
+ * DPA thread that mirrors the DPU forward datapath: it polls the DPU-resident
+ * rcv_ring for descriptors and DMAs the referenced tx_staging bytes into the
+ * host's local rcvbuf, delivering a fused completion to a host-side consumer.
+ * This reuses the exact machinery of run_host_dpa_bench, but with a real
+ * descriptor ring (dpa_buf_arr over the imported rcv_ring) and DMA
+ * source=tx_staging(DPU) / dest=rcvbuf(host).
+ */
+static doca_error_t
+setup_reverse_dpa(struct objects *objs)
+{
+    doca_error_t result;
+    struct dmesh_conn *conn;
+    struct dpa_thread_arg arg = {0};
+    doca_dpa_dev_comch_consumer_completion_t dpa_consumer_comp;
+    doca_dpa_dev_completion_t dpa_producer_comp;
+    doca_dpa_dev_comch_producer_t dpa_producer;
+    doca_dpa_dev_comch_consumer_t dpa_consumer;
+    doca_dpa_dev_mmap_t src_mmap, dst_mmap;
+    doca_dpa_dev_buf_arr_t dpa_buf_arr;
+    struct comch_msg kick = {0};
+    uint64_t rpc_ret;
+
+    /* The reverse DPA must run on a DIFFERENT host PCI function than
+     * comch/forward (94:00.1): flexio is one-process-per-function and the DPU
+     * proxy already holds this host's 94:00.1. Open 94:00.0 (env override) into
+     * its own struct objects and run everything reverse there. */
+    const char *rev_pci = getenv("DMESH_REV_PCI");
+    struct objects *rev;
+
+    if (rev_pci == NULL)
+        rev_pci = "94:00.0";
+
+    rev = calloc(1, sizeof(*rev));
+    if (rev == NULL)
+        return DOCA_ERROR_NO_MEMORY;
+    objs->rev_objs = rev;
+
+    result = open_doca_device_with_pci(rev_pci, NULL, &rev->dev);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("reverse: failed to open reverse device %s: %s", rev_pci, doca_error_get_descr(result));
+        return result;
+    }
+    result = init_dpa_objects(rev);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("reverse: failed to init DPA on %s: %s", rev_pci, doca_error_get_descr(result));
+        return result;
+    }
+    result = doca_pe_create(&rev->consumer_pe);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("reverse: failed to create consumer PE: %s", doca_error_get_descr(result));
+        return result;
+    }
+
+    /* reverse DMA destination: a local rcvbuf on the reverse device */
+    result = init_dmesh_buffer(rev->dev, &objs->rev_rcvbuf, BUFFER_SIZE);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("reverse: failed to alloc reverse rcvbuf: %s", doca_error_get_descr(result));
+        return result;
+    }
+
+    /* import the DPU's tx_staging (DMA source) + rcv_ring on the reverse device */
+    result = doca_mmap_create_from_export(NULL, objs->rev_msg.tx_desc, objs->rev_msg.tx_desc_len,
+                                          rev->dev, &rev->rev_tx_mmap);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("reverse: failed to import tx_staging: %s", doca_error_get_name(result));
+        return result;
+    }
+    result = doca_mmap_start(rev->rev_tx_mmap);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("reverse: failed to start tx_staging mmap: %s", doca_error_get_name(result));
+        return result;
+    }
+    result = doca_mmap_create_from_export(NULL, objs->rev_msg.ring_desc, objs->rev_msg.ring_desc_len,
+                                          rev->dev, &rev->rev_ring_mmap);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("reverse: failed to import rcv_ring: %s", doca_error_get_name(result));
+        return result;
+    }
+
+    conn = calloc(1, sizeof(*conn));
+    if (conn == NULL)
+        return DOCA_ERROR_NO_MEMORY;
+    conn->objs = rev;
+    conn->dpa_thread = calloc(1, sizeof(*conn->dpa_thread));
+    if (conn->dpa_thread == NULL)
+        return DOCA_ERROR_NO_MEMORY;
+    conn->dpa_thread->dpa = rev->dpa_pool->dpa;
+
+    result = dmesh_doca_dpa_thread_create(conn->dpa_thread);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("reverse: failed to create DPA thread: %s", doca_error_get_descr(result));
+        return result;
+    }
+
+    result = init_comch_dpa_msgq(conn, rev->consumer_pe);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("reverse: failed to init DPA msgqs: %s", doca_error_get_descr(result));
+        return result;
+    }
+
+    /* descriptor ring: buf_array over the imported DPU rcv_ring */
+    result = setup_dpa_buf_array(conn, DMA_RING_SIZE, rev->rev_ring_mmap);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("reverse: failed to set up buf array over rcv_ring: %s", doca_error_get_descr(result));
+        return result;
+    }
+
+    /* completed-segment ring the recv callback fills; drained by the host loop */
+    conn->recv_segs = calloc(DMESH_RECV_SEG_MAX, sizeof(struct dmesh_recv_seg));
+    if (conn->recv_segs == NULL)
+        return DOCA_ERROR_NO_MEMORY;
+
+    /* DPA handles (all on the reverse device) */
+    result = doca_comch_consumer_completion_get_dpa_handle(conn->dpa_comch->consumer_comp, &dpa_consumer_comp);
+    if (result == DOCA_SUCCESS)
+        result = doca_dpa_completion_get_dpa_handle(conn->dpa_comch->producer_comp, &dpa_producer_comp);
+    if (result == DOCA_SUCCESS)
+        result = doca_comch_consumer_get_dpa_handle(conn->dpa_comch->send.consumer, &dpa_consumer);
+    if (result == DOCA_SUCCESS)
+        result = doca_comch_producer_get_dpa_handle(conn->dpa_comch->recv.producer, &dpa_producer);
+    if (result == DOCA_SUCCESS)
+        result = doca_buf_arr_get_dpa_handle(conn->buf_arr, &dpa_buf_arr);
+    if (result == DOCA_SUCCESS)
+        result = doca_mmap_dev_get_dpa_handle(rev->rev_tx_mmap, rev->dev, &src_mmap);      /* DMA source = DPU tx_staging */
+    if (result == DOCA_SUCCESS)
+        result = doca_mmap_dev_get_dpa_handle(objs->rev_rcvbuf.mmap, rev->dev, &dst_mmap); /* DMA dest = reverse rcvbuf */
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("reverse: failed to get DPA handles: %s", doca_error_get_descr(result));
+        return result;
+    }
+
+    arg = (struct dpa_thread_arg) {
+        .dpa_consumer_comp = dpa_consumer_comp,
+        .dpa_producer_comp = dpa_producer_comp,
+        .dpa_consumer = dpa_consumer,
+        .dpa_producer = dpa_producer,
+        .dpa_buf_arr = dpa_buf_arr,
+        .buf_arr_size = DMA_RING_SIZE,
+        .host_mmap = src_mmap,               /* DMA source: DPU tx_staging */
+        .dpu_mmap = dst_mmap,                /* DMA destination: reverse rcvbuf */
+        .src_addr = (uint64_t)objs->rev_rcvbuf.buf,   /* destination base */
+        .buf_size = (uint32_t)objs->rev_rcvbuf.size,
+        .bench_mode = 0,
+    };
+
+    result = doca_dpa_rpc(conn->dpa_thread->dpa, thread_init_rpc, &rpc_ret,
+                          arg.dpa_consumer, (uint32_t)CC_DPA_MAX_MSG_NUM);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("reverse: init RPC failed: %s", doca_error_get_descr(result));
+        return result;
+    }
+    result = doca_dpa_h2d_memcpy(conn->dpa_thread->dpa, conn->dpa_thread->arg, &arg, sizeof(arg));
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("reverse: failed to copy thread arg: %s", doca_error_get_descr(result));
+        return result;
+    }
+    result = doca_dpa_thread_run(conn->dpa_thread->thread);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("reverse: failed to run DPA thread: %s", doca_error_get_descr(result));
+        return result;
+    }
+    /* kick the thread so it enters its poll loop (a thread only wakes on a
+     * completion; the kick plays send_dma_request_to_dpa's role) */
+    result = dmesh_doca_dpa_msgq_send(&conn->dpa_comch->send, &kick, sizeof(kick));
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("reverse: failed to send kick message: %s", doca_error_get_descr(result));
+        return result;
+    }
+
+    objs->rev_conn = conn;
+    DOCA_LOG_INFO("reverse: host DPA thread running (rcv_ring polling, tx_staging -> rcvbuf DMA)");
+    return DOCA_SUCCESS;
+}
+
+/*
+ * Host-side drain loop for the reverse path: progress the reverse consumer PE
+ * (DMA completions) and the control PE, and hand any completed response segment
+ * to stdout. Response bytes live in the host's local rcvbuf at [pos, pos+len).
+ * Never returns (the connection is long-lived).
+ */
+static void
+host_reverse_drain(struct objects *objs)
+{
+    struct dmesh_conn *conn = objs->rev_conn;
+    struct objects *rev = objs->rev_objs;
+
+    while (true) {
+        if (rev != NULL)
+            doca_pe_progress(rev->consumer_pe); /* reverse DMA completions (rev dev) */
+        doca_pe_progress(objs->pe);             /* control path (forward dev) */
+
+        if (conn == NULL)
+            continue;
+
+        while (conn->recv_seg_cnt > 0) {
+            struct dmesh_recv_seg *s = &conn->recv_segs[conn->recv_seg_head];
+            uint32_t pos = s->pos, len = s->len;
+
+            conn->recv_seg_head = (conn->recv_seg_head + 1) % DMESH_RECV_SEG_MAX;
+            conn->recv_seg_cnt--;
+
+            if (len > 0 && (size_t)pos + len <= objs->rev_rcvbuf.size) {
+                printf("DMESH_RESPONSE %u bytes @ %u:\n", len, pos);
+                fwrite((char *)objs->rev_rcvbuf.buf + pos, 1, len, stdout);
+                printf("\n---\n");
+                fflush(stdout);
+            }
+        }
+    }
+}
+
+/*
+ * TCP <-> DMA bridge for protocol-level benchmarking (e.g. HTTP/2 via h2load).
+ * libnghttp2 dev headers are unavailable here, so rather than implement HTTP/2
+ * in C we make the host a transparent byte pipe and let the battle-tested
+ * h2load binary drive the protocol:
+ *
+ *   h2load (h2c) -> TCP -> [this bridge] -> forward DMA -> DPU proxy (detects
+ *   HTTP/2, routes/LB/mTLS) -> backend; response <- reverse DMA (94:00.0) <-
+ *
+ * One TCP connection maps to this process's single dmesh connection, so run
+ * h2load with -c 1 (HTTP/2 multiplexes concurrency over -m streams on the one
+ * connection). Forward bytes are streamed into sndbuf as DMA descriptors;
+ * reverse response segments are written back to the socket. Busy-polls for
+ * lowest latency. Never returns until the peer closes.
+ */
+static void
+run_host_h2_bridge(struct objects *objs, int port)
+{
+    doca_dpa_dev_mmap_t local_mmap;
+    struct objects *rev = objs->rev_objs;
+    struct dmesh_conn *rconn = objs->rev_conn;
+    struct sockaddr_in addr;
+    int lfd, cfd, one = 1;
+    size_t spos = 0;
+    char tmp[16384];
+
+    if (doca_mmap_dev_get_dpa_handle(objs->sndbuf.mmap, objs->dev, &local_mmap) != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("bridge: failed to get sndbuf DPA handle");
+        return;
+    }
+
+    lfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (lfd < 0) { DOCA_LOG_ERR("bridge: socket() failed"); return; }
+    setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons((uint16_t)port);
+    if (bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        DOCA_LOG_ERR("bridge: bind(:%d) failed: %s", port, strerror(errno));
+        close(lfd);
+        return;
+    }
+    listen(lfd, 1);
+    DOCA_LOG_INFO("bridge: listening on :%d (run h2load -c1 http://<host>:%d/)", port, port);
+
+    cfd = accept(lfd, NULL, NULL);
+    if (cfd < 0) { DOCA_LOG_ERR("bridge: accept() failed"); close(lfd); return; }
+    setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    fcntl(cfd, F_SETFL, O_NONBLOCK);
+    DOCA_LOG_INFO("bridge: client connected; bridging TCP <-> DMA");
+
+    unsigned long dbg_fwd_bytes = 0, dbg_fwd_descs = 0, dbg_rev_bytes = 0, dbg_spin = 0;
+    int dbg_first = 1;
+    /* Round-trip probe: t_fwd stamped when a forward request burst is committed;
+     * measured when the first reverse (response) segment arrives. RTT here =
+     * forward DMA + DPU (linkerd+backend) + reverse DMA, from the host's view. */
+    struct timespec t_fwd = {0};
+    int have_fwd = 0;
+    unsigned long rtt_sum_us = 0, rtt_cnt = 0;
+
+    /* Non-blocking reverse: response segments are copied out of rev_rcvbuf into
+     * this pending ring immediately (so the DPA can keep filling rev_rcvbuf) and
+     * flushed to the TCP socket without blocking. This breaks the bidirectional
+     * deadlock where a full TCP send buffer would trap the single bridge thread
+     * in a send() spin, stalling both directions under high concurrency. */
+#define BRIDGE_PENDING_SIZE (8 * 1024 * 1024)
+    char *pend = malloc(BRIDGE_PENDING_SIZE);
+    size_t pend_head = 0, pend_len = 0;
+    int peer_gone = 0;
+    if (pend == NULL) { DOCA_LOG_ERR("bridge: pending buffer alloc failed"); close(cfd); close(lfd); return; }
+
+    while (true) {
+        /* Forward: TCP -> sndbuf -> DMA descriptors (chunked into the ring) */
+        ssize_t n = recv(cfd, tmp, sizeof(tmp), 0);
+        if (n == 0) {
+            DOCA_LOG_INFO("bridge: peer closed (fwd=%lu bytes/%lu descs, rev=%lu bytes)",
+                          dbg_fwd_bytes, dbg_fwd_descs, dbg_rev_bytes);
+            if (rtt_cnt)
+                DOCA_LOG_INFO("bridge: host-view RTT (fwd-commit -> rev-arrive) mean %lu us over %lu reqs "
+                              "[= forward DMA + DPU(linkerd+backend) + reverse DMA]",
+                              rtt_sum_us / rtt_cnt, rtt_cnt);
+            break;                      /* peer closed */
+        }
+        if (n > 0) {
+            size_t off = 0;
+            (void)dbg_first;
+            dbg_fwd_bytes += (unsigned long)n;
+            while (off < (size_t)n) {
+                size_t remaining = (size_t)n - off;
+                size_t chunk;
+                struct dma_desc *d;
+
+                /* producer_dma_copy (the fused copy+notify the DPA runs) fires a
+                 * completion only when the copy is a multiple of 128B, or a
+                 * single sub-block <=128B. Emit the largest 128-aligned copy
+                 * (<=8064 = 63*128, under the 8KB single-DMA limit); the final
+                 * <=128B tail is a valid single sub-block. This 128-aligns every
+                 * DMA while keeping copies large. */
+                if (remaining <= 128)
+                    chunk = remaining;
+                else if (remaining >= 8064)
+                    chunk = 8064;
+                else
+                    chunk = remaining & ~(size_t)127;
+                if (spos + chunk > objs->sndbuf.size)
+                    spos = 0;           /* wrap sndbuf */
+                memcpy((char *)objs->sndbuf.buf + spos, tmp + off, chunk);
+                d = get_next_dma_desc(objs->dma_ring);
+                d->mmap = local_mmap;
+                d->addr = (uint64_t)objs->sndbuf.buf + spos;
+                d->size = chunk;
+                commit_dma_desc(objs->dma_ring);
+                spos += chunk;
+                off += chunk;
+                dbg_fwd_descs++;
+            }
+            clock_gettime(CLOCK_MONOTONIC, &t_fwd);
+            have_fwd = 1;
+        }
+
+        if ((++dbg_spin & 0xFFFFF) == 0 && rconn != NULL)
+            DOCA_LOG_INFO("bridge: recv_seg_cnt=%d dropped=%ld pend_len=%zu fwd_descs=%lu rev=%lu",
+                          rconn->recv_seg_cnt, rconn->recv_seg_dropped, pend_len,
+                          dbg_fwd_descs, dbg_rev_bytes);
+        /* Reverse step 1: progress the PEs, then copy completed response
+         * segments out of rev_rcvbuf into the pending ring (non-blocking, no
+         * TCP write yet) so the DPA/rev_rcvbuf never wait on the socket. */
+        if (rev != NULL)
+            doca_pe_progress(rev->consumer_pe);
+        doca_pe_progress(objs->pe);
+        while (rconn != NULL && rconn->recv_seg_cnt > 0) {
+            struct dmesh_recv_seg *s = &rconn->recv_segs[rconn->recv_seg_head];
+            uint32_t pos = s->pos, len = s->len;
+            size_t tail, first;
+
+            if (pend_len + len > BRIDGE_PENDING_SIZE)
+                break;                  /* pending full: backpressure, leave in ring */
+
+            rconn->recv_seg_head = (rconn->recv_seg_head + 1) % DMESH_RECV_SEG_MAX;
+            rconn->recv_seg_cnt--;
+
+            if (have_fwd) {
+                struct timespec now;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                rtt_sum_us += (unsigned long)((now.tv_sec - t_fwd.tv_sec) * 1000000L +
+                                              (now.tv_nsec - t_fwd.tv_nsec) / 1000);
+                rtt_cnt++;
+                have_fwd = 0;
+            }
+
+            if ((size_t)pos + len > objs->rev_rcvbuf.size)
+                continue;               /* defensive: skip out-of-range segment */
+
+            /* enqueue [rev_rcvbuf+pos, len) into the pending ring */
+            tail = (pend_head + pend_len) % BRIDGE_PENDING_SIZE;
+            first = len < BRIDGE_PENDING_SIZE - tail ? len : BRIDGE_PENDING_SIZE - tail;
+            memcpy(pend + tail, (char *)objs->rev_rcvbuf.buf + pos, first);
+            if (first < len)
+                memcpy(pend, (char *)objs->rev_rcvbuf.buf + pos + first, len - first);
+            pend_len += len;
+            dbg_rev_bytes += len;
+        }
+
+        /* Reverse step 2: flush the pending ring to TCP without blocking. On
+         * EAGAIN stop and retry next iteration (keep reading forward + draining
+         * reverse meanwhile) - this is what breaks the deadlock. */
+        while (pend_len > 0) {
+            size_t run = pend_len < BRIDGE_PENDING_SIZE - pend_head
+                             ? pend_len : BRIDGE_PENDING_SIZE - pend_head;
+            ssize_t k = send(cfd, pend + pend_head, run, MSG_NOSIGNAL);
+            if (k > 0) {
+                pend_head = (pend_head + (size_t)k) % BRIDGE_PENDING_SIZE;
+                pend_len -= (size_t)k;
+            } else if (k < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                break;                  /* socket full: retry next loop iteration */
+            } else {
+                peer_gone = 1;          /* peer closed / error */
+                break;
+            }
+        }
+        if (peer_gone) {
+            DOCA_LOG_INFO("bridge: peer gone (fwd=%lu bytes/%lu descs, rev=%lu bytes)",
+                          dbg_fwd_bytes, dbg_fwd_descs, dbg_rev_bytes);
+            break;
+        }
+    }
+
+    free(pend);
+    close(cfd);
+    close(lfd);
+    DOCA_LOG_INFO("bridge: connection closed");
+}
+
 void
 run_host_worker(struct objects *objs, const char *server_name)
 {
@@ -85,6 +499,28 @@ run_host_worker(struct objects *objs, const char *server_name)
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to export DMA metadata: %s", doca_error_get_descr(result));
         return;
+    }
+
+    /* Reverse path: wait for the DPU to export its rcv_ring + tx_staging (sent
+     * once the connection reaches RUNNING), then launch the host DPA thread that
+     * DMAs responses back into the local rcvbuf. */
+    DOCA_LOG_INFO("Waiting for reverse-path metadata from DPU...");
+    while (!objs->reverse_ready)
+        doca_pe_progress(objs->pe);
+    result = setup_reverse_dpa(objs);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to set up reverse path: %s", doca_error_get_descr(result));
+        return;
+    }
+
+    /* Benchmark bridge mode: expose the DMA path as a local TCP endpoint so
+     * h2load (or any TCP client) can drive it. DMESH_BRIDGE_PORT=<port>. */
+    {
+        const char *bridge_port = getenv("DMESH_BRIDGE_PORT");
+        if (bridge_port != NULL && atoi(bridge_port) > 0) {
+            run_host_h2_bridge(objs, atoi(bridge_port));
+            return;
+        }
     }
 
     // result = init_dpa_objects(objs);
@@ -160,9 +596,8 @@ run_host_worker(struct objects *objs, const char *server_name)
         desc->addr = (uint64_t)objs->sndbuf.buf;
         desc->size = len;
         commit_dma_desc(objs->dma_ring);
-        DOCA_LOG_INFO("Host worker sent %zu bytes from %s; idling for response", len, http_file);
-        while (true)
-            sleep(3600);
+        DOCA_LOG_INFO("Host worker sent %zu bytes from %s; draining response path", len, http_file);
+        host_reverse_drain(objs);
         return;
     }
     if (http_req != NULL) {
@@ -175,9 +610,8 @@ run_host_worker(struct objects *objs, const char *server_name)
         desc->addr = (uint64_t)objs->sndbuf.buf;
         desc->size = len;
         commit_dma_desc(objs->dma_ring);
-        DOCA_LOG_INFO("Host worker sent HTTP request (%zu bytes); idling for response", len);
-        while (true)
-            sleep(3600);
+        DOCA_LOG_INFO("Host worker sent HTTP request (%zu bytes); draining response path", len);
+        host_reverse_drain(objs);
         return;
     }
 

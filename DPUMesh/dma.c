@@ -700,23 +700,36 @@ cleanup_dma_tasks(struct dmesh_conn *conn)
     if (conn == NULL || conn->dma_ctx == NULL)
         return;
 
-    dma_ctx = doca_dma_as_ctx(conn->dma_ctx);
-    if (doca_ctx_get_state(dma_ctx, &state) == DOCA_SUCCESS &&
-        state != DOCA_CTX_STATE_IDLE) {
-        result = doca_ctx_stop(dma_ctx);
-        if (result == DOCA_SUCCESS) {
-            while (doca_ctx_get_state(dma_ctx, &state) == DOCA_SUCCESS &&
-                   state != DOCA_CTX_STATE_IDLE)
-                doca_pe_progress(objs->consumer_pe); /* DMA ctx lives on the consumer PE */
-        } else {
-            DOCA_LOG_ERR("Failed to stop DMA context: %s", doca_error_get_descr(result));
-        }
-    }
-
+    /* A DMA context will not leave STOPPING for IDLE until every task
+     * allocated from its pool is freed. Free the (idle) pool tasks FIRST, then
+     * stop and drain - otherwise the stop-progress loop below spins forever and
+     * the context is destroyed while still STOPPING (leak + later crash). No
+     * task is in flight here: the connection's host has disconnected and the
+     * DPA thread has already been quiesced. */
     if (conn->dma_task_entries != NULL) {
         for (i = 0; i < conn->num_dma_tasks; ++i) {
             if (conn->dma_task_entries[i].task != NULL)
                 doca_task_free(doca_dma_task_memcpy_as_task(conn->dma_task_entries[i].task));
+        }
+    }
+
+    dma_ctx = doca_dma_as_ctx(conn->dma_ctx);
+    if (doca_ctx_get_state(dma_ctx, &state) == DOCA_SUCCESS &&
+        state != DOCA_CTX_STATE_IDLE) {
+        result = doca_ctx_stop(dma_ctx);
+        /* doca_ctx_stop is asynchronous: it returns DOCA_ERROR_IN_PROGRESS while
+         * it settles. In both cases progress the PE until the context reaches
+         * IDLE - only then can it be destroyed. */
+        if (result == DOCA_SUCCESS || result == DOCA_ERROR_IN_PROGRESS) {
+            int spins = 0;
+            while (spins++ < 100000 &&
+                   doca_ctx_get_state(dma_ctx, &state) == DOCA_SUCCESS &&
+                   state != DOCA_CTX_STATE_IDLE)
+                doca_pe_progress(objs->consumer_pe); /* DMA ctx lives on the consumer PE */
+            if (state != DOCA_CTX_STATE_IDLE)
+                DOCA_LOG_ERR("DMA context did not reach IDLE (state=%d) within bound", state);
+        } else {
+            DOCA_LOG_ERR("Failed to stop DMA context: %s", doca_error_get_descr(result));
         }
     }
 

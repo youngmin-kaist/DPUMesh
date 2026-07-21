@@ -57,6 +57,30 @@ static void server_send_task_completion_err_callback(struct doca_comch_task_send
  * @return: DOCA_SUCCESS on success and DOCA_ERROR otherwise
  */
 doca_error_t 
+server_send_msg_conn(struct objects *objs, struct doca_comch_connection *connection,
+		     const char *msg, size_t len)
+{
+	doca_error_t result;
+	struct doca_comch_task_send *task;
+
+	result = doca_comch_server_task_send_alloc_init(objs->cc_server, connection,
+							(void *)msg, len, &task);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Failed to allocate server task with error = %s", doca_error_get_name(result));
+		return result;
+	}
+
+	result = doca_task_submit(doca_comch_task_send_as_task(task));
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Failed to send server task with error = %s", doca_error_get_name(result));
+		doca_task_free(doca_comch_task_send_as_task(task));
+		return result;
+	}
+
+	return DOCA_SUCCESS;
+}
+
+doca_error_t
 server_send_msg(struct objects *objs, const char *msg, size_t len)
 {
 	doca_error_t result;
@@ -270,8 +294,17 @@ static void server_disconnection_event_callback(struct doca_comch_event_connecti
 		return;
 
 	objs = (struct objects *)user_data.ptr;
-	dmesh_dpa_thread_pool_release(objs, comch_connection);
-	dmesh_conn_close(objs, comch_connection);
+
+	/* Do NOT tear down DOCA resources here: this callback runs inside
+	 * doca_pe_progress(control PE), and teardown must progress the consumer PE
+	 * (re-entrancy is forbidden). Just mark the slot; dmesh_doca_ctrl_advance
+	 * performs the teardown from the driver loop. */
+	{
+		struct dmesh_conn *conn = dmesh_conn_get(objs, comch_connection);
+
+		if (conn != NULL && conn->state != DMESH_CONN_FREE)
+			conn->state = DMESH_CONN_CLOSING;
+	}
 }
 
 doca_error_t
@@ -659,6 +692,108 @@ dmesh_doca_ctrl_clear_and_drain(struct objects *objs, int fd)
 	return DOCA_SUCCESS;
 }
 
+/* Tear down all DOCA resources a connection acquired, so its slot (and its DPA
+ * pool thread) can be reused without restarting the proxy. Runs from advance()
+ * - never inside the disconnect callback - so progressing PEs here is safe. */
+static void
+dmesh_conn_teardown(struct dmesh_conn *conn)
+{
+    struct objects *objs = conn->objs;
+
+    DOCA_LOG_INFO("Tearing down connection slot %ld", conn - objs->conns);
+
+    /* Quiesce the DPA thread first: signal its poll loop to exit, wait for the
+     * ack, then stop it. Its DPA-side msgq/completion ctxs can only idle (and
+     * later be destroyed) once the thread is no longer hot-looping. */
+    dmesh_doca_dpa_thread_quiesce(conn->dpa_thread);
+
+    /* Datapath consumer (DPU side, on the shared consumer PE). */
+    if (conn->consumer != NULL) {
+        enum doca_ctx_states st;
+        int spins = 0;
+        struct doca_ctx *cctx = doca_comch_consumer_as_ctx(conn->consumer);
+
+        if (doca_ctx_get_state(cctx, &st) == DOCA_SUCCESS && st != DOCA_CTX_STATE_IDLE) {
+            (void)doca_ctx_stop(cctx);
+            while (spins++ < 100000 &&
+                   doca_ctx_get_state(cctx, &st) == DOCA_SUCCESS && st != DOCA_CTX_STATE_IDLE)
+                doca_pe_progress(objs->consumer_pe);
+        }
+        (void)doca_comch_consumer_destroy(conn->consumer);
+        conn->consumer = NULL;
+    }
+    if (conn->consumer_mem != NULL) {
+        clean_local_mem_bufs(conn->consumer_mem);
+        free(conn->consumer_mem);
+        conn->consumer_mem = NULL;
+    }
+
+    /* DPA comch (both MsgQs + completions) and the DPA thread itself. */
+    dmesh_doca_dpa_comch_destroy(conn);
+    dmesh_doca_dpa_thread_destroy(conn->dpa_thread);
+
+    /* DPA buffer array over the DMA ring. */
+    if (conn->buf_arr != NULL) {
+        (void)doca_buf_arr_stop(conn->buf_arr);
+        (void)doca_buf_arr_destroy(conn->buf_arr);
+        conn->buf_arr = NULL;
+    }
+
+    /* Remote mmaps imported from the host's metadata message. */
+    if (conn->ring_mmap != NULL) {
+        (void)doca_mmap_destroy(conn->ring_mmap);
+        conn->ring_mmap = NULL;
+    }
+    if (conn->sndbuf.mmap != NULL) {
+        (void)doca_mmap_destroy(conn->sndbuf.mmap);
+        conn->sndbuf.mmap = NULL;
+    }
+    if (conn->rcvbuf.mmap != NULL) {
+        (void)doca_mmap_destroy(conn->rcvbuf.mmap);
+        conn->rcvbuf.mmap = NULL;
+    }
+    conn->sndbuf.buf = NULL;
+    conn->rcvbuf.buf = NULL;
+
+    /* Local staging buffer + its mmap. */
+    if (conn->local_mmap != NULL) {
+        destroy_mmap_and_free_buffer(conn->local_mmap, conn->dma_buffer);
+        conn->local_mmap = NULL;
+        conn->dma_buffer = NULL;
+    }
+
+    /* Reverse (response) path resources owned by the DPU. */
+    if (conn->rcv_ring != NULL) {
+        free_dma_ring(conn->rcv_ring);
+        conn->rcv_ring = NULL;
+    }
+    if (conn->tx_staging_mmap != NULL) {
+        destroy_mmap_and_free_buffer(conn->tx_staging_mmap, conn->tx_staging);
+        conn->tx_staging_mmap = NULL;
+        conn->tx_staging = NULL;
+    }
+    conn->tx_staging_len = 0;
+    conn->tx_pos = 0;
+    conn->reverse_exported = false;
+
+    /* Per-connection DMA engine (ctx, inventory, task pool, recv/pending rings). */
+    cleanup_dma_tasks(conn);
+
+    /* Return the DPA pool thread and unbind the slot. */
+    dmesh_dpa_thread_pool_release(objs, conn->connection);
+
+    /* Reset the slot for reuse. */
+    {
+        struct dmesh_flow_id flow = conn->flow;
+        (void)flow;
+        conn->connection = NULL;
+        conn->remote_consumer_id = 0;
+        conn->dpa_thread = NULL;
+        conn->state = DMESH_CONN_FREE;
+        memset(&conn->flow, 0, sizeof(conn->flow));
+    }
+}
+
 /* Advance one connection's setup state machine. A failure parks only this
  * connection (DMESH_CONN_ERROR); other connections keep running. */
 static void
@@ -766,10 +901,29 @@ dmesh_doca_conn_advance(struct dmesh_conn *conn)
 
 		conn->state = DMESH_CONN_RUNNING;
 		DOCA_LOG_INFO("Connection %p is running", (void *)conn->connection);
+		/* fall through to export the reverse path metadata this same tick */
+		/* fallthrough */
+
+	case DMESH_CONN_RUNNING:
+		/* Reverse (response) path: allocate this connection's rcv_ring +
+		 * tx_staging and hand their export descriptors to the host, whose
+		 * DPA thread then DMAs responses back into the host rcvbuf. Idempotent
+		 * (guarded by conn->reverse_exported); retried until it succeeds. */
+		if (!conn->reverse_exported) {
+			result = export_rcv_ring_metadata(conn);
+			if (result != DOCA_SUCCESS)
+				DOCA_LOG_ERR("Failed to export reverse metadata (will retry): %s",
+					     doca_error_get_name(result));
+		}
+		break;
+
+	case DMESH_CONN_CLOSING:
+		/* Host disconnected (or setup failed): release everything so the slot
+		 * and its DPA pool thread can be reused. Sets state to FREE. */
+		dmesh_conn_teardown(conn);
 		break;
 
 	case DMESH_CONN_FREE:
-	case DMESH_CONN_RUNNING:
 	case DMESH_CONN_ERROR:
 	default:
 		break;

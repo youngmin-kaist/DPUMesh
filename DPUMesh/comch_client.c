@@ -103,9 +103,19 @@ static void client_message_recv_callback(struct doca_comch_event_msg_recv *event
 		DOCA_LOG_INFO("Received DPA completion handles from server");
 		struct dmesh_dpa_comp_msg *dpa_comp_msg = (struct dmesh_dpa_comp_msg *)recv_buffer;
 		result = process_dpa_comp_msg(objs, dpa_comp_msg);
-	
+
 		break;
-	
+
+	case DMESH_MSG_EXPORT_RCV_RING: {
+		DOCA_LOG_INFO("Received reverse rcv_ring metadata from server");
+		struct dmesh_export_rcv_ring_msg *rr = (struct dmesh_export_rcv_ring_msg *)recv_buffer;
+		result = process_export_rcv_ring_msg(objs, rr);
+		if (result != DOCA_SUCCESS)
+			DOCA_LOG_ERR("Failed to process reverse rcv_ring metadata: %s",
+				     doca_error_get_name(result));
+		break;
+	}
+
 	default:
 		DOCA_LOG_INFO("Received unknown message type from server: %u", comch_msg->type);
 		break;

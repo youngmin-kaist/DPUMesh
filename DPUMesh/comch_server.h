@@ -89,8 +89,13 @@ dmesh_doca_ctrl_clear_and_drain(struct objects *objs, int fd);
 doca_error_t
 dmesh_doca_ctrl_advance(struct objects *objs, enum dmesh_doca_init_state *out_state);
 
-doca_error_t 
+doca_error_t
 server_send_msg(struct objects *objs, const char *msg, size_t len);
+
+struct doca_comch_connection;
+doca_error_t
+server_send_msg_conn(struct objects *objs, struct doca_comch_connection *connection,
+		     const char *msg, size_t len);
 
 doca_error_t
 export_dpa_comp_to_host(struct objects *objs);

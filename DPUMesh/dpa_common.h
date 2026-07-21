@@ -30,6 +30,14 @@ struct dpa_thread_arg {
 	uint32_t bench_msg_size;    /* bytes per copy (max 8192 on this platform) */
 	uint32_t bench_num_ops;     /* copies per run */
 
+	/* Cooperative shutdown: the host sets stop=1 (h2d_memcpy) when tearing the
+	 * connection down; the kernel's poll loop observes it, writes stopped=1
+	 * back (window writeback) and returns WITHOUT rescheduling, so the DPA
+	 * thread goes idle and doca_dpa_thread_stop can quiesce it cleanly. A
+	 * hot-looping (never-rescheduling) thread cannot be stopped by flexio. */
+	volatile uint32_t stop;     /* host -> DPA: leave the poll loop */
+	volatile uint32_t stopped;  /* DPA -> host: poll loop has exited */
+
 } __attribute__((__packed__, aligned(8)));
 
 enum comch_msg_type {

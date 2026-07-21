@@ -16,6 +16,7 @@ enum msg_direction {
 enum dmesh_msg_type {
     DMESH_MSG_EXPORT_METADATA = 1,
     DMESH_MSG_EXPORT_DPA_COMP = 2,
+    DMESH_MSG_EXPORT_RCV_RING = 3,  /* DPU -> host: reverse (response) path metadata */
 };
 
 /* Identity of the flow carried by a dmesh connection. The DMA path has no
@@ -67,12 +68,32 @@ struct dmesh_dpa_comp_msg {
 	doca_dpa_dev_comch_consumer_t dpa_consumer;
 };
 
+/* Reverse (response) path metadata, sent DPU -> host once the DPU has allocated
+ * this connection's descriptor ring and staging buffer. It is the mirror of
+ * dmesh_export_metadata_msg: the DPU exports the rcv_ring (host DPA polls it for
+ * descriptors) and the tx_staging buffer (DMA source; host DPA copies it into
+ * the host's rcvbuf). Both live in DPU memory and are PCI-exported to the host. */
+struct dmesh_export_rcv_ring_msg {
+    enum dmesh_msg_type type;
+    /* descriptor ring (DPU memory) the host DPA thread polls */
+    void *ring_buf;
+    size_t ring_buf_len;
+    size_t ring_desc_len;
+    /* tx staging buffer (DPU memory) the host DPA thread DMAs into the rcvbuf */
+    void *tx_staging;
+    size_t tx_staging_len;
+    size_t tx_desc_len;
+    uint8_t ring_desc[512];
+    uint8_t tx_desc[512];
+};
+
 struct dmesh_comch_msg {
     enum dmesh_msg_type type;
     union
     {
         struct dmesh_export_metadata_msg export_metadata_msg;
         struct dmesh_dpa_comp_msg dpa_comp_msg;
+        struct dmesh_export_rcv_ring_msg export_rcv_ring_msg;
     };
 };
 
@@ -84,4 +105,12 @@ doca_error_t
 process_export_metadata_msg(struct dmesh_conn *conn, struct dmesh_export_metadata_msg *metadata_msg);
 doca_error_t
 process_dpa_comp_msg(struct objects *objs, struct dmesh_dpa_comp_msg *dpa_comp_msg);
+
+/* DPU side: allocate this connection's reverse rcv_ring + tx_staging (if not
+ * already) and send their PCI export descriptors to the host. */
+doca_error_t
+export_rcv_ring_metadata(struct dmesh_conn *conn);
+/* Host side: import the DPU's rcv_ring + tx_staging from the export message. */
+doca_error_t
+process_export_rcv_ring_msg(struct objects *objs, struct dmesh_export_rcv_ring_msg *msg);
 #endif // COMCH_COMMON_H

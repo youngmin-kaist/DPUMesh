@@ -11,6 +11,8 @@
 #include "dpa_common.h"
 #include "dpa.h"
 #include "ring.h"
+#include "buffer.h"
+#include "dma.h"          /* BUFFER_SIZE */
 DOCA_LOG_REGISTER(COMCH_COMMON);
 
 /*
@@ -176,5 +178,93 @@ process_dpa_comp_msg(struct objects *objs, struct dmesh_dpa_comp_msg *dpa_comp_m
     objs->remote_dpa_producer = dpa_comp_msg->dpa_producer;
     objs->remote_dpa_producer_comp = dpa_comp_msg->dpa_producer_comp;
 
+    return DOCA_SUCCESS;
+}
+
+/* DPU side: allocate this connection's reverse rcv_ring + tx_staging (once) and
+ * ship their PCI export descriptors to the host. The mirror of
+ * export_dma_metadata, but DPU -> host (server -> client). */
+doca_error_t
+export_rcv_ring_metadata(struct dmesh_conn *conn)
+{
+    struct objects *objs = conn->objs;
+    struct dmesh_export_rcv_ring_msg *msg;
+    doca_error_t result;
+    const void *export_desc;
+    size_t export_desc_len;
+
+    if (conn->reverse_exported)
+        return DOCA_SUCCESS;
+
+    if (conn->rcv_ring == NULL) {
+        result = alloc_dma_ring(&conn->rcv_ring, objs->dev, DMA_RING_SIZE);
+        if (result != DOCA_SUCCESS)
+            return result;
+    }
+    if (conn->tx_staging == NULL) {
+        result = alloc_buffer_and_set_mmap(&conn->tx_staging_mmap, objs->dev,
+                                           &conn->tx_staging, BUFFER_SIZE,
+                                           DOCA_ACCESS_FLAG_PCI_READ_WRITE);
+        if (result != DOCA_SUCCESS)
+            return result;
+        conn->tx_staging_len = BUFFER_SIZE;
+        conn->tx_pos = 0;
+    }
+
+    msg = (struct dmesh_export_rcv_ring_msg *)malloc(sizeof(*msg));
+    if (msg == NULL)
+        return DOCA_ERROR_NO_MEMORY;
+    memset(msg, 0, sizeof(*msg));
+    msg->type = DMESH_MSG_EXPORT_RCV_RING;
+
+    /* descriptor ring */
+    result = doca_mmap_export_pci(conn->rcv_ring->mmap, objs->dev, &export_desc, &export_desc_len);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to export reverse rcv_ring mmap: %s", doca_error_get_descr(result));
+        free(msg);
+        return result;
+    }
+    msg->ring_buf = conn->rcv_ring->buffer;
+    msg->ring_buf_len = sizeof(struct dma_ring_ctrl) + conn->rcv_ring->size * sizeof(struct dma_desc);
+    msg->ring_desc_len = export_desc_len;
+    memcpy(msg->ring_desc, export_desc, export_desc_len);
+
+    /* tx staging buffer */
+    result = doca_mmap_export_pci(conn->tx_staging_mmap, objs->dev, &export_desc, &export_desc_len);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to export reverse tx_staging mmap: %s", doca_error_get_descr(result));
+        free(msg);
+        return result;
+    }
+    msg->tx_staging = conn->tx_staging;
+    msg->tx_staging_len = conn->tx_staging_len;
+    msg->tx_desc_len = export_desc_len;
+    memcpy(msg->tx_desc, export_desc, export_desc_len);
+
+    result = server_send_msg_conn(objs, conn->connection, (const char *)msg, sizeof(*msg));
+    if (result != DOCA_SUCCESS) {
+        free(msg);
+        return result;
+    }
+
+    conn->reverse_exported = true;
+    DOCA_LOG_INFO("Exported reverse rcv_ring (buf=%p len=%zu) + tx_staging (buf=%p len=%zu) to host",
+                  msg->ring_buf, msg->ring_buf_len, msg->tx_staging, msg->tx_staging_len);
+    free(msg);
+    return DOCA_SUCCESS;
+}
+
+/* Host side: stash the DPU's export descriptors. The actual mmap import + the
+ * reverse DPA thread are set up by the host worker (setup_reverse_dpa) once it
+ * has opened the reverse PCI function (94:00.0) - a flexio process is
+ * one-per-function and the DPU proxy already holds this host's 94:00.1, so the
+ * reverse DPA must live on a different function and import on that device. */
+doca_error_t
+process_export_rcv_ring_msg(struct objects *objs, struct dmesh_export_rcv_ring_msg *msg)
+{
+    objs->rev_msg = *msg;
+    objs->reverse_ready = true;
+    DOCA_LOG_INFO("Stashed reverse rcv_ring (%p, %zu) + tx_staging (%p, %zu) export from DPU",
+                  msg->ring_buf, msg->ring_buf_len, msg->tx_staging, msg->tx_staging_len);
     return DOCA_SUCCESS;
 }

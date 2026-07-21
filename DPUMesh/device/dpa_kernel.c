@@ -164,6 +164,20 @@ static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
     while (1) {
 
         __dpa_thread_window_read_inv();
+
+        /* Cooperative shutdown: the host set stop=1 while tearing this
+         * connection down. Acknowledge (stopped=1), mark the thread finished
+         * so flexio releases the EU and will not reschedule it, then return.
+         * doca_dpa_dev_thread_finish() (not a bare return) is what makes the
+         * thread quiescent enough for the host's doca_dpa_thread_stop to
+         * succeed - a thread that merely returns stays un-stoppable. */
+        if (thread_arg->stop) {
+            thread_arg->stopped = 1;
+            __dpa_thread_window_writeback();
+            doca_dpa_dev_thread_finish();
+            return;
+        }
+
         buf = doca_dpa_dev_buf_array_get_buf(thread_arg->dpa_buf_arr, 0);
         dev_ptr = doca_dpa_dev_buf_get_external_ptr(buf);
         ctrl = (struct dma_ring_ctrl *)dev_ptr;
@@ -205,6 +219,16 @@ static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
             //     batch_len += (uint32_t)desc->size;
             //     batch_cnt++;
             // }
+
+            /* Wrap the destination cursor BEFORE a copy that would cross the
+             * buffer end, so every copy stays within [0, buf_size) and no
+             * segment straddles the wrap. A straddling segment has pos+len >
+             * buf_size, which the reader (Rust staging read / host bridge)
+             * cannot represent as one [pos,len) and skips - losing the response
+             * and stalling the stream exactly once the buffer first fills.
+             * batch_len <= 8064 << buf_size, so wrapping always leaves room. */
+            if ((uint32_t)thread_arg->pos + batch_len > buf_size)
+                thread_arg->pos = 0;
 
             /* if consumer is empty, wait */
             while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, /*consumer_id=*/1) == 1) {
@@ -463,5 +487,9 @@ __dpa_global__ void run_dma_manager(uint64_t arg)
 
     poll_desc_ring(thread_arg);
 
-    doca_dpa_dev_thread_reschedule();
+    /* poll_desc_ring only returns when the host requested a stop. Do NOT
+     * reschedule in that case: let this activation end so the thread becomes
+     * idle and stoppable. Otherwise keep the thread armed. */
+    if (!thread_arg->stop)
+        doca_dpa_dev_thread_reschedule();
 }

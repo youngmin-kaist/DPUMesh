@@ -49,6 +49,9 @@ enum dmesh_conn_state {
     /* appended to keep wire numbering stable */
     DMESH_CONN_CONSUMER_STARTING,  /* consumer ctx started; waiting for it to
                                       reach RUNNING (peer registration) */
+    DMESH_CONN_CLOSING,            /* host disconnected; advance() tears the
+                                      slot's DOCA resources down (never inside
+                                      the disconnect callback - PE re-entrancy) */
 };
 
 /* A second-stage copy (staging buffer -> rcvbuf) deferred because all of this
@@ -121,6 +124,17 @@ struct dmesh_conn {
     int recv_seg_head;                        /* consumer (Rust pop) */
     int recv_seg_cnt;
     long recv_seg_dropped;                    /* segments lost to a full ring */
+
+    /* Reverse (response) path, DPU-owned. The DPU exports both to the host,
+     * whose DPA thread polls rcv_ring for descriptors and DMAs the referenced
+     * tx_staging bytes into the host's rcvbuf. The proxy writes response bytes
+     * into tx_staging[tx_pos..] and appends a descriptor to rcv_ring. */
+    struct dma_ring *rcv_ring;                /* descriptor ring (DPU memory) */
+    struct doca_mmap *tx_staging_mmap;        /* mmap over tx_staging (PCI export) */
+    void *tx_staging;                         /* DMA source for DPU->host copies */
+    size_t tx_staging_len;
+    uint32_t tx_pos;                          /* write cursor into tx_staging */
+    bool reverse_exported;                    /* rcv_ring+tx_staging sent to host */
 };
 
 /* DOCA objects for DPUMesh thread */
@@ -194,6 +208,29 @@ struct objects {
 
     long unsigned int start_time_ns;
     long unsigned int end_time_ns;
+
+    /* Reverse (response) path, host side. Handles imported from the DPU's
+     * rcv_ring + tx_staging (DPU_TO_HOST metadata), and the host-launched DPA
+     * thread that polls the ring and DMAs tx_staging -> local rcvbuf (mirror of
+     * the DPU forward datapath). rev_conn carries the DPA thread + comch msgqs. */
+    struct doca_mmap *rev_ring_mmap;   /* imported DPU rcv_ring */
+    void *rev_ring_buf;
+    size_t rev_ring_buf_len;
+    struct doca_mmap *rev_tx_mmap;     /* imported DPU tx_staging */
+    void *rev_tx_buf;
+    size_t rev_tx_len;
+    struct dmesh_conn *rev_conn;       /* host DPA thread + comch for reverse path */
+    bool reverse_ready;
+
+    /* The reverse DPA must run on a DIFFERENT host PCI function than the
+     * forward path: a flexio process is one-per-function, and the DPU proxy
+     * already holds this host's 94:00.1. rev_objs owns the reverse device
+     * (94:00.0), its DPA instance, the local reverse rcvbuf and the imported
+     * DPU handles. rev_msg stashes the export descriptors until rev_objs's
+     * device exists to import them on. */
+    struct dmesh_export_rcv_ring_msg rev_msg;  /* stashed DPU export descriptors */
+    struct objects *rev_objs;                  /* reverse device (94:00.0) state */
+    struct dmesh_buffer rev_rcvbuf;            /* reverse DMA destination (on rev dev) */
 
     /* DPU multi-connection slots (see struct dmesh_conn) */
     struct dmesh_conn conns[DMESH_MAX_CONNECTIONS];

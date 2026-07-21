@@ -1,5 +1,6 @@
 #include "dpa.h"
 
+#include <stddef.h>
 #include <doca_error.h>
 #include <doca_log.h>
 #include <doca_comch_consumer.h>
@@ -99,7 +100,12 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
                 if (cm->count > 1)
                     objs->recv_msg_cnt += cm->count - 1; /* +1 more below */
 
-                if (conn->recv_seg_cnt < DMESH_RECV_SEG_MAX) {
+                /* recv_segs is NULL for byte-accounting-only consumers (the host
+                 * DPA bench), so guard it: only real datapath conns (DPU proxy
+                 * and the host reverse path) allocate the ring and want segments. */
+                if (conn->recv_segs == NULL) {
+                    /* byte accounting only */
+                } else if (conn->recv_seg_cnt < DMESH_RECV_SEG_MAX) {
                     int tail = (conn->recv_seg_head + conn->recv_seg_cnt) % DMESH_RECV_SEG_MAX;
                     conn->recv_segs[tail].pos = cm->pos;
                     conn->recv_segs[tail].len = cm->length;
@@ -324,6 +330,15 @@ dmesh_dpa_thread_pool_alloc(struct objects *objs, struct doca_comch_connection *
 
     for (i = 0; i < pool->size; i++) {
         if (pool->owner[i] == NULL) {
+            /* A recycled slot has its thread destroyed by teardown; recreate a
+             * fresh one before handing it out. */
+            if (pool->threads[i].thread == NULL) {
+                pool->threads[i].dpa = pool->dpa;
+                if (dmesh_doca_dpa_thread_create(&pool->threads[i]) != DOCA_SUCCESS) {
+                    DOCA_LOG_ERR("Failed to recreate DPA pool thread %d", i);
+                    return NULL;
+                }
+            }
             pool->owner[i] = conn;
             DOCA_LOG_INFO("Assigned DPA pool thread %d to connection %p", i, (void *)conn);
             return &pool->threads[i];
@@ -715,6 +730,149 @@ dmesh_doca_dpa_comch_create(struct dmesh_conn *conn)
     }
 
     return DOCA_SUCCESS;
+}
+
+/* Stop a ctx and progress its PE until idle (bounded, to never hang). DPA-side
+ * ctxs are progressed on `pe` too; they idle once the DPA thread is stopped. */
+static void
+stop_ctx_bounded(struct doca_ctx *ctx, struct doca_pe *pe)
+{
+    enum doca_ctx_states state;
+    int spins = 0;
+
+    if (ctx == NULL)
+        return;
+    if (doca_ctx_get_state(ctx, &state) != DOCA_SUCCESS || state == DOCA_CTX_STATE_IDLE)
+        return;
+
+    (void)doca_ctx_stop(ctx);
+    while (spins++ < 100000) {
+        if (doca_ctx_get_state(ctx, &state) != DOCA_SUCCESS || state == DOCA_CTX_STATE_IDLE)
+            break;
+        if (pe != NULL)
+            doca_pe_progress(pe);
+    }
+}
+
+/* Tear down one DPA MsgQ: stop both endpoint ctxs, then destroy them and the
+ * MsgQ. The DPA thread must already be stopped so the DPA-side ctx can idle. */
+static void
+dmesh_doca_dpa_msgq_destroy(struct dmesh_doca_dpa_msgq *msgq, struct doca_pe *pe)
+{
+    if (msgq == NULL)
+        return;
+
+    if (msgq->producer != NULL)
+        stop_ctx_bounded(doca_comch_producer_as_ctx(msgq->producer), pe);
+    if (msgq->consumer != NULL)
+        stop_ctx_bounded(doca_comch_consumer_as_ctx(msgq->consumer), pe);
+
+    if (msgq->producer != NULL) {
+        (void)doca_comch_producer_destroy(msgq->producer);
+        msgq->producer = NULL;
+    }
+    if (msgq->consumer != NULL) {
+        (void)doca_comch_consumer_destroy(msgq->consumer);
+        msgq->consumer = NULL;
+    }
+    if (msgq->msgq != NULL) {
+        (void)doca_comch_msgq_stop(msgq->msgq);
+        (void)doca_comch_msgq_destroy(msgq->msgq);
+        msgq->msgq = NULL;
+    }
+    /* msgq->pe is the shared consumer PE - do NOT destroy it here */
+    msgq->pe = NULL;
+}
+
+/* Destroy a connection's DPA comch: both MsgQs and both completion objects.
+ * Requires conn->dpa_thread to be stopped first. */
+void
+dmesh_doca_dpa_comch_destroy(struct dmesh_conn *conn)
+{
+    struct dmesh_doca_dpa_comch *comch = conn->dpa_comch;
+    struct doca_pe *pe = conn->objs->consumer_pe;
+
+    if (comch == NULL)
+        return;
+
+    dmesh_doca_dpa_msgq_destroy(&comch->send, pe);
+    dmesh_doca_dpa_msgq_destroy(&comch->recv, pe);
+
+    if (comch->consumer_comp != NULL) {
+        (void)doca_comch_consumer_completion_stop(comch->consumer_comp);
+        (void)doca_comch_consumer_completion_destroy(comch->consumer_comp);
+        comch->consumer_comp = NULL;
+    }
+    if (comch->producer_comp != NULL) {
+        (void)doca_dpa_completion_stop(comch->producer_comp);
+        (void)doca_dpa_completion_destroy(comch->producer_comp);
+        comch->producer_comp = NULL;
+    }
+
+    free(comch);
+    conn->dpa_comch = NULL;
+}
+
+/* Bring a running DPA thread to a quiescent (finished) state so its completion
+ * contexts and the thread itself can be destroyed. A thread executing the
+ * descriptor-ring poll loop never yields, so we signal the kernel (stop=1) and
+ * wait for it to acknowledge (stopped=1) - the kernel then calls
+ * doca_dpa_dev_thread_finish() and returns, releasing the EU.
+ *
+ * Note: we deliberately do NOT call doca_dpa_thread_stop() here. Per the DOCA
+ * DPA samples the teardown path is destroy-only (completions first, then the
+ * thread); calling thread_stop on this comch-attached thread returns
+ * DOCA_ERROR_DRIVER and corrupts the flexio thread/event-handler state, which
+ * later crashes the process. Bounded throughout so teardown can never hang. */
+void
+dmesh_doca_dpa_thread_quiesce(struct dmesh_doca_dpa_thread *dpa_thread)
+{
+    doca_error_t result;
+    uint32_t one = 1;
+    uint32_t stopped = 0;
+    int spins;
+
+    if (dpa_thread == NULL || dpa_thread->thread == NULL)
+        return;
+
+    /* A thread that was created but never run (arg == 0) has nothing polling. */
+    if (dpa_thread->arg == 0)
+        return;
+
+    result = doca_dpa_h2d_memcpy(dpa_thread->dpa,
+                                 dpa_thread->arg + offsetof(struct dpa_thread_arg, stop),
+                                 &one, sizeof(one));
+    if (result != DOCA_SUCCESS)
+        DOCA_LOG_ERR("Failed to signal DPA thread stop: %s", doca_error_get_name(result));
+
+    for (spins = 0; spins < 100000; spins++) {
+        result = doca_dpa_d2h_memcpy(dpa_thread->dpa, &stopped,
+                                     dpa_thread->arg + offsetof(struct dpa_thread_arg, stopped),
+                                     sizeof(stopped));
+        if (result == DOCA_SUCCESS && stopped != 0)
+            break;
+    }
+    if (stopped == 0)
+        DOCA_LOG_WARN("DPA thread did not acknowledge stop within bound; destroying anyway");
+}
+
+/* Destroy a pool DPA thread and free its arg memory, so the slot can be
+ * recreated fresh for the next connection (dmesh_dpa_thread_pool_alloc).
+ * The thread must already be quiesced (dmesh_doca_dpa_thread_quiesce) and its
+ * completion contexts destroyed (dmesh_doca_dpa_comch_destroy) first. */
+void
+dmesh_doca_dpa_thread_destroy(struct dmesh_doca_dpa_thread *dpa_thread)
+{
+    if (dpa_thread == NULL || dpa_thread->thread == NULL)
+        return;
+
+    (void)doca_dpa_thread_destroy(dpa_thread->thread);
+    dpa_thread->thread = NULL;
+
+    if (dpa_thread->arg != 0) {
+        (void)doca_dpa_mem_free(dpa_thread->dpa, dpa_thread->arg);
+        dpa_thread->arg = 0;
+    }
 }
 
 /*

@@ -111,6 +111,16 @@ struct dmesh_conn;
 doca_error_t
 dmesh_doca_dpa_comch_create(struct dmesh_conn *conn);
 
+/* Teardown counterparts (per-connection reuse without a proxy restart) */
+void
+dmesh_doca_dpa_comch_destroy(struct dmesh_conn *conn);
+/* Signal the kernel poll loop to exit, wait for the ack, then stop the thread
+ * (must precede comch/thread destruction - a hot thread cannot be stopped). */
+void
+dmesh_doca_dpa_thread_quiesce(struct dmesh_doca_dpa_thread *dpa_thread);
+void
+dmesh_doca_dpa_thread_destroy(struct dmesh_doca_dpa_thread *dpa_thread);
+
 doca_error_t
 dmesh_doca_run_dpa_thread(struct dmesh_conn *conn);
 
