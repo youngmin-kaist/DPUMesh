@@ -451,6 +451,152 @@ run_host_h2_bridge(struct objects *objs, int port)
     DOCA_LOG_INFO("bridge: connection closed");
 }
 
+/*
+ * Backend bridge (plan "안 2"): this host process provides a local TCP backend
+ * (e.g. nginx on the host) to the DPU proxy over DMA, with NO host DPA.
+ *
+ *   requests  (proxy -> backend): the DPU pushes batches into our rcvbuf's
+ *     data ring with its doca_dma engine and publishes each one via a 16B
+ *     descriptor slot (struct dmesh_push_desc); we busy-poll the slots in
+ *     order - plain reads of our own memory - and write the bytes to the TCP
+ *     connection we opened to the real backend.
+ *   responses (backend -> proxy): identical to the client bridge's forward
+ *     path - TCP recv into sndbuf, 128-aligned descriptors into the DMA ring;
+ *     the DPU-side DPA thread (the proxy's, on the DPU function) pulls them.
+ *
+ * connect_addr is "ip:port" of the real backend on this host.
+ */
+static void
+run_host_backend_bridge(struct objects *objs, const char *connect_addr)
+{
+    doca_dpa_dev_mmap_t local_mmap;
+    volatile struct dmesh_push_desc *descs =
+        (volatile struct dmesh_push_desc *)objs->rcvbuf.buf;
+    char *data_area = (char *)objs->rcvbuf.buf + DMESH_PUSH_DATA_OFF;
+    size_t data_size = objs->rcvbuf.size - DMESH_PUSH_DATA_OFF;
+    uint64_t expected = 1;
+    struct sockaddr_in addr;
+    char ip[64];
+    int port, cfd, one = 1;
+    size_t spos = 0;
+    char tmp[16384];
+    const char *colon = strrchr(connect_addr, ':');
+
+    if (colon == NULL || (size_t)(colon - connect_addr) >= sizeof(ip)) {
+        DOCA_LOG_ERR("backend bridge: bad DMESH_BACKEND_CONNECT '%s' (want ip:port)", connect_addr);
+        return;
+    }
+    memcpy(ip, connect_addr, colon - connect_addr);
+    ip[colon - connect_addr] = '\0';
+    port = atoi(colon + 1);
+
+    if (doca_mmap_dev_get_dpa_handle(objs->sndbuf.mmap, objs->dev, &local_mmap) != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("backend bridge: failed to get sndbuf DPA handle");
+        return;
+    }
+
+    cfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (cfd < 0) { DOCA_LOG_ERR("backend bridge: socket() failed"); return; }
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = inet_addr(ip);
+    addr.sin_port = htons((uint16_t)port);
+    if (connect(cfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        DOCA_LOG_ERR("backend bridge: connect(%s:%d) failed: %s", ip, port, strerror(errno));
+        close(cfd);
+        return;
+    }
+    setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    fcntl(cfd, F_SETFL, O_NONBLOCK);
+    DOCA_LOG_INFO("backend bridge: connected to %s:%d; serving over DMA (push mode)", ip, port);
+
+#define BACKEND_PENDING_SIZE (8 * 1024 * 1024)
+    char *pend = malloc(BACKEND_PENDING_SIZE);
+    size_t pend_head = 0, pend_len = 0;
+    int peer_gone = 0;
+    unsigned long req_bytes = 0, resp_bytes = 0;
+    if (pend == NULL) { close(cfd); return; }
+
+    while (!peer_gone) {
+        /* Requests: consume published push batches in order -> pending ring */
+        while (descs[expected % DMESH_PUSH_DESC_N].seq == expected) {
+            uint32_t pos = descs[expected % DMESH_PUSH_DESC_N].pos;
+            uint32_t len = descs[expected % DMESH_PUSH_DESC_N].len;
+            size_t tail, first;
+
+            if (len == 0 || (size_t)pos + len > data_size ||
+                pend_len + len > BACKEND_PENDING_SIZE)
+                break;                  /* bogus desc or backpressure */
+
+            tail = (pend_head + pend_len) % BACKEND_PENDING_SIZE;
+            first = len < BACKEND_PENDING_SIZE - tail ? len : BACKEND_PENDING_SIZE - tail;
+            memcpy(pend + tail, data_area + pos, first);
+            if (first < len)
+                memcpy(pend, data_area + pos + first, len - first);
+            pend_len += len;
+            req_bytes += len;
+            expected++;
+        }
+
+        /* Flush pending request bytes to the backend TCP (non-blocking) */
+        while (pend_len > 0) {
+            size_t run = pend_len < BACKEND_PENDING_SIZE - pend_head
+                             ? pend_len : BACKEND_PENDING_SIZE - pend_head;
+            ssize_t k = send(cfd, pend + pend_head, run, MSG_NOSIGNAL);
+            if (k > 0) {
+                pend_head = (pend_head + (size_t)k) % BACKEND_PENDING_SIZE;
+                pend_len -= (size_t)k;
+            } else if (k < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                break;
+            } else {
+                peer_gone = 1;
+                break;
+            }
+        }
+
+        /* Responses: backend TCP -> sndbuf -> forward DMA descriptors */
+        ssize_t n = recv(cfd, tmp, sizeof(tmp), 0);
+        if (n == 0) {
+            peer_gone = 1;
+        } else if (n > 0) {
+            size_t off = 0;
+            resp_bytes += (unsigned long)n;
+            while (off < (size_t)n) {
+                size_t remaining = (size_t)n - off;
+                size_t chunk;
+                struct dma_desc *d;
+
+                /* producer_dma_copy completion rule: multiple of 128B, or a
+                 * single <=128B block (see the client bridge) */
+                if (remaining <= 128)
+                    chunk = remaining;
+                else if (remaining >= 8064)
+                    chunk = 8064;
+                else
+                    chunk = remaining & ~(size_t)127;
+                if (spos + chunk > objs->sndbuf.size)
+                    spos = 0;
+                memcpy((char *)objs->sndbuf.buf + spos, tmp + off, chunk);
+                d = get_next_dma_desc(objs->dma_ring);
+                d->mmap = local_mmap;
+                d->addr = (uint64_t)objs->sndbuf.buf + spos;
+                d->size = chunk;
+                commit_dma_desc(objs->dma_ring);
+                spos += chunk;
+                off += chunk;
+            }
+        }
+        /* n < 0 with EAGAIN: nothing to read this iteration */
+
+        doca_pe_progress(objs->pe);     /* control path (comch) */
+    }
+
+    DOCA_LOG_INFO("backend bridge: closed (req=%lu bytes to backend, resp=%lu bytes back)",
+                  req_bytes, resp_bytes);
+    free(pend);
+    close(cfd);
+}
+
 void
 run_host_worker(struct objects *objs, const char *server_name)
 {
@@ -494,10 +640,25 @@ run_host_worker(struct objects *objs, const char *server_name)
         return;
     }
 
+    /* Backend provider mode (안 2): declare it in the flow metadata BEFORE the
+     * export; the DPU then pushes into our rcvbuf instead of exporting a
+     * rcv_ring, and we run no host DPA at all. */
+    const char *backend_connect = getenv("DMESH_BACKEND_CONNECT");
+    if (backend_connect != NULL) {
+        objs->flow.mode = DMESH_FLOW_MODE_BACKEND;
+        /* descriptor slots must start empty (seq 0) */
+        memset(objs->rcvbuf.buf, 0, DMESH_PUSH_DATA_OFF);
+    }
+
     /* export DMA ring + send/receive buffer metadata to DPU in one message */
     result = export_dma_metadata(objs);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to export DMA metadata: %s", doca_error_get_descr(result));
+        return;
+    }
+
+    if (backend_connect != NULL) {
+        run_host_backend_bridge(objs, backend_connect);
         return;
     }
 

@@ -35,6 +35,17 @@ doca_error_t
 submit_dma_task(struct dmesh_conn *conn, const struct doca_buf *src, struct doca_buf *dst);
 
 doca_error_t
+submit_dma_task_kind(struct dmesh_conn *conn, const struct doca_buf *src, struct doca_buf *dst,
+                     int kind);
+
+/* Backend (안 2) push: DMA up to one <=8KB batch DPU -> host rcvbuf data ring
+ * and publish it via a 16B descriptor slot (see struct dmesh_push_desc). No
+ * host DPA involved. Returns bytes accepted (0 = batch in flight, retry) or a
+ * negative doca_error_t. */
+int
+dmesh_dma_push_backend(struct dmesh_conn *conn, const uint8_t *data, size_t len);
+
+doca_error_t
 enqueue_dma_task(struct dmesh_conn *conn, const struct doca_buf *src, struct doca_buf *dst);
 
 /* Submit up to max_tasks queued tasks. A max_tasks value of zero processes the entire queue. */

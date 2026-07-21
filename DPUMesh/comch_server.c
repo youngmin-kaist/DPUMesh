@@ -775,6 +775,11 @@ dmesh_conn_teardown(struct dmesh_conn *conn)
     conn->tx_staging_len = 0;
     conn->tx_pos = 0;
     conn->reverse_exported = false;
+    conn->push_seq = 0;
+    conn->push_pos = 0;
+    conn->push_len = 0;
+    conn->push_state = 0;
+    conn->push_shadow = NULL;
 
     /* Per-connection DMA engine (ctx, inventory, task pool, recv/pending rings). */
     cleanup_dma_tasks(conn);
@@ -905,15 +910,43 @@ dmesh_doca_conn_advance(struct dmesh_conn *conn)
 		/* fallthrough */
 
 	case DMESH_CONN_RUNNING:
-		/* Reverse (response) path: allocate this connection's rcv_ring +
-		 * tx_staging and hand their export descriptors to the host, whose
-		 * DPA thread then DMAs responses back into the host rcvbuf. Idempotent
-		 * (guarded by conn->reverse_exported); retried until it succeeds. */
+		/* Reverse (DPU->host) path setup, once per connection.
+		 *
+		 * CLIENT flows (안 1): allocate rcv_ring + tx_staging and export them;
+		 * the host's DPA thread pulls responses into the host rcvbuf.
+		 *
+		 * BACKEND flows (안 2): the host runs NO DPA - the DPU pushes with
+		 * this connection's doca_dma engine straight into the host rcvbuf's
+		 * push layout (dmesh_dma_push_backend). Only a local (non-exported)
+		 * tx_staging is needed for staging + the descriptor shadow. */
 		if (!conn->reverse_exported) {
-			result = export_rcv_ring_metadata(conn);
-			if (result != DOCA_SUCCESS)
-				DOCA_LOG_ERR("Failed to export reverse metadata (will retry): %s",
-					     doca_error_get_name(result));
+			if (conn->flow.mode == DMESH_FLOW_MODE_BACKEND) {
+				if (conn->tx_staging == NULL) {
+					result = alloc_buffer_and_set_mmap(&conn->tx_staging_mmap,
+									   objs->dev, &conn->tx_staging,
+									   BUFFER_SIZE,
+									   DOCA_ACCESS_FLAG_LOCAL_READ_WRITE);
+					if (result != DOCA_SUCCESS) {
+						DOCA_LOG_ERR("Failed to alloc backend push staging (will retry): %s",
+							     doca_error_get_name(result));
+						break;
+					}
+					conn->tx_staging_len = BUFFER_SIZE;
+					conn->push_seq = 0;
+					conn->push_pos = 0;
+					conn->push_state = 0;
+				}
+				conn->reverse_exported = true;   /* nothing to export */
+				DOCA_LOG_INFO("Backend channel ready (push mode) for %u.%u.%u.%u:%u",
+					      conn->flow.dst_ip & 0xff, (conn->flow.dst_ip >> 8) & 0xff,
+					      (conn->flow.dst_ip >> 16) & 0xff, (conn->flow.dst_ip >> 24) & 0xff,
+					      conn->flow.dst_port);
+			} else {
+				result = export_rcv_ring_metadata(conn);
+				if (result != DOCA_SUCCESS)
+					DOCA_LOG_ERR("Failed to export reverse metadata (will retry): %s",
+						     doca_error_get_name(result));
+			}
 		}
 		break;
 

@@ -18,10 +18,16 @@ struct dmesh_dpa_thread_pool;
 struct dma_ring;
 struct objects;
 struct dmesh_conn;
+/* What a DMA task carries; drives the completion callback's behavior. */
+#define DMESH_TASK_NORMAL    0   /* legacy staging->rcvbuf copy */
+#define DMESH_TASK_PUSH_DATA 1   /* backend push: batch data -> host data ring */
+#define DMESH_TASK_PUSH_DESC 2   /* backend push: 16B descriptor -> host slot */
+
 struct dma_task_entry {
     struct dmesh_conn *owner;
     struct doca_dma_task_memcpy *task;
     doca_error_t result;
+    int kind;                    /* DMESH_TASK_* */
     bool in_free_queue;
     bool in_submission_queue;
     bool in_flight;
@@ -135,6 +141,17 @@ struct dmesh_conn {
     size_t tx_staging_len;
     uint32_t tx_pos;                          /* write cursor into tx_staging */
     bool reverse_exported;                    /* rcv_ring+tx_staging sent to host */
+
+    /* Backend (안 2) push state: DPU -> host via this connection's doca_dma,
+     * one batch outstanding at a time (data copy, then - from its completion
+     * callback - the 16B descriptor copy; see struct dmesh_push_desc). The
+     * batch staged in tx_staging stays untouched until the desc completes.
+     * push_shadow is the DPU-local (mmap'd) source of the descriptor copy. */
+    uint64_t push_seq;                        /* completed batches (next = +1) */
+    uint32_t push_pos;                        /* data-ring write offset (host side) */
+    uint32_t push_len;                        /* in-flight batch length */
+    int push_state;                           /* 0 idle, 1 data in flight, 2 desc in flight */
+    struct dmesh_push_desc *push_shadow;      /* in tx_staging's reserved tail */
 };
 
 /* DOCA objects for DPUMesh thread */

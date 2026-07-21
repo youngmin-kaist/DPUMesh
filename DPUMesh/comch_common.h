@@ -24,13 +24,47 @@ enum dmesh_msg_type {
  * address) and what iptables interception used to provide (original
  * destination) must be conveyed explicitly by the host shim.
  * ips/ports are little-endian host order (both PCIe endpoints are LE). */
+
+/* What role this dmesh connection plays. CLIENT: an intercepted outbound flow
+ * (the proxy serves it through the outbound stack). BACKEND: the host process
+ * is a backend provider - the proxy CONNECTS THROUGH this channel to reach the
+ * service at flow.dst instead of dialing TCP. */
+#define DMESH_FLOW_MODE_CLIENT  0u
+#define DMESH_FLOW_MODE_BACKEND 1u
+
 struct dmesh_flow_id {
     uint32_t src_ip;
-    uint32_t dst_ip;            /* ORIGINAL destination (pre-rewrite) */
+    uint32_t dst_ip;            /* ORIGINAL destination (pre-rewrite); for a
+                                   BACKEND flow: the service address provided */
     uint16_t src_port;
     uint16_t dst_port;
+    uint32_t mode;              /* DMESH_FLOW_MODE_* */
     char src_workload[64];      /* source workload identity (pod/SA), NUL-terminated */
 };
+
+/* Backend (plan "안 2") push channel layout, in the HOST's rcvbuf of a BACKEND
+ * connection. No host DPA is involved: the DPU pushes with its per-connection
+ * doca_dma engine and the host busy-polls plain memory.
+ *
+ *   rcvbuf[0 .. 2048)                : desc slot ring, DMESH_PUSH_DESC_N x 16B
+ *   rcvbuf[DMESH_PUSH_DATA_OFF .. )  : data ring
+ *
+ * Per batch (<= 8KB, the platform's single-DMA limit) the DPU DMAs the data
+ * into the data ring, then - only after that copy completes - DMAs one 16B
+ * descriptor into slot seq % N carrying {seq, pos, len}. The host consumes in
+ * order: it waits for desc[expected % N].seq == expected, copies
+ * data[pos, pos+len), and advances. Ordering is enforced by completion
+ * chaining on the DPU (desc submitted from the data copy's completion
+ * callback), and the slot ring tolerates the host lagging up to N batches
+ * (N * 8KB = the data ring size, so data and descriptors overwrite together). */
+struct dmesh_push_desc {
+    volatile uint64_t seq;      /* 1-based batch sequence; 0 = empty slot */
+    volatile uint32_t pos;      /* batch offset within the data ring */
+    volatile uint32_t len;      /* batch length in bytes */
+};
+#define DMESH_PUSH_DESC_N    128u
+#define DMESH_PUSH_DATA_OFF  4096u
+#define DMESH_PUSH_MAX_BATCH 8192u
 
 /* Single control-path message carrying all host-side DMA metadata: the DMA
  * ring, the send buffer and the receive buffer (address, size and PCI export

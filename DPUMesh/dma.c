@@ -18,6 +18,10 @@
 
 DOCA_LOG_REGISTER(DMA);
 
+/* backend push chaining stages (defined below, called from the completion cb) */
+static void dmesh_dma_push_submit_desc(struct dmesh_conn *conn);
+static void dmesh_dma_push_desc_done(struct dmesh_conn *conn);
+
 doca_error_t
 init_dma_resources(struct objects *objs)
 {
@@ -202,6 +206,7 @@ static void dmesh_doca_dpa_dma_task_completed_cb(struct doca_dma_task_memcpy *dm
 {
     struct dmesh_conn *conn = (struct dmesh_conn *)ctx_user_data.ptr;
     struct dma_task_entry *entry = (struct dma_task_entry *)task_user_data.ptr;
+    int kind = entry->kind;
     doca_error_t result;
 
     entry->in_flight = false;
@@ -210,6 +215,18 @@ static void dmesh_doca_dpa_dma_task_completed_cb(struct doca_dma_task_memcpy *dm
     if (result != DOCA_SUCCESS)
         DOCA_LOG_ERR("Failed to return completed DMA task to queue: %s",
                      doca_error_get_descr(result));
+
+    /* Backend push chaining (task submission is allowed inside a completion
+     * callback): data landed -> publish its descriptor; descriptor landed ->
+     * the batch is visible, accept the next one. */
+    if (kind == DMESH_TASK_PUSH_DATA) {
+        dmesh_dma_push_submit_desc(conn);
+        return;
+    }
+    if (kind == DMESH_TASK_PUSH_DESC) {
+        dmesh_dma_push_desc_done(conn);
+        return;
+    }
 
     /* a task (and its bufs) just freed up: run this connection's deferred
      * copies. Task submission is allowed inside a completion callback. */
@@ -230,6 +247,7 @@ static void dmesh_doca_dpa_dma_task_error_cb(struct doca_dma_task_memcpy *dma_ta
     struct dmesh_conn *conn = (struct dmesh_conn *)ctx_user_data.ptr;
 	struct doca_task *task = doca_dma_task_memcpy_as_task(dma_task);
     struct dma_task_entry *entry = (struct dma_task_entry *)task_user_data.ptr;
+    int kind = entry->kind;
     doca_error_t result;
 
     entry->in_flight = false;
@@ -240,6 +258,13 @@ static void dmesh_doca_dpa_dma_task_error_cb(struct doca_dma_task_memcpy *dma_ta
                      doca_error_get_descr(result));
 
     DOCA_LOG_ERR("DMA task failed: %s", doca_error_get_descr(entry->result));
+
+    /* A failed backend-push stage drops the batch (the byte stream loses those
+     * bytes - the h2 connection will reset); just unblock the pusher. */
+    if (kind == DMESH_TASK_PUSH_DATA || kind == DMESH_TASK_PUSH_DESC) {
+        conn->push_state = 0;
+        return;
+    }
 
     int i;
     for (i = 0; i < conn->num_dma_tasks; i++) {
@@ -483,7 +508,8 @@ destroy_dma:
 }
 
 doca_error_t
-submit_dma_task(struct dmesh_conn *conn, const struct doca_buf *src, struct doca_buf *dst)
+submit_dma_task_kind(struct dmesh_conn *conn, const struct doca_buf *src, struct doca_buf *dst,
+                     int kind)
 {
     struct doca_dma_task_memcpy *dma_task;
     struct dma_task_entry *entry;
@@ -499,8 +525,9 @@ submit_dma_task(struct dmesh_conn *conn, const struct doca_buf *src, struct doca
     entry = doca_task_get_user_data(doca_dma_task_memcpy_as_task(dma_task)).ptr;
 
     doca_dma_task_memcpy_set_src(dma_task, src);
-    doca_dma_task_memcpy_set_dst(dma_task, dst); 
+    doca_dma_task_memcpy_set_dst(dma_task, dst);
     entry->result = DOCA_ERROR_IN_PROGRESS;
+    entry->kind = kind;
 
     result = doca_task_submit(doca_dma_task_memcpy_as_task(dma_task));
     if (result == DOCA_SUCCESS) {
@@ -512,6 +539,130 @@ submit_dma_task(struct dmesh_conn *conn, const struct doca_buf *src, struct doca
     }
 
     return result;
+}
+
+doca_error_t
+submit_dma_task(struct dmesh_conn *conn, const struct doca_buf *src, struct doca_buf *dst)
+{
+    return submit_dma_task_kind(conn, src, dst, DMESH_TASK_NORMAL);
+}
+
+/* Backend (안 2) push: DPU -> host with this connection's doca_dma engine, no
+ * host DPA. Stages up to one <=8KB batch in tx_staging, DMAs it into the
+ * host's data ring (rcvbuf + DMESH_PUSH_DATA_OFF), and - from that copy's
+ * completion callback - DMAs a 16B dmesh_push_desc into slot seq % N. The
+ * host busy-polls the slots in order. One batch outstanding at a time.
+ * Returns bytes accepted (0 while a batch is in flight - caller retries), or
+ * a negative doca_error_t. */
+int
+dmesh_dma_push_backend(struct dmesh_conn *conn, const uint8_t *data, size_t len)
+{
+    struct doca_buf *sbuf = NULL, *dbuf = NULL;
+    size_t data_size, chunk;
+    doca_error_t result;
+
+    if (conn == NULL || data == NULL)
+        return -(int)DOCA_ERROR_INVALID_VALUE;
+    if (conn->tx_staging == NULL || conn->rcvbuf.mmap == NULL || conn->rcvbuf.buf == NULL)
+        return -(int)DOCA_ERROR_BAD_STATE;
+    if (conn->push_state != 0)
+        return 0;                       /* previous batch still in flight */
+    if (len == 0)
+        return 0;
+
+    /* usable data ring: bounded by the host data area and the staging (minus
+     * the 64B shadow tail reserved for the descriptor source) */
+    data_size = conn->rcvbuf.size - DMESH_PUSH_DATA_OFF;
+    if (data_size > conn->tx_staging_len - 64)
+        data_size = conn->tx_staging_len - 64;
+
+    chunk = len > DMESH_PUSH_MAX_BATCH ? DMESH_PUSH_MAX_BATCH : len;
+    if ((size_t)conn->push_pos + chunk > data_size)
+        conn->push_pos = 0;             /* wrap before, never across, the end */
+
+    /* stage the batch; it must stay put until the desc DMA completes */
+    memcpy((uint8_t *)conn->tx_staging + conn->push_pos, data, chunk);
+
+    result = doca_buf_inventory_buf_get_by_data(conn->buf_inv, conn->tx_staging_mmap,
+                                                (uint8_t *)conn->tx_staging + conn->push_pos,
+                                                chunk, &sbuf);
+    if (result != DOCA_SUCCESS)
+        return -(int)result;
+    result = doca_buf_inventory_buf_get_by_addr(conn->buf_inv, conn->rcvbuf.mmap,
+                                                (uint8_t *)conn->rcvbuf.buf + DMESH_PUSH_DATA_OFF +
+                                                    conn->push_pos,
+                                                chunk, &dbuf);
+    if (result != DOCA_SUCCESS) {
+        (void)doca_buf_dec_refcount(sbuf, NULL);
+        return -(int)result;
+    }
+
+    result = submit_dma_task_kind(conn, sbuf, dbuf, DMESH_TASK_PUSH_DATA);
+    if (result == DOCA_ERROR_AGAIN) {
+        (void)doca_buf_dec_refcount(dbuf, NULL);
+        (void)doca_buf_dec_refcount(sbuf, NULL);
+        return 0;                       /* task pool exhausted; retry later */
+    }
+    if (result != DOCA_SUCCESS)
+        return -(int)result;
+
+    conn->push_len = (uint32_t)chunk;
+    conn->push_state = 1;
+    return (int)chunk;
+}
+
+/* Second stage of a backend push, run from the data copy's completion
+ * callback: publish the batch by DMAing its 16B descriptor into the host's
+ * slot ring. The shadow (descriptor source) lives in tx_staging's reserved
+ * tail so it is mmap'd for DMA. */
+static void
+dmesh_dma_push_submit_desc(struct dmesh_conn *conn)
+{
+    struct doca_buf *sbuf = NULL, *dbuf = NULL;
+    uint64_t next_seq = conn->push_seq + 1;
+    doca_error_t result;
+
+    conn->push_shadow = (struct dmesh_push_desc *)((uint8_t *)conn->tx_staging +
+                                                   conn->tx_staging_len - 64);
+    conn->push_shadow->seq = next_seq;
+    conn->push_shadow->pos = conn->push_pos;
+    conn->push_shadow->len = conn->push_len;
+
+    result = doca_buf_inventory_buf_get_by_data(conn->buf_inv, conn->tx_staging_mmap,
+                                                conn->push_shadow,
+                                                sizeof(struct dmesh_push_desc), &sbuf);
+    if (result == DOCA_SUCCESS)
+        result = doca_buf_inventory_buf_get_by_addr(conn->buf_inv, conn->rcvbuf.mmap,
+                                                    (uint8_t *)conn->rcvbuf.buf +
+                                                        (next_seq % DMESH_PUSH_DESC_N) *
+                                                            sizeof(struct dmesh_push_desc),
+                                                    sizeof(struct dmesh_push_desc), &dbuf);
+    if (result == DOCA_SUCCESS)
+        result = submit_dma_task_kind(conn, sbuf, dbuf, DMESH_TASK_PUSH_DESC);
+
+    if (result == DOCA_SUCCESS) {
+        conn->push_state = 2;
+        return;
+    }
+
+    /* Batch is lost to the stream if we cannot publish it - log loudly. */
+    DOCA_LOG_ERR("backend push: failed to submit desc DMA (seq=%lu): %s",
+                 next_seq, doca_error_get_descr(result));
+    if (dbuf != NULL)
+        (void)doca_buf_dec_refcount(dbuf, NULL);
+    if (sbuf != NULL)
+        (void)doca_buf_dec_refcount(sbuf, NULL);
+    conn->push_state = 0;
+}
+
+/* Final stage: descriptor landed; the batch is visible to the host. */
+static void
+dmesh_dma_push_desc_done(struct dmesh_conn *conn)
+{
+    conn->push_seq++;
+    conn->push_pos += conn->push_len;
+    conn->push_len = 0;
+    conn->push_state = 0;
 }
 
 doca_error_t
