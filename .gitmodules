@@ -1,3 +1,6 @@
 [submodule "linkerd2-proxy"]
 	path = linkerd2-proxy
 	url = git@github.com:youngmin-kaist/linkerd2-proxy
+[submodule "transport"]
+	path = transport
+	url = https://github.com/jukebox03/DPUmesh
