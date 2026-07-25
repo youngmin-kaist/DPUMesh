@@ -1128,7 +1128,12 @@ host_worker_thread(void *arg)
      * (destination overridable via DMESH_DST_IP / DMESH_DST_PORT). */
     const char *dst_ip_env = getenv("DMESH_DST_IP");
     const char *dst_port_env = getenv("DMESH_DST_PORT");
-    objs->flow.src_ip = inet_addr("127.0.0.1");
+    /* Source IP conveyed in the flow identity (used by inbound authz network
+     * matching). Overridable via DMESH_SRC_IP; defaults to loopback. Note the
+     * proxy's inbound policy auto-permits 127.0.0.1/32 (localhost), so testing
+     * identity-based deny requires a non-loopback src. */
+    const char *src_ip_env = getenv("DMESH_SRC_IP");
+    objs->flow.src_ip = inet_addr(src_ip_env != NULL ? src_ip_env : "127.0.0.1");
     objs->flow.src_port = (uint16_t)(40000 + ctx->idx);
     objs->flow.dst_ip = inet_addr(dst_ip_env != NULL ? dst_ip_env : "127.0.0.1");
     objs->flow.dst_port = (uint16_t)(dst_port_env != NULL ? atoi(dst_port_env) : 8080);
