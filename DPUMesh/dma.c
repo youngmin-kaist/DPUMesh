@@ -548,20 +548,20 @@ submit_dma_task(struct dmesh_conn *conn, const struct doca_buf *src, struct doca
 }
 
 /* Backend (안 2) push: DPU -> host with this connection's doca_dma engine, no
- * host DPA. Stages up to one <=8KB batch in tx_staging, DMAs it into the
- * host's data ring (rcvbuf + DMESH_PUSH_DATA_OFF), and - from that copy's
- * completion callback - DMAs a 16B dmesh_push_desc into slot seq % N. The
- * host busy-polls the slots in order. One batch outstanding at a time.
- * Returns bytes accepted (0 while a batch is in flight - caller retries), or
- * a negative doca_error_t. */
+ * host DPA. The batch is ALREADY staged at tx_staging+src_pos (the Rust writer
+ * put it there); this DMAs up to <=8KB of it into the host's data ring
+ * (rcvbuf + DMESH_PUSH_DATA_OFF) and - from that copy's completion callback -
+ * DMAs a 16B dmesh_push_desc into slot seq % N. The host busy-polls the slots
+ * in order. One batch outstanding at a time. Returns bytes accepted (0 while a
+ * batch is in flight - caller retries), or a negative doca_error_t. */
 int
-dmesh_dma_push_backend(struct dmesh_conn *conn, const uint8_t *data, size_t len)
+dmesh_dma_push_staged(struct dmesh_conn *conn, uint32_t src_pos, uint32_t len)
 {
     struct doca_buf *sbuf = NULL, *dbuf = NULL;
     size_t data_size, chunk;
     doca_error_t result;
 
-    if (conn == NULL || data == NULL)
+    if (conn == NULL)
         return -(int)DOCA_ERROR_INVALID_VALUE;
     if (conn->tx_staging == NULL || conn->rcvbuf.mmap == NULL || conn->rcvbuf.buf == NULL)
         return -(int)DOCA_ERROR_BAD_STATE;
@@ -570,21 +570,20 @@ dmesh_dma_push_backend(struct dmesh_conn *conn, const uint8_t *data, size_t len)
     if (len == 0)
         return 0;
 
-    /* usable data ring: bounded by the host data area and the staging (minus
-     * the 64B shadow tail reserved for the descriptor source) */
+    /* The bytes are already staged at tx_staging+src_pos (written once by the
+     * Rust side). We only build the DMA and publish a descriptor - no memcpy.
+     * push_pos is our own cursor into the HOST data ring (destination), tracked
+     * independently of the source and advanced in dmesh_dma_push_desc_done. */
     data_size = conn->rcvbuf.size - DMESH_PUSH_DATA_OFF;
     if (data_size > conn->tx_staging_len - 64)
         data_size = conn->tx_staging_len - 64;
 
     chunk = len > DMESH_PUSH_MAX_BATCH ? DMESH_PUSH_MAX_BATCH : len;
     if ((size_t)conn->push_pos + chunk > data_size)
-        conn->push_pos = 0;             /* wrap before, never across, the end */
-
-    /* stage the batch; it must stay put until the desc DMA completes */
-    memcpy((uint8_t *)conn->tx_staging + conn->push_pos, data, chunk);
+        conn->push_pos = 0;             /* wrap the destination before the end */
 
     result = doca_buf_inventory_buf_get_by_data(conn->buf_inv, conn->tx_staging_mmap,
-                                                (uint8_t *)conn->tx_staging + conn->push_pos,
+                                                (uint8_t *)conn->tx_staging + src_pos,
                                                 chunk, &sbuf);
     if (result != DOCA_SUCCESS)
         return -(int)result;

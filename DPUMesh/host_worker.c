@@ -668,11 +668,17 @@ run_host_worker(struct objects *objs, const char *server_name)
     DOCA_LOG_INFO("Waiting for reverse-path metadata from DPU...");
     while (!objs->reverse_ready)
         doca_pe_progress(objs->pe);
-    result = setup_reverse_dpa(objs);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to set up reverse path: %s", doca_error_get_descr(result));
-        return;
-    }
+    /* Forward-only throughput bench: DMESH_SKIP_REVERSE=1 skips the reverse
+     * host DPA (flexio is one-process-per-function, so multiple host threads
+     * can't each open 94:00.0) and goes straight to the forward send loop.
+     * Bridge/response modes are unavailable in this mode. */
+    const char *skip_reverse = getenv("DMESH_SKIP_REVERSE");
+    if (skip_reverse == NULL || atoi(skip_reverse) == 0) {
+        result = setup_reverse_dpa(objs);
+        if (result != DOCA_SUCCESS) {
+            DOCA_LOG_ERR("Failed to set up reverse path: %s", doca_error_get_descr(result));
+            return;
+        }
 
     /* Benchmark bridge mode: expose the DMA path as a local TCP endpoint so
      * h2load (or any TCP client) can drive it. DMESH_BRIDGE_PORT=<port>. */
@@ -683,6 +689,7 @@ run_host_worker(struct objects *objs, const char *server_name)
             return;
         }
     }
+    }   /* end !DMESH_SKIP_REVERSE */
 
     // result = init_dpa_objects(objs);
     // if (result != DOCA_SUCCESS) {
