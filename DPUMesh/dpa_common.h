@@ -294,6 +294,32 @@ struct grpc_req_desc {
 	uint8_t reserved[34];
 } __attribute__((__packed__, aligned(DMA_RING_CACHELINE_SIZE)));
 
+/* ====== SwDescriptor (host-internal RX/TX descriptor, packed) ====== */
+/* Host-internal descriptor (NOT a wire layout): the façade builds it for
+ * dpumesh_enqueue (translated to dma_desc) and dpumesh_dequeue fills it from a
+ * delivered completion. Carries the oriented endpoint tuple — see api.md §5/§6. */
+typedef struct {
+	uint64_t addr;					/* TX/RX buffer address */
+    uint16_t body_len;
+	/* --- */
+    /* ---- oriented endpoint tuple ---- */
+    uint16_t src_pod;               /* sender pod (always concrete) */
+    uint16_t src_service;           /* sender's own service (= ep service_id); SVC_NONE if none */
+    uint16_t src_port;              /* sender port */
+    uint16_t dst_pod;               /* dest pod; DMESH_POD_BLANK(-1) -> DPU resolves dst_service */
+	/* --- */
+	uint16_t dst_service;           /* peer service (routing input when dst_pod==BLANK) */
+    uint16_t dst_port;              /* dest port; DMESH_PORT_BLANK(0) -> accept queue */
+    uint16_t seq;                   /* per-conn sequence (match key with port) */
+	uint8_t  padding;				/* padding to align to 128 bytes */
+    uint8_t  flags;					/* valid, eop, type (data, health check probe, ...), etc */
+	/* --- */
+
+	// TODO: What can we do with the remaining 40 bytes? 
+	// 		 Maybe we can use it for some metadata or future extensions.
+	uint8_t reserved[40]; 			/* pad to 64 bytes */
+} __attribute__((__packed__, aligned(DMA_RING_CACHELINE_SIZE))) sw_descriptor_t;
+
 struct dma_ring_consumer_state {
 	volatile uint64_t consumer_seq;
 	uint8_t reserved[56];
