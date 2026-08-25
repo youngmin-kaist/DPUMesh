@@ -1,0 +1,2 @@
+option('use_jemalloc', type : 'boolean', value : true,
+  description : 'Interpose jemalloc (libjemalloc.so.2) for the allocation-heavy request path')
