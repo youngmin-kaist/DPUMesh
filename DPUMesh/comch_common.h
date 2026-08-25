@@ -31,6 +31,12 @@ enum dmesh_msg_type {
  * service at flow.dst instead of dialing TCP. */
 #define DMESH_FLOW_MODE_CLIENT  0u
 #define DMESH_FLOW_MODE_BACKEND 1u
+/* Client-semantics flow carried over the push transport (안 2): the DPU serves
+ * it like CLIENT (h2 server), but the reverse path is the DPA-free push channel
+ * so ingress host processes scale past the flexio one-per-function limit. */
+#define DMESH_FLOW_MODE_INGRESS_PUSH 2u
+/* True for modes whose reverse (DPU->host) path uses the push engine. */
+#define DMESH_FLOW_USES_PUSH(m) ((m) == DMESH_FLOW_MODE_BACKEND || (m) == DMESH_FLOW_MODE_INGRESS_PUSH)
 
 struct dmesh_flow_id {
     uint32_t src_ip;

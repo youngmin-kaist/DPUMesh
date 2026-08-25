@@ -1,0 +1,21 @@
+[package]
+name = "hpack-h2-bench"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+h2 = "0.4"
+bytes = "1"
+http = "1"
+hyper = { version = "1", features = ["client", "server", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tokio = { version = "1", features = ["rt", "io-util", "macros", "time", "sync"] }
+http-body-util = "0.1"
+pprof = { version = "0.15", features = ["protobuf-codec"] }
+
+[profile.release]
+debug = 1
+lto = true
+
+[patch.crates-io]
+h2 = { path = "vendor/h2" }

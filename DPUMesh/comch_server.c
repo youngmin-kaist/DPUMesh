@@ -920,7 +920,7 @@ dmesh_doca_conn_advance(struct dmesh_conn *conn)
 		 * push layout (dmesh_dma_push_backend). Only a local (non-exported)
 		 * tx_staging is needed for staging + the descriptor shadow. */
 		if (!conn->reverse_exported) {
-			if (conn->flow.mode == DMESH_FLOW_MODE_BACKEND) {
+			if (DMESH_FLOW_USES_PUSH(conn->flow.mode)) {
 				if (conn->tx_staging == NULL) {
 					result = alloc_buffer_and_set_mmap(&conn->tx_staging_mmap,
 									   objs->dev, &conn->tx_staging,
@@ -937,7 +937,8 @@ dmesh_doca_conn_advance(struct dmesh_conn *conn)
 					conn->push_state = 0;
 				}
 				conn->reverse_exported = true;   /* nothing to export */
-				DOCA_LOG_INFO("Backend channel ready (push mode) for %u.%u.%u.%u:%u",
+				DOCA_LOG_INFO("Push channel ready (mode %u) for %u.%u.%u.%u:%u",
+					      conn->flow.mode,
 					      conn->flow.dst_ip & 0xff, (conn->flow.dst_ip >> 8) & 0xff,
 					      (conn->flow.dst_ip >> 16) & 0xff, (conn->flow.dst_ip >> 24) & 0xff,
 					      conn->flow.dst_port);

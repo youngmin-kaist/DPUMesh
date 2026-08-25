@@ -3,6 +3,9 @@
 #include "doca_dpa_dev_buf.h"
 #include "dpaintrin.h"
 #include "dpa_common.h"
+#include "hpack_walk.h"
+#include "dsb_blocks.h"
+#include "hpack_term.h"
 /*
  * RPC for initializing DPA IO thread called before running the thread
  *
@@ -466,6 +469,145 @@ static void run_dma_copy_bench(struct dpa_thread_arg *a)
     }
 }
 
+/* Selective-HPACK-walk microbenchmark (bench_mode 3): measures the pure
+ * compute cost of the connection-state HPACK walker on a DPA EU, using real
+ * header blocks captured from the h2load workload (11B steady-state block =
+ * 99.998% of traffic; 39B first block exercises dynamic-table inserts +
+ * huffman). No DMA involved — this isolates walk ns/block so it can be
+ * compared with the ARM figure from the same walker source. */
+static const unsigned char hpack_block_first[39] = {
+    0x04,0x85,0x60,0xf1,0xf4,0x0f,0x5f,0x86,0x41,0x8b,0x08,0x9d,0x5c,0x0b,
+    0x81,0x70,0xdc,0x0b,0x60,0x00,0x7f,0x82,0x7a,0x8f,0x9c,0x54,0x1c,0x72,
+    0x29,0x54,0xd3,0xa5,0x35,0x89,0x80,0xae,0xd3,0x2b,0x83};
+static const unsigned char hpack_block_steady[11] = {
+    0x04,0x85,0x60,0xf1,0xf4,0x0f,0x5f,0x86,0xbf,0x82,0xbe};
+
+#define DSB_BLK(i) (dsb_steady_data + dsb_steady_off[i]), \
+                   (int)(dsb_steady_off[(i) + 1] - dsb_steady_off[(i)])
+#define DSB_NI(i)  (dsb_ni_steady_data + dsb_ni_steady_off[i]), \
+                   (int)(dsb_ni_steady_off[(i) + 1] - dsb_ni_steady_off[(i)])
+
+/* bench_mode 3: selective walk over the DSB gRPC blocks (256-block cycle,
+ * churning dynamic table). Old h2load blocks kept for reference. */
+static void run_hpack_walk_bench(struct dpa_thread_arg *a)
+{
+    static struct hw_state st;      /* static: DPA stack is tiny */
+    static struct hw_out out;
+    uint32_t n = a->bench_num_ops;
+    uint64_t t0, t1, c0, c1;
+    uint32_t i;
+    int rc;
+    volatile unsigned int sink = 0;
+
+    hw_init(&st);
+    rc = hw_walk(dsb_first, sizeof(dsb_first), &st, &out, 0);
+    DOCA_DPA_DEV_LOG_INFO("HPACK_BENCH dsb first rc=%d have=%x plen=%u\n",
+                          rc, out.have, out.plen);
+
+    t0 = __dpa_thread_time();
+    c0 = __dpa_thread_cycles();
+    for (i = 0; i < n; i++) {
+        if (i % DSB_STEADY_N == 0) {   /* connection replay boundary */
+            hw_init(&st);
+            hw_walk(dsb_first, sizeof(dsb_first), &st, &out, 0);
+        }
+        rc = hw_walk(DSB_BLK(i % DSB_STEADY_N), &st, &out, 0);
+        if (rc) { DOCA_DPA_DEV_LOG_INFO("HPACK_BENCH walk FAIL i=%u\n", i); return; }
+        sink += out.plen;
+    }
+    c1 = __dpa_thread_cycles();
+    t1 = __dpa_thread_time();
+    DOCA_DPA_DEV_LOG_INFO("HPACK_BENCH dsb SELECTIVE ops=%u cycles=%lu us=%lu have=%x sink=%u\n",
+                          n, c1 - c0, t1 - t0, out.have, sink);
+
+    /* NI variant: trace-id without indexing */
+    t0 = __dpa_thread_time();
+    c0 = __dpa_thread_cycles();
+    for (i = 0; i < n; i++) {
+        if (i % DSB_STEADY_N == 0) {
+            hw_init(&st);
+            hw_walk(dsb_ni_first, sizeof(dsb_ni_first), &st, &out, 0);
+        }
+        rc = hw_walk(DSB_NI(i % DSB_STEADY_N), &st, &out, 0);
+        if (rc) { DOCA_DPA_DEV_LOG_INFO("HPACK_BENCH NI walk FAIL i=%u\n", i); return; }
+        sink += out.plen;
+    }
+    c1 = __dpa_thread_cycles();
+    t1 = __dpa_thread_time();
+    DOCA_DPA_DEV_LOG_INFO("HPACK_BENCH dsb NI-SELECTIVE ops=%u cycles=%lu us=%lu sink=%u\n",
+                          n, c1 - c0, t1 - t0, sink);
+}
+
+/* bench_mode 4: FULL decode (materialize all 8 fields).
+ * bench_mode 5: decode + re-encode (termination baseline). */
+static void run_hpack_term_bench(struct dpa_thread_arg *a, int reencode)
+{
+    static struct ht_table dec, enc;
+    static struct ht_field fields[HT_MAX_FIELDS];
+    static unsigned char blk[512];
+    uint32_t n = a->bench_num_ops;
+    uint64_t t0, t1, c0, c1;
+    uint32_t i;
+    int rc, nf = 0, el = 0;
+    volatile int sink = 0;
+
+    ht_init(&dec); ht_init(&enc);
+    rc = ht_decode(dsb_first, sizeof(dsb_first), &dec, fields, &nf);
+    if (reencode)
+        el = ht_encode(fields, nf, &enc, blk, sizeof(blk));
+    DOCA_DPA_DEV_LOG_INFO("HPACK_TERM first rc=%d nf=%d el=%d mode=%d\n",
+                          rc, nf, el, reencode);
+
+    t0 = __dpa_thread_time();
+    c0 = __dpa_thread_cycles();
+    for (i = 0; i < n; i++) {
+        if (i % DSB_STEADY_N == 0) {   /* connection replay boundary */
+            ht_init(&dec); ht_init(&enc);
+            ht_decode(dsb_first, sizeof(dsb_first), &dec, fields, &nf);
+            if (reencode)
+                ht_encode(fields, nf, &enc, blk, sizeof(blk));
+        }
+        rc = ht_decode(DSB_BLK(i % DSB_STEADY_N), &dec, fields, &nf);
+        if (rc) { DOCA_DPA_DEV_LOG_INFO("HPACK_TERM decode FAIL i=%u\n", i); return; }
+        if (reencode) {
+            el = ht_encode(fields, nf, &enc, blk, sizeof(blk));
+            if (el <= 0) { DOCA_DPA_DEV_LOG_INFO("HPACK_TERM encode FAIL i=%u\n", i); return; }
+            sink += el;
+        } else {
+            sink += nf;
+        }
+    }
+    c1 = __dpa_thread_cycles();
+    t1 = __dpa_thread_time();
+    DOCA_DPA_DEV_LOG_INFO("HPACK_TERM %s ops=%u cycles=%lu us=%lu sink=%d\n",
+                          reencode ? "DEC+REENC" : "DECODE",
+                          n, c1 - c0, t1 - t0, sink);
+
+    /* NI variant */
+    t0 = __dpa_thread_time();
+    c0 = __dpa_thread_cycles();
+    for (i = 0; i < n; i++) {
+        if (i % DSB_STEADY_N == 0) {
+            ht_init(&dec); ht_init(&enc);
+            ht_decode(dsb_ni_first, sizeof(dsb_ni_first), &dec, fields, &nf);
+            if (reencode)
+                ht_encode(fields, nf, &enc, blk, sizeof(blk));
+        }
+        rc = ht_decode(DSB_NI(i % DSB_STEADY_N), &dec, fields, &nf);
+        if (rc) { DOCA_DPA_DEV_LOG_INFO("HPACK_TERM NI decode FAIL i=%u\n", i); return; }
+        if (reencode) {
+            el = ht_encode(fields, nf, &enc, blk, sizeof(blk));
+            if (el <= 0) { DOCA_DPA_DEV_LOG_INFO("HPACK_TERM NI encode FAIL i=%u\n", i); return; }
+            sink += el;
+        } else sink += nf;
+    }
+    c1 = __dpa_thread_cycles();
+    t1 = __dpa_thread_time();
+    DOCA_DPA_DEV_LOG_INFO("HPACK_TERM NI-%s ops=%u cycles=%lu us=%lu sink=%d\n",
+                          reencode ? "DEC+REENC" : "DECODE",
+                          n, c1 - c0, t1 - t0, sink);
+}
+
 __dpa_global__ void run_dma_manager(uint64_t arg)
 {
     struct dpa_thread_arg *thread_arg = (struct dpa_thread_arg *)arg;
@@ -475,7 +617,14 @@ __dpa_global__ void run_dma_manager(uint64_t arg)
     DOCA_DPA_DEV_LOG_INFO("DPU mmap: %u, addr: %p host mmap: %u\n", thread_arg->dpu_mmap, thread_arg->src_addr, thread_arg->host_mmap);
 
     if (thread_arg->bench_mode != 0) {
-        run_dma_copy_bench(thread_arg);
+        if (thread_arg->bench_mode == 3)
+            run_hpack_walk_bench(thread_arg);
+        else if (thread_arg->bench_mode == 4)
+            run_hpack_term_bench(thread_arg, 0);
+        else if (thread_arg->bench_mode == 5)
+            run_hpack_term_bench(thread_arg, 1);
+        else
+            run_dma_copy_bench(thread_arg);
         /* run once per thread activation only */
         thread_arg->bench_mode = 0;
         doca_dpa_dev_thread_reschedule();

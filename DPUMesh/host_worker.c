@@ -452,22 +452,13 @@ run_host_h2_bridge(struct objects *objs, int port)
 }
 
 /*
- * Backend bridge (plan "안 2"): this host process provides a local TCP backend
- * (e.g. nginx on the host) to the DPU proxy over DMA, with NO host DPA.
- *
- *   requests  (proxy -> backend): the DPU pushes batches into our rcvbuf's
- *     data ring with its doca_dma engine and publishes each one via a 16B
- *     descriptor slot (struct dmesh_push_desc); we busy-poll the slots in
- *     order - plain reads of our own memory - and write the bytes to the TCP
- *     connection we opened to the real backend.
- *   responses (backend -> proxy): identical to the client bridge's forward
- *     path - TCP recv into sndbuf, 128-aligned descriptors into the DMA ring;
- *     the DPU-side DPA thread (the proxy's, on the DPU function) pulls them.
- *
- * connect_addr is "ip:port" of the real backend on this host.
+ * Shared TCP<->push-DMA splice used by both push bridges (backend = connect
+ * side, ingress = listen side). Socket-side bytes go to the forward path
+ * (sndbuf staging + 128-aligned descriptors); DPU-side bytes arrive as push
+ * batches in rcvbuf's slot ring and are flushed to the socket non-blocking.
  */
 static void
-run_host_backend_bridge(struct objects *objs, const char *connect_addr)
+run_host_push_splice(struct objects *objs, int cfd, const char *tag)
 {
     doca_dpa_dev_mmap_t local_mmap;
     volatile struct dmesh_push_desc *descs =
@@ -475,50 +466,23 @@ run_host_backend_bridge(struct objects *objs, const char *connect_addr)
     char *data_area = (char *)objs->rcvbuf.buf + DMESH_PUSH_DATA_OFF;
     size_t data_size = objs->rcvbuf.size - DMESH_PUSH_DATA_OFF;
     uint64_t expected = 1;
-    struct sockaddr_in addr;
-    char ip[64];
-    int port, cfd, one = 1;
     size_t spos = 0;
     char tmp[16384];
-    const char *colon = strrchr(connect_addr, ':');
-
-    if (colon == NULL || (size_t)(colon - connect_addr) >= sizeof(ip)) {
-        DOCA_LOG_ERR("backend bridge: bad DMESH_BACKEND_CONNECT '%s' (want ip:port)", connect_addr);
-        return;
-    }
-    memcpy(ip, connect_addr, colon - connect_addr);
-    ip[colon - connect_addr] = '\0';
-    port = atoi(colon + 1);
 
     if (doca_mmap_dev_get_dpa_handle(objs->sndbuf.mmap, objs->dev, &local_mmap) != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("backend bridge: failed to get sndbuf DPA handle");
+        DOCA_LOG_ERR("%s: failed to get sndbuf DPA handle", tag);
         return;
     }
-
-    cfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (cfd < 0) { DOCA_LOG_ERR("backend bridge: socket() failed"); return; }
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = inet_addr(ip);
-    addr.sin_port = htons((uint16_t)port);
-    if (connect(cfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        DOCA_LOG_ERR("backend bridge: connect(%s:%d) failed: %s", ip, port, strerror(errno));
-        close(cfd);
-        return;
-    }
-    setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    fcntl(cfd, F_SETFL, O_NONBLOCK);
-    DOCA_LOG_INFO("backend bridge: connected to %s:%d; serving over DMA (push mode)", ip, port);
 
 #define BACKEND_PENDING_SIZE (8 * 1024 * 1024)
     char *pend = malloc(BACKEND_PENDING_SIZE);
     size_t pend_head = 0, pend_len = 0;
     int peer_gone = 0;
     unsigned long req_bytes = 0, resp_bytes = 0;
-    if (pend == NULL) { close(cfd); return; }
+    if (pend == NULL) return;
 
     while (!peer_gone) {
-        /* Requests: consume published push batches in order -> pending ring */
+        /* DPU->host: consume published push batches in order -> pending ring */
         while (descs[expected % DMESH_PUSH_DESC_N].seq == expected) {
             uint32_t pos = descs[expected % DMESH_PUSH_DESC_N].pos;
             uint32_t len = descs[expected % DMESH_PUSH_DESC_N].len;
@@ -538,7 +502,7 @@ run_host_backend_bridge(struct objects *objs, const char *connect_addr)
             expected++;
         }
 
-        /* Flush pending request bytes to the backend TCP (non-blocking) */
+        /* Flush pending DPU bytes to the TCP peer (non-blocking) */
         while (pend_len > 0) {
             size_t run = pend_len < BACKEND_PENDING_SIZE - pend_head
                              ? pend_len : BACKEND_PENDING_SIZE - pend_head;
@@ -554,7 +518,7 @@ run_host_backend_bridge(struct objects *objs, const char *connect_addr)
             }
         }
 
-        /* Responses: backend TCP -> sndbuf -> forward DMA descriptors */
+        /* host->DPU: TCP -> sndbuf -> forward DMA descriptors */
         ssize_t n = recv(cfd, tmp, sizeof(tmp), 0);
         if (n == 0) {
             peer_gone = 1;
@@ -591,9 +555,94 @@ run_host_backend_bridge(struct objects *objs, const char *connect_addr)
         doca_pe_progress(objs->pe);     /* control path (comch) */
     }
 
-    DOCA_LOG_INFO("backend bridge: closed (req=%lu bytes to backend, resp=%lu bytes back)",
-                  req_bytes, resp_bytes);
+    DOCA_LOG_INFO("%s: closed (from-DPU=%lu bytes, to-DPU=%lu bytes)",
+                  tag, req_bytes, resp_bytes);
     free(pend);
+}
+
+/*
+ * Push-transport INGRESS bridge (listen side): h2load connects here; the DPU
+ * serves the flow as a CLIENT (h2 server) while the reverse path is the
+ * DPA-free push channel, so any number of these processes can run.
+ * DMESH_PUSH_BRIDGE_PORT=<port>. One connection then exit, like the peers.
+ */
+static void
+run_host_push_ingress_bridge(struct objects *objs, int port)
+{
+    struct sockaddr_in addr;
+    int lfd, cfd, one = 1;
+
+    lfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (lfd < 0) { DOCA_LOG_ERR("push-ingress: socket() failed"); return; }
+    setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons((uint16_t)port);
+    if (bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        DOCA_LOG_ERR("push-ingress: bind(:%d) failed: %s", port, strerror(errno));
+        close(lfd);
+        return;
+    }
+    listen(lfd, 1);
+    DOCA_LOG_INFO("push-ingress: listening on :%d (h2load -c1 here)", port);
+    cfd = accept(lfd, NULL, NULL);
+    if (cfd < 0) { DOCA_LOG_ERR("push-ingress: accept() failed"); close(lfd); return; }
+    setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    fcntl(cfd, F_SETFL, O_NONBLOCK);
+
+    run_host_push_splice(objs, cfd, "push-ingress");
+    close(cfd);
+    close(lfd);
+}
+
+/*
+ * Backend bridge (plan "안 2"): this host process provides a local TCP backend
+ * (e.g. nginx on the host) to the DPU proxy over DMA, with NO host DPA.
+ *
+ *   requests  (proxy -> backend): the DPU pushes batches into our rcvbuf's
+ *     data ring with its doca_dma engine and publishes each one via a 16B
+ *     descriptor slot (struct dmesh_push_desc); we busy-poll the slots in
+ *     order - plain reads of our own memory - and write the bytes to the TCP
+ *     connection we opened to the real backend.
+ *   responses (backend -> proxy): identical to the client bridge's forward
+ *     path - TCP recv into sndbuf, 128-aligned descriptors into the DMA ring;
+ *     the DPU-side DPA thread (the proxy's, on the DPU function) pulls them.
+ *
+ * connect_addr is "ip:port" of the real backend on this host.
+ */
+static void
+run_host_backend_bridge(struct objects *objs, const char *connect_addr)
+{
+    struct sockaddr_in addr;
+    char ip[64];
+    int port, cfd, one = 1;
+    const char *colon = strrchr(connect_addr, ':');
+
+    if (colon == NULL || (size_t)(colon - connect_addr) >= sizeof(ip)) {
+        DOCA_LOG_ERR("backend bridge: bad DMESH_BACKEND_CONNECT '%s' (want ip:port)", connect_addr);
+        return;
+    }
+    memcpy(ip, connect_addr, colon - connect_addr);
+    ip[colon - connect_addr] = '\0';
+    port = atoi(colon + 1);
+
+    cfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (cfd < 0) { DOCA_LOG_ERR("backend bridge: socket() failed"); return; }
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = inet_addr(ip);
+    addr.sin_port = htons((uint16_t)port);
+    if (connect(cfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        DOCA_LOG_ERR("backend bridge: connect(%s:%d) failed: %s", ip, port, strerror(errno));
+        close(cfd);
+        return;
+    }
+    setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    fcntl(cfd, F_SETFL, O_NONBLOCK);
+    DOCA_LOG_INFO("backend bridge: connected to %s:%d; serving over DMA (push mode)", ip, port);
+
+    run_host_push_splice(objs, cfd, "backend bridge");
     close(cfd);
 }
 
@@ -650,6 +699,15 @@ run_host_worker(struct objects *objs, const char *server_name)
         memset(objs->rcvbuf.buf, 0, DMESH_PUSH_DATA_OFF);
     }
 
+    /* Push-transport ingress (client-semantics flow, DPA-free reverse):
+     * declared in the metadata like BACKEND so the DPU uses the push engine,
+     * but served as a client flow by the proxy. */
+    const char *push_port = getenv("DMESH_PUSH_BRIDGE_PORT");
+    if (push_port != NULL && atoi(push_port) > 0) {
+        objs->flow.mode = DMESH_FLOW_MODE_INGRESS_PUSH;
+        memset(objs->rcvbuf.buf, 0, DMESH_PUSH_DATA_OFF);
+    }
+
     /* export DMA ring + send/receive buffer metadata to DPU in one message */
     result = export_dma_metadata(objs);
     if (result != DOCA_SUCCESS) {
@@ -659,6 +717,11 @@ run_host_worker(struct objects *objs, const char *server_name)
 
     if (backend_connect != NULL) {
         run_host_backend_bridge(objs, backend_connect);
+        return;
+    }
+
+    if (push_port != NULL && atoi(push_port) > 0) {
+        run_host_push_ingress_bridge(objs, atoi(push_port));
         return;
     }
 
@@ -1140,9 +1203,12 @@ host_worker_thread(void *arg)
     snprintf(objs->flow.src_workload, sizeof(objs->flow.src_workload),
              "host-worker-%d", ctx->idx);
 
-    /* spread connections across the DPU worker servers round-robin */
+    /* spread connections across the DPU worker servers round-robin;
+     * DMESH_SERVER_IDX pins a standalone bridge process to one worker */
     int num_dpu_workers = ctx->gcfg->num_dpu_workers > 0 ? ctx->gcfg->num_dpu_workers : 1;
-    snprintf(server_name, sizeof(server_name), "DPUMesh%d", ctx->idx % num_dpu_workers);
+    const char *sidx = getenv("DMESH_SERVER_IDX");
+    int idx_eff = sidx != NULL ? atoi(sidx) : (ctx->idx % num_dpu_workers);
+    snprintf(server_name, sizeof(server_name), "DPUMesh%d", idx_eff);
 
     DOCA_LOG_INFO("worker %d: connecting to DPU server '%s'", ctx->idx, server_name);
     run_host_worker(objs, server_name);
