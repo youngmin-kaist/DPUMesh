@@ -566,14 +566,19 @@ run_host_push_splice(struct objects *objs, int cfd, const char *tag)
  * DPA-free push channel, so any number of these processes can run.
  * DMESH_PUSH_BRIDGE_PORT=<port>. One connection then exit, like the peers.
  */
-static void
-run_host_push_ingress_bridge(struct objects *objs, int port)
+/* Accept the ingress TCP client BEFORE the DMA channel is exported: the proxy
+ * starts protocol detection (10s budget) the moment the flow attaches, so the
+ * first request bytes must effectively be in hand at attach time or the flow
+ * silently degrades to an opaque L4 forward. Polls the comch PE while waiting
+ * so the control path stays serviced. */
+static int
+host_push_ingress_accept(struct objects *objs, int port)
 {
     struct sockaddr_in addr;
-    int lfd, cfd, one = 1;
+    int lfd, cfd = -1, one = 1;
 
     lfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (lfd < 0) { DOCA_LOG_ERR("push-ingress: socket() failed"); return; }
+    if (lfd < 0) { DOCA_LOG_ERR("push-ingress: socket() failed"); return -1; }
     setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
@@ -582,18 +587,35 @@ run_host_push_ingress_bridge(struct objects *objs, int port)
     if (bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         DOCA_LOG_ERR("push-ingress: bind(:%d) failed: %s", port, strerror(errno));
         close(lfd);
-        return;
+        return -1;
     }
     listen(lfd, 1);
+    fcntl(lfd, F_SETFL, O_NONBLOCK);
     DOCA_LOG_INFO("push-ingress: listening on :%d (h2load -c1 here)", port);
-    cfd = accept(lfd, NULL, NULL);
-    if (cfd < 0) { DOCA_LOG_ERR("push-ingress: accept() failed"); close(lfd); return; }
+    while (cfd < 0) {
+        cfd = accept(lfd, NULL, NULL);
+        if (cfd < 0) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                DOCA_LOG_ERR("push-ingress: accept() failed: %s", strerror(errno));
+                close(lfd);
+                return -1;
+            }
+            doca_pe_progress(objs->pe);
+            usleep(1000);
+        }
+    }
+    close(lfd);
     setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     fcntl(cfd, F_SETFL, O_NONBLOCK);
+    DOCA_LOG_INFO("push-ingress: client accepted, attaching DMA channel");
+    return cfd;
+}
 
+static void
+run_host_push_ingress_bridge(struct objects *objs, int cfd)
+{
     run_host_push_splice(objs, cfd, "push-ingress");
     close(cfd);
-    close(lfd);
 }
 
 /*
@@ -703,9 +725,14 @@ run_host_worker(struct objects *objs, const char *server_name)
      * declared in the metadata like BACKEND so the DPU uses the push engine,
      * but served as a client flow by the proxy. */
     const char *push_port = getenv("DMESH_PUSH_BRIDGE_PORT");
+    int ingress_cfd = -1;
     if (push_port != NULL && atoi(push_port) > 0) {
         objs->flow.mode = DMESH_FLOW_MODE_INGRESS_PUSH;
         memset(objs->rcvbuf.buf, 0, DMESH_PUSH_DATA_OFF);
+        /* block for the TCP client BEFORE exporting: see host_push_ingress_accept */
+        ingress_cfd = host_push_ingress_accept(objs, atoi(push_port));
+        if (ingress_cfd < 0)
+            return;
     }
 
     /* export DMA ring + send/receive buffer metadata to DPU in one message */
@@ -720,8 +747,8 @@ run_host_worker(struct objects *objs, const char *server_name)
         return;
     }
 
-    if (push_port != NULL && atoi(push_port) > 0) {
-        run_host_push_ingress_bridge(objs, atoi(push_port));
+    if (ingress_cfd >= 0) {
+        run_host_push_ingress_bridge(objs, ingress_cfd);
         return;
     }
 
