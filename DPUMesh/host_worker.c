@@ -479,9 +479,16 @@ run_host_push_splice(struct objects *objs, int cfd, const char *tag)
     size_t pend_head = 0, pend_len = 0;
     int peer_gone = 0;
     unsigned long req_bytes = 0, resp_bytes = 0;
+    /* Idle backoff: N bridges busy-polling starve the host's h2load clients
+     * (32 hot processes on 18 cores at M=16). After 64 workless iterations
+     * sleep 5us, after 4096 sleep 50us; any work resets. DMESH_SPLICE_SPIN=1
+     * restores the pure spin for A/B. */
+    unsigned idle_iters = 0;
+    const int spin = getenv("DMESH_SPLICE_SPIN") != NULL;
     if (pend == NULL) return;
 
     while (!peer_gone) {
+        int did_work = 0;
         /* DPU->host: consume published push batches in order -> pending ring */
         while (descs[expected % DMESH_PUSH_DESC_N].seq == expected) {
             uint32_t pos = descs[expected % DMESH_PUSH_DESC_N].pos;
@@ -500,6 +507,7 @@ run_host_push_splice(struct objects *objs, int cfd, const char *tag)
             pend_len += len;
             req_bytes += len;
             expected++;
+            did_work = 1;
         }
 
         /* Flush pending DPU bytes to the TCP peer (non-blocking) */
@@ -508,6 +516,7 @@ run_host_push_splice(struct objects *objs, int cfd, const char *tag)
                              ? pend_len : BACKEND_PENDING_SIZE - pend_head;
             ssize_t k = send(cfd, pend + pend_head, run, MSG_NOSIGNAL);
             if (k > 0) {
+                did_work = 1;
                 pend_head = (pend_head + (size_t)k) % BACKEND_PENDING_SIZE;
                 pend_len -= (size_t)k;
             } else if (k < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
@@ -524,6 +533,7 @@ run_host_push_splice(struct objects *objs, int cfd, const char *tag)
             peer_gone = 1;
         } else if (n > 0) {
             size_t off = 0;
+            did_work = 1;
             resp_bytes += (unsigned long)n;
             while (off < (size_t)n) {
                 size_t remaining = (size_t)n - off;
@@ -552,7 +562,13 @@ run_host_push_splice(struct objects *objs, int cfd, const char *tag)
         }
         /* n < 0 with EAGAIN: nothing to read this iteration */
 
-        doca_pe_progress(objs->pe);     /* control path (comch) */
+        if (doca_pe_progress(objs->pe)) /* control path (comch) */
+            did_work = 1;
+
+        if (did_work)
+            idle_iters = 0;
+        else if (++idle_iters > 64 && !spin)
+            usleep(idle_iters > 4096 ? 50 : 5);
     }
 
     DOCA_LOG_INFO("%s: closed (from-DPU=%lu bytes, to-DPU=%lu bytes)",
