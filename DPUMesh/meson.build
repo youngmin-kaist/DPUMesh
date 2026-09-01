@@ -72,3 +72,32 @@ executable('dpumesh', srcs,
   include_directories : inc_dirs,
   install : false,
 )
+
+# Host-side DMA channel as a shared library (cgo/gRPC transport integration).
+# Same datapath sources as the host worker, minus the standalone binaries.
+# No host DPA in the push transport, so the DPA kernel archive (non-PIC,
+# cannot enter a shared object) and dpa.c stay out; missing DPU-side symbols
+# are stubbed in host_lib.c.
+lib_srcs = [
+    'object.c',
+    'buffer.c',
+    'common.c',
+    'comch_common.c',
+    'comch_client.c',
+    'comch_consumer.c',
+    'comch_producer.c',
+    'ring.c',
+    'host_lib.c',
+]
+lib_dependencies = [
+    dependency('threads'),
+    dependency('doca-common'),
+    dependency('doca-comch'),
+    dependency('doca-dma'),
+    dependency('doca-dpa'),
+]
+shared_library('dmesh_host', lib_srcs,
+  dependencies : lib_dependencies,
+  include_directories : inc_dirs,
+  install : false,
+)
