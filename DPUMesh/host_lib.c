@@ -290,6 +290,10 @@ dmesh_chan_claimed(struct dmesh_chan *c)
     if (c == NULL)
         return 0;
     pthread_mutex_lock(&c->lock);
+    if (c->dead) {
+        pthread_mutex_unlock(&c->lock);
+        return 0;
+    }
     (void)doca_pe_progress(c->objs->pe);
     chan_pump_rx(c);
     v = c->claimed;
