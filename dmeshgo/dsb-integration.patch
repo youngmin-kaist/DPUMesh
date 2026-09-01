@@ -48,7 +48,7 @@ diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/ho
 \ No newline at end of file
 diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/hotelReservation/dialer/dialer.go hotelres-dmesh/dialer/dialer.go
 --- DeathStarBench/hotelReservation/dialer/dialer.go	2026-08-20 01:18:55.962887480 +0900
-+++ hotelres-dmesh/dialer/dialer.go	2026-09-02 06:50:37.329675101 +0900
++++ hotelres-dmesh/dialer/dialer.go	2026-09-02 07:12:04.878262704 +0900
 @@ -1,6 +1,7 @@
  package dialer
  
@@ -57,14 +57,32 @@ diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/ho
  	"fmt"
  	"time"
  
-@@ -52,6 +53,15 @@
+@@ -9,6 +10,8 @@
+ 	consul "github.com/hashicorp/consul/api"
+ 	opentracing "github.com/opentracing/opentracing-go"
+ 	"google.golang.org/grpc"
++	"google.golang.org/grpc/resolver"
++	"google.golang.org/grpc/resolver/manual"
+ 	"google.golang.org/grpc/keepalive"
+ )
+ 
+@@ -52,6 +55,24 @@
  		dialopts = append(dialopts, opt)
  	}
  
 +	if svc, ok := dmesh.ServiceFromTarget(name); ok {
 +		if dmesh.Enabled() {
-+			dialopts = append(dialopts, grpc.WithContextDialer(dmesh.Dialer(svc)))
-+			name = "passthrough:///" + svc
++			addrs := []resolver.Address{}
++			for _, a := range dmesh.ReplicaAddrs() {
++				addrs = append(addrs, resolver.Address{Addr: a})
++			}
++			rb := manual.NewBuilderWithScheme("dmesh-" + svc)
++			rb.InitialState(resolver.State{Addresses: addrs})
++			dialopts = append(dialopts,
++				grpc.WithContextDialer(dmesh.Dialer(svc)),
++				grpc.WithResolvers(rb),
++				grpc.WithDefaultServiceConfig(`{"loadBalancingConfig": [{"round_robin":{}}]}`))
++			name = rb.Scheme() + ":///" + svc
 +		} else if dmesh.TCPDirect() {
 +			name = "passthrough:///" + dmesh.TCPAddr(svc)
 +		}
@@ -135,7 +153,7 @@ diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/ho
 +replace dmeshgo => /home/youngmin/bf-workspace/dmeshgo
 diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/hotelReservation/services/attractions/server.go hotelres-dmesh/services/attractions/server.go
 --- DeathStarBench/hotelReservation/services/attractions/server.go	2026-08-20 01:18:55.966887467 +0900
-+++ hotelres-dmesh/services/attractions/server.go	2026-09-02 06:51:49.060380775 +0900
++++ hotelres-dmesh/services/attractions/server.go	2026-09-02 08:04:38.664716214 +0900
 @@ -1,9 +1,9 @@
  package attractions
  
@@ -147,7 +165,15 @@ diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/ho
  	"time"
  
  	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/registry"
-@@ -88,7 +88,7 @@
+@@ -72,6 +72,7 @@
+ 			Timeout: 120 * time.Second,
+ 		}),
+ 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
++			MinTime:             10 * time.Second,
+ 			PermitWithoutStream: true,
+ 		}),
+ 		grpc.UnaryInterceptor(
+@@ -88,7 +89,7 @@
  	pb.RegisterAttractionsServer(srv, s)
  
  	// listener
@@ -158,7 +184,7 @@ diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/ho
  	}
 diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/hotelReservation/services/geo/server.go hotelres-dmesh/services/geo/server.go
 --- DeathStarBench/hotelReservation/services/geo/server.go	2026-08-20 01:18:55.970887455 +0900
-+++ hotelres-dmesh/services/geo/server.go	2026-09-02 06:51:48.888383813 +0900
++++ hotelres-dmesh/services/geo/server.go	2026-09-02 08:04:38.664716214 +0900
 @@ -1,9 +1,9 @@
  package geo
  
@@ -170,7 +196,15 @@ diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/ho
  	"time"
  
  	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/registry"
-@@ -73,7 +73,7 @@
+@@ -57,6 +57,7 @@
+ 			Timeout: 120 * time.Second,
+ 		}),
+ 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
++			MinTime:             10 * time.Second,
+ 			PermitWithoutStream: true,
+ 		}),
+ 		grpc.UnaryInterceptor(
+@@ -73,7 +74,7 @@
  	pb.RegisterGeoServer(srv, s)
  
  	// listener
@@ -181,7 +215,7 @@ diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/ho
  	}
 diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/hotelReservation/services/profile/server.go hotelres-dmesh/services/profile/server.go
 --- DeathStarBench/hotelReservation/services/profile/server.go	2026-08-20 01:18:55.970887455 +0900
-+++ hotelres-dmesh/services/profile/server.go	2026-09-02 06:51:48.920383248 +0900
++++ hotelres-dmesh/services/profile/server.go	2026-09-02 08:04:38.664716214 +0900
 @@ -1,10 +1,10 @@
  package profile
  
@@ -194,7 +228,15 @@ diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/ho
  	"sync"
  	"time"
  
-@@ -70,7 +70,7 @@
+@@ -55,6 +55,7 @@
+ 			Timeout: 120 * time.Second,
+ 		}),
+ 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
++			MinTime:             10 * time.Second,
+ 			PermitWithoutStream: true,
+ 		}),
+ 		grpc.UnaryInterceptor(
+@@ -70,7 +71,7 @@
  
  	pb.RegisterProfileServer(srv, s)
  
@@ -205,7 +247,7 @@ diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/ho
  	}
 diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/hotelReservation/services/rate/server.go hotelres-dmesh/services/rate/server.go
 --- DeathStarBench/hotelReservation/services/rate/server.go	2026-08-20 01:18:55.970887455 +0900
-+++ hotelres-dmesh/services/rate/server.go	2026-09-02 06:51:48.904383531 +0900
++++ hotelres-dmesh/services/rate/server.go	2026-09-02 08:04:38.660716259 +0900
 @@ -1,10 +1,10 @@
  package rate
  
@@ -218,7 +260,15 @@ diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/ho
  	"sort"
  	"strings"
  	"sync"
-@@ -70,7 +70,7 @@
+@@ -55,6 +55,7 @@
+ 			Timeout: 120 * time.Second,
+ 		}),
+ 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
++			MinTime:             10 * time.Second,
+ 			PermitWithoutStream: true,
+ 		}),
+ 		grpc.UnaryInterceptor(
+@@ -70,7 +71,7 @@
  
  	pb.RegisterRateServer(srv, s)
  
@@ -227,9 +277,32 @@ diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/ho
  	if err != nil {
  		log.Fatal().Msgf("failed to listen: %v", err)
  	}
+@@ -137,15 +138,19 @@
+ 				mongoSpan, _ := opentracing.StartSpanFromContext(ctx, "mongo_rate")
+ 				mongoSpan.SetTag("span.kind", "client")
+ 
+-				// memcached miss, set up mongo connection
++				// memcached miss, set up mongo connection.
++				// Upstream DSB bug fixed here: the query used an EMPTY filter
++				// (bson.D{}) - a full collection scan per miss - and appended
++				// every rate plan in the DB to the response AND cached that
++				// blob under this hotelId (cache pollution). Filter by hotelId.
+ 				collection := s.MongoClient.Database("rate-db").Collection("inventory")
+-				curr, err := collection.Find(context.TODO(), bson.D{})
++				curr, err := collection.Find(context.TODO(), bson.M{"hotelId": id})
+ 				if err != nil {
+ 					log.Error().Msgf("Failed get rate data: ", err)
+ 				}
+ 
+ 				tmpRatePlans := make(RatePlans, 0)
+-				curr.All(context.TODO(), &tmpRatePlans)
++				err = curr.All(context.TODO(), &tmpRatePlans)
+ 				if err != nil {
+ 					log.Error().Msgf("Failed get rate data: ", err)
+ 				}
 diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/hotelReservation/services/recommendation/server.go hotelres-dmesh/services/recommendation/server.go
 --- DeathStarBench/hotelReservation/services/recommendation/server.go	2026-08-20 01:18:55.970887455 +0900
-+++ hotelres-dmesh/services/recommendation/server.go	2026-09-02 06:51:48.936382965 +0900
++++ hotelres-dmesh/services/recommendation/server.go	2026-09-02 08:04:38.664716214 +0900
 @@ -1,10 +1,10 @@
  package recommendation
  
@@ -242,7 +315,15 @@ diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/ho
  	"time"
  
  	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/registry"
-@@ -69,7 +69,7 @@
+@@ -54,6 +54,7 @@
+ 			Timeout: 120 * time.Second,
+ 		}),
+ 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
++			MinTime:             10 * time.Second,
+ 			PermitWithoutStream: true,
+ 		}),
+ 		grpc.UnaryInterceptor(
+@@ -69,7 +70,7 @@
  
  	pb.RegisterRecommendationServer(srv, s)
  
@@ -253,7 +334,7 @@ diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/ho
  	}
 diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/hotelReservation/services/reservation/server.go hotelres-dmesh/services/reservation/server.go
 --- DeathStarBench/hotelReservation/services/reservation/server.go	2026-08-20 01:18:55.970887455 +0900
-+++ hotelres-dmesh/services/reservation/server.go	2026-09-02 06:51:49.000381834 +0900
++++ hotelres-dmesh/services/reservation/server.go	2026-09-02 08:04:38.664716214 +0900
 @@ -1,9 +1,9 @@
  package reservation
  
@@ -265,7 +346,15 @@ diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/ho
  	"strconv"
  	"strings"
  	"sync"
-@@ -69,7 +69,7 @@
+@@ -54,6 +54,7 @@
+ 			Timeout: 120 * time.Second,
+ 		}),
+ 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
++			MinTime:             10 * time.Second,
+ 			PermitWithoutStream: true,
+ 		}),
+ 		grpc.UnaryInterceptor(
+@@ -69,7 +70,7 @@
  
  	pb.RegisterReservationServer(srv, s)
  
@@ -276,7 +365,7 @@ diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/ho
  	}
 diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/hotelReservation/services/review/server.go hotelres-dmesh/services/review/server.go
 --- DeathStarBench/hotelReservation/services/review/server.go	2026-08-20 01:18:55.970887455 +0900
-+++ hotelres-dmesh/services/review/server.go	2026-09-02 06:51:49.040381128 +0900
++++ hotelres-dmesh/services/review/server.go	2026-09-02 08:04:38.664716214 +0900
 @@ -1,6 +1,7 @@
  package review
  
@@ -293,7 +382,15 @@ diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/ho
  	// "os"
  	// "sort"
  	"time"
-@@ -76,7 +76,7 @@
+@@ -61,6 +61,7 @@
+ 			Timeout: 120 * time.Second,
+ 		}),
+ 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
++			MinTime:             10 * time.Second,
+ 			PermitWithoutStream: true,
+ 		}),
+ 		grpc.UnaryInterceptor(
+@@ -76,7 +77,7 @@
  
  	pb.RegisterReviewServer(srv, s)
  
@@ -304,7 +401,7 @@ diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/ho
  	}
 diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/hotelReservation/services/search/server.go hotelres-dmesh/services/search/server.go
 --- DeathStarBench/hotelReservation/services/search/server.go	2026-08-20 01:18:55.970887455 +0900
-+++ hotelres-dmesh/services/search/server.go	2026-09-02 06:51:48.868384166 +0900
++++ hotelres-dmesh/services/search/server.go	2026-09-02 08:04:38.664716214 +0900
 @@ -1,8 +1,8 @@
  package search
  
@@ -315,7 +412,15 @@ diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/ho
  	"time"
  
  	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dialer"
-@@ -74,7 +74,7 @@
+@@ -52,6 +52,7 @@
+ 			Timeout: 120 * time.Second,
+ 		}),
+ 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
++			MinTime:             10 * time.Second,
+ 			PermitWithoutStream: true,
+ 		}),
+ 		grpc.UnaryInterceptor(
+@@ -74,7 +75,7 @@
  		return err
  	}
  
@@ -326,7 +431,7 @@ diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/ho
  	}
 diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/hotelReservation/services/user/server.go hotelres-dmesh/services/user/server.go
 --- DeathStarBench/hotelReservation/services/user/server.go	2026-08-20 01:18:55.970887455 +0900
-+++ hotelres-dmesh/services/user/server.go	2026-09-02 06:51:48.980382188 +0900
++++ hotelres-dmesh/services/user/server.go	2026-09-02 08:04:38.664716214 +0900
 @@ -1,9 +1,9 @@
  package user
  
@@ -338,7 +443,15 @@ diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/ho
  	"time"
  
  	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/registry"
-@@ -68,7 +68,7 @@
+@@ -53,6 +53,7 @@
+ 			Timeout: 120 * time.Second,
+ 		}),
+ 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
++			MinTime:             10 * time.Second,
+ 			PermitWithoutStream: true,
+ 		}),
+ 		grpc.UnaryInterceptor(
+@@ -68,7 +69,7 @@
  
  	pb.RegisterUserServer(srv, s)
  
