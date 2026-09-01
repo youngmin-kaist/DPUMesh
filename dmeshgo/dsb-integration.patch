@@ -1,0 +1,349 @@
+diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/hotelReservation/config.json hotelres-dmesh/config.json
+--- DeathStarBench/hotelReservation/config.json	2026-08-20 01:18:55.962887480 +0900
++++ hotelres-dmesh/config.json	2026-09-02 06:54:22.885773687 +0900
+@@ -1,28 +1,27 @@
+ {
+-  "consulAddress": "consul:8500",
+-  "jaegerAddress": "jaeger:6831",
++  "consulAddress": "172.19.0.10:8500",
++  "jaegerAddress": "172.19.0.6:6831",
+   "FrontendPort": "5000",
+   "GeoPort": "8083",
+-  "GeoMongoAddress": "mongodb-geo:27017",
++  "GeoMongoAddress": "172.19.0.3:27017",
+   "ProfilePort": "8081",
+-  "ProfileMongoAddress": "mongodb-profile:27017",
+-  "ProfileMemcAddress": "memcached-profile:11211",
++  "ProfileMongoAddress": "172.19.0.12:27017",
++  "ProfileMemcAddress": "172.19.0.9:11211",
+   "ReviewPort": "8088",
+-  "ReviewMongoAddress": "mongodb-review:27017",
+-  "ReviewMemcAddress": "memcached-review:11211",
++  "ReviewMongoAddress": "172.19.0.5:27017",
++  "ReviewMemcAddress": "172.19.0.8:11211",
+   "AttractionsPort": "8089",
+-  "AttractionsMongoAddress": "mongodb-attractions:27017",
++  "AttractionsMongoAddress": "172.19.0.15:27017",
+   "RatePort": "8084",
+-  "RateMongoAddress": "mongodb-rate:27017",
+-  "RateMemcAddress": "memcached-rate:11211",
++  "RateMongoAddress": "172.19.0.14:27017",
++  "RateMemcAddress": "172.19.0.4:11211",
+   "RecommendPort": "8085",
+-  "RecommendMongoAddress": "mongodb-recommendation:27017",
++  "RecommendMongoAddress": "172.19.0.11:27017",
+   "ReservePort": "8087",
+-  "ReserveMongoAddress": "mongodb-reservation:27017",
+-  "ReserveMemcAddress": "memcached-reserve:11211",
++  "ReserveMongoAddress": "172.19.0.7:27017",
++  "ReserveMemcAddress": "172.19.0.2:11211",
+   "SearchPort": "8082",
+   "UserPort": "8086",
+-  "UserMongoAddress": "mongodb-user:27017",
++  "UserMongoAddress": "172.19.0.13:27017",
+   "KnativeDomainName": ""
+-}
+-
++}
+\ No newline at end of file
+diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/hotelReservation/dialer/dialer.go hotelres-dmesh/dialer/dialer.go
+--- DeathStarBench/hotelReservation/dialer/dialer.go	2026-08-20 01:18:55.962887480 +0900
++++ hotelres-dmesh/dialer/dialer.go	2026-09-02 06:50:37.329675101 +0900
+@@ -1,6 +1,7 @@
+ package dialer
+ 
+ import (
++	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dmesh"
+ 	"fmt"
+ 	"time"
+ 
+@@ -52,6 +53,15 @@
+ 		dialopts = append(dialopts, opt)
+ 	}
+ 
++	if svc, ok := dmesh.ServiceFromTarget(name); ok {
++		if dmesh.Enabled() {
++			dialopts = append(dialopts, grpc.WithContextDialer(dmesh.Dialer(svc)))
++			name = "passthrough:///" + svc
++		} else if dmesh.TCPDirect() {
++			name = "passthrough:///" + dmesh.TCPAddr(svc)
++		}
++	}
++
+ 	conn, err := grpc.Dial(name, dialopts...)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to dial %s: %v", name, err)
+Only in hotelres-dmesh: dmesh
+diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/hotelReservation/go.mod hotelres-dmesh/go.mod
+--- DeathStarBench/hotelReservation/go.mod	2026-08-20 01:18:55.962887480 +0900
++++ hotelres-dmesh/go.mod	2026-09-02 06:50:42.449580811 +0900
+@@ -1,10 +1,10 @@
+ module github.com/delimitrou/DeathStarBench/tree/master/hotelReservation
+ 
+-go 1.18
++go 1.26
+ 
+ require (
+ 	github.com/bradfitz/gomemcache v0.0.0-20230905024940-24af94b03874
+-	github.com/google/uuid v1.4.0
++	github.com/google/uuid v1.6.0
+ 	github.com/grpc-ecosystem/grpc-opentracing v0.0.0-20180507213350-8e809c8a8645
+ 	github.com/hailocab/go-geoindex v0.0.0-20160127134810-64631bfe9711
+ 	github.com/hashicorp/consul/api v1.26.1
+@@ -14,9 +14,9 @@
+ 	github.com/rs/zerolog v1.31.0
+ 	github.com/uber/jaeger-client-go v2.30.0+incompatible
+ 	go.mongodb.org/mongo-driver v1.12.2
+-	golang.org/x/net v0.17.0
+-	google.golang.org/grpc v1.56.3
+-	google.golang.org/protobuf v1.31.0
++	golang.org/x/net v0.34.0
++	google.golang.org/grpc v1.71.0
++	google.golang.org/protobuf v1.36.4
+ )
+ 
+ require (
+@@ -24,7 +24,6 @@
+ 	github.com/armon/go-metrics v0.4.1 // indirect
+ 	github.com/fatih/color v1.15.0 // indirect
+ 	github.com/go-playground/form v3.1.4+incompatible // indirect
+-	github.com/golang/protobuf v1.5.3 // indirect
+ 	github.com/golang/snappy v0.0.4 // indirect
+ 	github.com/hashicorp/errwrap v1.1.0 // indirect
+ 	github.com/hashicorp/go-cleanhttp v0.5.2 // indirect
+@@ -50,12 +49,16 @@
+ 	github.com/xdg-go/stringprep v1.0.4 // indirect
+ 	github.com/youmark/pkcs8 v0.0.0-20181117223130-1be2e3e5546d // indirect
+ 	go.uber.org/atomic v1.11.0 // indirect
+-	golang.org/x/crypto v0.14.0 // indirect
++	golang.org/x/crypto v0.32.0 // indirect
+ 	golang.org/x/exp v0.0.0-20230817173708-d852ddb80c63 // indirect
+-	golang.org/x/sync v0.4.0 // indirect
+-	golang.org/x/sys v0.13.0 // indirect
+-	golang.org/x/text v0.13.0 // indirect
+-	google.golang.org/genproto/googleapis/rpc v0.0.0-20230526203410-71b5a4ffd15e // indirect
++	golang.org/x/sync v0.10.0 // indirect
++	golang.org/x/sys v0.29.0 // indirect
++	golang.org/x/text v0.21.0 // indirect
++	google.golang.org/genproto/googleapis/rpc v0.0.0-20250115164207-1a7da9e5054f // indirect
+ )
+ 
+ replace github.com/hashicorp/consul => github.com/hashicorp/consul v1.15.7
++
++require dmeshgo v0.0.0
++
++replace dmeshgo => /home/youngmin/bf-workspace/dmeshgo
+diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/hotelReservation/services/attractions/server.go hotelres-dmesh/services/attractions/server.go
+--- DeathStarBench/hotelReservation/services/attractions/server.go	2026-08-20 01:18:55.966887467 +0900
++++ hotelres-dmesh/services/attractions/server.go	2026-09-02 06:51:49.060380775 +0900
+@@ -1,9 +1,9 @@
+ package attractions
+ 
+ import (
++	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dmesh"
+ 	"context"
+ 	"fmt"
+-	"net"
+ 	"time"
+ 
+ 	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/registry"
+@@ -88,7 +88,7 @@
+ 	pb.RegisterAttractionsServer(srv, s)
+ 
+ 	// listener
+-	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", s.Port))
++	lis, err := dmesh.Listen("srv-attractions", s.Port)
+ 	if err != nil {
+ 		return fmt.Errorf("failed to listen: %v", err)
+ 	}
+diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/hotelReservation/services/geo/server.go hotelres-dmesh/services/geo/server.go
+--- DeathStarBench/hotelReservation/services/geo/server.go	2026-08-20 01:18:55.970887455 +0900
++++ hotelres-dmesh/services/geo/server.go	2026-09-02 06:51:48.888383813 +0900
+@@ -1,9 +1,9 @@
+ package geo
+ 
+ import (
++	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dmesh"
+ 	"context"
+ 	"fmt"
+-	"net"
+ 	"time"
+ 
+ 	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/registry"
+@@ -73,7 +73,7 @@
+ 	pb.RegisterGeoServer(srv, s)
+ 
+ 	// listener
+-	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", s.Port))
++	lis, err := dmesh.Listen("srv-geo", s.Port)
+ 	if err != nil {
+ 		return fmt.Errorf("failed to listen: %v", err)
+ 	}
+diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/hotelReservation/services/profile/server.go hotelres-dmesh/services/profile/server.go
+--- DeathStarBench/hotelReservation/services/profile/server.go	2026-08-20 01:18:55.970887455 +0900
++++ hotelres-dmesh/services/profile/server.go	2026-09-02 06:51:48.920383248 +0900
+@@ -1,10 +1,10 @@
+ package profile
+ 
+ import (
++	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dmesh"
+ 	"context"
+ 	"encoding/json"
+ 	"fmt"
+-	"net"
+ 	"sync"
+ 	"time"
+ 
+@@ -70,7 +70,7 @@
+ 
+ 	pb.RegisterProfileServer(srv, s)
+ 
+-	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", s.Port))
++	lis, err := dmesh.Listen("srv-profile", s.Port)
+ 	if err != nil {
+ 		log.Fatal().Msgf("failed to configure listener: %v", err)
+ 	}
+diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/hotelReservation/services/rate/server.go hotelres-dmesh/services/rate/server.go
+--- DeathStarBench/hotelReservation/services/rate/server.go	2026-08-20 01:18:55.970887455 +0900
++++ hotelres-dmesh/services/rate/server.go	2026-09-02 06:51:48.904383531 +0900
+@@ -1,10 +1,10 @@
+ package rate
+ 
+ import (
++	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dmesh"
+ 	"context"
+ 	"encoding/json"
+ 	"fmt"
+-	"net"
+ 	"sort"
+ 	"strings"
+ 	"sync"
+@@ -70,7 +70,7 @@
+ 
+ 	pb.RegisterRateServer(srv, s)
+ 
+-	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", s.Port))
++	lis, err := dmesh.Listen("srv-rate", s.Port)
+ 	if err != nil {
+ 		log.Fatal().Msgf("failed to listen: %v", err)
+ 	}
+diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/hotelReservation/services/recommendation/server.go hotelres-dmesh/services/recommendation/server.go
+--- DeathStarBench/hotelReservation/services/recommendation/server.go	2026-08-20 01:18:55.970887455 +0900
++++ hotelres-dmesh/services/recommendation/server.go	2026-09-02 06:51:48.936382965 +0900
+@@ -1,10 +1,10 @@
+ package recommendation
+ 
+ import (
++	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dmesh"
+ 	"context"
+ 	"fmt"
+ 	"math"
+-	"net"
+ 	"time"
+ 
+ 	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/registry"
+@@ -69,7 +69,7 @@
+ 
+ 	pb.RegisterRecommendationServer(srv, s)
+ 
+-	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", s.Port))
++	lis, err := dmesh.Listen("srv-recommendation", s.Port)
+ 	if err != nil {
+ 		log.Fatal().Msgf("failed to listen: %v", err)
+ 	}
+diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/hotelReservation/services/reservation/server.go hotelres-dmesh/services/reservation/server.go
+--- DeathStarBench/hotelReservation/services/reservation/server.go	2026-08-20 01:18:55.970887455 +0900
++++ hotelres-dmesh/services/reservation/server.go	2026-09-02 06:51:49.000381834 +0900
+@@ -1,9 +1,9 @@
+ package reservation
+ 
+ import (
++	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dmesh"
+ 	"context"
+ 	"fmt"
+-	"net"
+ 	"strconv"
+ 	"strings"
+ 	"sync"
+@@ -69,7 +69,7 @@
+ 
+ 	pb.RegisterReservationServer(srv, s)
+ 
+-	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", s.Port))
++	lis, err := dmesh.Listen("srv-reservation", s.Port)
+ 	if err != nil {
+ 		log.Fatal().Msgf("failed to listen: %v", err)
+ 	}
+diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/hotelReservation/services/review/server.go hotelres-dmesh/services/review/server.go
+--- DeathStarBench/hotelReservation/services/review/server.go	2026-08-20 01:18:55.970887455 +0900
++++ hotelres-dmesh/services/review/server.go	2026-09-02 06:51:49.040381128 +0900
+@@ -1,6 +1,7 @@
+ package review
+ 
+ import (
++	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dmesh"
+ 	"encoding/json"
+ 	"fmt"
+ 
+@@ -8,7 +9,6 @@
+ 	"go.mongodb.org/mongo-driver/mongo"
+ 
+ 	// "io/ioutil"
+-	"net"
+ 	// "os"
+ 	// "sort"
+ 	"time"
+@@ -76,7 +76,7 @@
+ 
+ 	pb.RegisterReviewServer(srv, s)
+ 
+-	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", s.Port))
++	lis, err := dmesh.Listen("srv-review", s.Port)
+ 	if err != nil {
+ 		log.Fatal().Msgf("failed to listen: %v", err)
+ 	}
+diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/hotelReservation/services/search/server.go hotelres-dmesh/services/search/server.go
+--- DeathStarBench/hotelReservation/services/search/server.go	2026-08-20 01:18:55.970887455 +0900
++++ hotelres-dmesh/services/search/server.go	2026-09-02 06:51:48.868384166 +0900
+@@ -1,8 +1,8 @@
+ package search
+ 
+ import (
++	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dmesh"
+ 	"fmt"
+-	"net"
+ 	"time"
+ 
+ 	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dialer"
+@@ -74,7 +74,7 @@
+ 		return err
+ 	}
+ 
+-	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", s.Port))
++	lis, err := dmesh.Listen("srv-search", s.Port)
+ 	if err != nil {
+ 		log.Fatal().Msgf("failed to listen: %v", err)
+ 	}
+diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/hotelReservation/services/user/server.go hotelres-dmesh/services/user/server.go
+--- DeathStarBench/hotelReservation/services/user/server.go	2026-08-20 01:18:55.970887455 +0900
++++ hotelres-dmesh/services/user/server.go	2026-09-02 06:51:48.980382188 +0900
+@@ -1,9 +1,9 @@
+ package user
+ 
+ import (
++	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dmesh"
+ 	"crypto/sha256"
+ 	"fmt"
+-	"net"
+ 	"time"
+ 
+ 	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/registry"
+@@ -68,7 +68,7 @@
+ 
+ 	pb.RegisterUserServer(srv, s)
+ 
+-	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", s.Port))
++	lis, err := dmesh.Listen("srv-user", s.Port)
+ 	if err != nil {
+ 		log.Fatal().Msgf("failed to listen: %v", err)
+ 	}
