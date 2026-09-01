@@ -787,6 +787,28 @@ dmesh_conn_teardown(struct dmesh_conn *conn)
     /* Return the DPA pool thread and unbind the slot. */
     dmesh_dpa_thread_pool_release(objs, conn->connection);
 
+    /* Release the server-side comch connection object. Without this the
+     * firmware channel resources of dead clients leak, and the NEXT client
+     * registration fails at devx-object creation (syndrome 0xe5300 ->
+     * DOCA_ERROR_CONNECTION_ABORTED at client ctx start) - the historical
+     * "reconnect needs a proxy restart" limitation. DOCA_ERROR_AGAIN means
+     * the ctrl send queue is full; progress it and retry (we run from
+     * advance(), never inside a PE callback, so progressing here is safe). */
+    if (conn->connection != NULL) {
+        doca_error_t dres;
+        int spins = 0;
+
+        do {
+            dres = doca_comch_server_disconnect(objs->cc_server, conn->connection);
+            if (dres != DOCA_ERROR_AGAIN)
+                break;
+            (void)doca_pe_progress(objs->pe);
+        } while (spins++ < 100000);
+        if (dres != DOCA_SUCCESS)
+            DOCA_LOG_WARN("Server-side disconnect of dead connection: %s",
+                          doca_error_get_name(dres));
+    }
+
     /* Reset the slot for reuse. */
     {
         struct dmesh_flow_id flow = conn->flow;
@@ -952,6 +974,22 @@ dmesh_doca_conn_advance(struct dmesh_conn *conn)
 		break;
 
 	case DMESH_CONN_CLOSING:
+		/* DMESH_NO_TEARDOWN=1: park the dead slot instead of tearing it
+		 * down. Teardown's DPA-thread destroy fails inside flexio in the
+		 * proxy process and wedges the whole comch function (every later
+		 * client registration aborts at devx creation, syndrome 0xe5300).
+		 * Parking leaks the slot + its DPA pool thread (8 per worker), but
+		 * reconnects keep working - enough for benchmark/DSB sessions.
+		 * Root cause of the flexio failure is still open. */
+		if (getenv("DMESH_NO_TEARDOWN") != NULL) {
+			dmesh_doca_dpa_thread_quiesce(conn->dpa_thread);
+			if (conn->connection != NULL)
+				(void)doca_comch_server_disconnect(objs->cc_server, conn->connection);
+			conn->state = DMESH_CONN_ERROR;
+			DOCA_LOG_INFO("Parked dead connection slot %ld (DMESH_NO_TEARDOWN)",
+				      conn - objs->conns);
+			break;
+		}
 		/* Host disconnected (or setup failed): release everything so the slot
 		 * and its DPA pool thread can be reused. Sets state to FREE. */
 		dmesh_conn_teardown(conn);

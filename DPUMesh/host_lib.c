@@ -18,6 +18,8 @@
 #include <doca_mmap.h>
 #include <doca_pe.h>
 #include <doca_dpa.h>
+#include <doca_comch.h>
+#include <doca_comch_producer.h>
 
 #include "object.h"
 #include "common.h"
@@ -112,8 +114,13 @@ dmesh_chan_connect(const char *pci_addr, const char *server_name,
         struct doca_log_backend *sdk_log;
 
         (void)doca_log_backend_create_standard();
-        if (doca_log_backend_create_with_file_sdk(stderr, &sdk_log) == DOCA_SUCCESS)
-            (void)doca_log_backend_set_sdk_level(sdk_log, DOCA_LOG_LEVEL_WARNING);
+        if (doca_log_backend_create_with_file_sdk(stderr, &sdk_log) == DOCA_SUCCESS) {
+            const char *lvl = getenv("DMESH_SDK_LOG");
+
+            (void)doca_log_backend_set_sdk_level(sdk_log,
+                lvl != NULL && strcmp(lvl, "debug") == 0 ? DOCA_LOG_LEVEL_DEBUG
+                                                         : DOCA_LOG_LEVEL_WARNING);
+        }
         lib_log_inited = 1;
     }
 
@@ -211,9 +218,13 @@ dmesh_chan_read(struct dmesh_chan *c, void *buf, size_t len)
 {
     size_t n, first;
 
-    if (c == NULL || c->dead)
+    if (c == NULL)
         return -1;
     pthread_mutex_lock(&c->lock);
+    if (c->dead) {
+        pthread_mutex_unlock(&c->lock);
+        return -1;
+    }
     (void)doca_pe_progress(c->objs->pe);        /* control path (comch) */
     chan_pump_rx(c);
     n = c->pend_len < len ? c->pend_len : len;
@@ -235,9 +246,13 @@ dmesh_chan_write(struct dmesh_chan *c, const void *buf, size_t len)
 {
     size_t off = 0;
 
-    if (c == NULL || c->dead)
+    if (c == NULL)
         return -1;
     pthread_mutex_lock(&c->lock);
+    if (c->dead) {
+        pthread_mutex_unlock(&c->lock);
+        return -1;
+    }
     (void)doca_pe_progress(c->objs->pe);
     while (off < len) {
         size_t remaining = len - off;
@@ -285,13 +300,59 @@ dmesh_chan_claimed(struct dmesh_chan *c)
 void
 dmesh_chan_close(struct dmesh_chan *c)
 {
+    struct objects *objs;
+    enum doca_ctx_states st;
+    int spins;
+
     if (c == NULL)
         return;
+    pthread_mutex_lock(&c->lock);
+    if (c->dead) {
+        pthread_mutex_unlock(&c->lock);
+        return;
+    }
     c->dead = 1;
-    /* Minimal teardown for v1: release the pending ring and leave the DOCA
-     * objects to process exit (per-channel DOCA teardown from a library is
-     * the same latent-fault surface as the proxy-side slot teardown; the
-     * echo/DSB processes are long-lived, channels are few). */
+    objs = c->objs;
+
+    /* Graceful comch disconnect. Without completing this handshake the
+     * firmware-side channel object of this client leaks on the service, and
+     * later client registrations fail at devx creation (syndrome 0xe5300 ->
+     * CONNECTION_ABORTED) - the historical "reconnect needs a proxy restart"
+     * failure. Stop the producer first, then the client ctx, progressing
+     * their PEs until IDLE (bounded so close can never hang). */
+    if (objs->producer != NULL) {
+        (void)doca_ctx_stop(doca_comch_producer_as_ctx(objs->producer));
+        spins = 0;
+        while (spins++ < 100000 &&
+               doca_ctx_get_state(doca_comch_producer_as_ctx(objs->producer), &st) == DOCA_SUCCESS &&
+               st != DOCA_CTX_STATE_IDLE)
+            (void)doca_pe_progress(objs->producer_pe != NULL ? objs->producer_pe : objs->pe);
+        (void)doca_comch_producer_destroy(objs->producer);
+        objs->producer = NULL;
+    }
+    if (objs->cc_client != NULL) {
+        (void)doca_ctx_stop(doca_comch_client_as_ctx(objs->cc_client));
+        spins = 0;
+        while (spins++ < 100000 &&
+               doca_ctx_get_state(doca_comch_client_as_ctx(objs->cc_client), &st) == DOCA_SUCCESS &&
+               st != DOCA_CTX_STATE_IDLE)
+            (void)doca_pe_progress(objs->pe);
+        (void)doca_comch_client_destroy(objs->cc_client);
+        objs->cc_client = NULL;
+    }
+
+    /* Buffers and mmaps (the reader/writer are fenced out by c->dead). */
+    if (objs->sndbuf.mmap != NULL) {
+        destroy_mmap_and_free_buffer(objs->sndbuf.mmap, objs->sndbuf.buf);
+        objs->sndbuf.mmap = NULL; objs->sndbuf.buf = NULL;
+    }
+    if (objs->rcvbuf.mmap != NULL) {
+        destroy_mmap_and_free_buffer(objs->rcvbuf.mmap, objs->rcvbuf.buf);
+        objs->rcvbuf.mmap = NULL; objs->rcvbuf.buf = NULL;
+    }
     free(c->pend);
     c->pend = NULL;
+    /* The chan/objs structs stay allocated (tiny) so a racing caller can only
+     * ever observe dead=1, never freed memory. */
+    pthread_mutex_unlock(&c->lock);
 }

@@ -5,6 +5,7 @@
 package main
 
 import (
+	"os"
 	"context"
 	"log"
 	"net"
@@ -18,9 +19,13 @@ import (
 )
 
 func main() {
+	srv := os.Getenv("DMESH_SERVER")
+	if srv == "" {
+		srv = "DPUMesh0"
+	}
 	dialer := func(ctx context.Context, addr string) (net.Conn, error) {
 		log.Printf("echo-client: dialing DMA channel (dst key 10.0.0.42:8086)")
-		return dmeshgo.Dial("DPUMesh0", "127.0.0.1", 40001, "10.0.0.42", 8086, "echo-client.dmesh")
+		return dmeshgo.Dial(srv, "127.0.0.1", 40001, "10.0.0.42", 8086, "echo-client.dmesh")
 	}
 
 	cc, err := grpc.NewClient("passthrough:///dmesh-echo",

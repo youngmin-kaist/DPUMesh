@@ -4,6 +4,7 @@
 package main
 
 import (
+	"os"
 	"log"
 	"time"
 
@@ -15,7 +16,11 @@ import (
 )
 
 func main() {
-	lis, err := dmeshgo.Listen("DPUMesh0", "10.0.0.42", 8086, "echo-server.dmesh")
+	srv := os.Getenv("DMESH_SERVER")
+	if srv == "" {
+		srv = "DPUMesh0"
+	}
+	lis, err := dmeshgo.Listen(srv, "10.0.0.42", 8086, "echo-server.dmesh")
 	if err != nil {
 		log.Fatalf("dmesh listen: %v", err)
 	}
