@@ -168,13 +168,13 @@ doca_error_t init_comch_ctrl_path_client(const char *server_name,
 	};
 
     result = doca_pe_create(&(objs->pe));
-    if (result != DOCA_SUCCESS) {   
+    if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed creating pe with error = %s", doca_error_get_name(result));
         return result;
     }
 
     result = doca_comch_client_create(objs->dev, server_name, &(objs->cc_client));
-    if (result != DOCA_SUCCESS) {   
+    if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to create client with error = %s", doca_error_get_name(result));
         goto destroy_pe;
     }
@@ -182,7 +182,7 @@ doca_error_t init_comch_ctrl_path_client(const char *server_name,
     ctx = doca_comch_client_as_ctx(objs->cc_client);
 
     result = doca_pe_connect_ctx(objs->pe, ctx);
-    if (result != DOCA_SUCCESS) {   
+    if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed adding pe context to client with error = %s", doca_error_get_name(result));
         goto destroy_client;
     }
