@@ -70,6 +70,21 @@ struct dmesh_push_desc {
 };
 #define DMESH_PUSH_DESC_N    128u
 #define DMESH_PUSH_DATA_OFF  4096u
+
+/* Push flow control: the host publishes its consumption cursor at a fixed
+ * offset in its rcvbuf (the reserved gap between the desc slots and the data
+ * ring). The DPU pulls it with a small read-DMA between batches and refuses
+ * to publish a batch that would overrun unconsumed slots/bytes. MAGIC marks
+ * a flow-control-aware host; without it the DPU keeps the legacy
+ * no-backpressure behavior (old host + new DPU stays compatible). */
+#define DMESH_PUSH_CURSOR_OFF   2048u
+#define DMESH_PUSH_FC_MAGIC     0xD3E5FC01D3E5FC01ull
+struct dmesh_push_cursor {
+    uint64_t magic;
+    uint64_t consumed_seq;      /* last fully consumed batch seq */
+    uint64_t consumed_bytes;    /* total bytes drained from the data ring */
+    uint64_t pad;
+};
 #define DMESH_PUSH_MAX_BATCH 8192u
 
 /* Single control-path message carrying all host-side DMA metadata: the DMA

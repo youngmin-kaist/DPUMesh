@@ -60,9 +60,11 @@ struct dmesh_chan {
 
     /* DPU -> host: push slot ring + data ring inside rcvbuf */
     volatile struct dmesh_push_desc *descs;
+    volatile struct dmesh_push_cursor *cursor;
     char *data_area;
     size_t data_size;
     uint64_t expected;              /* next push desc seq */
+    uint64_t rx_bytes;              /* total bytes drained from the data ring */
     char *pend;                     /* staging for consumed-but-unread bytes */
     size_t pend_head, pend_len;
 
@@ -95,8 +97,12 @@ chan_pump_rx(struct dmesh_chan *c)
         if (first < len)
             memcpy(c->pend, c->data_area + pos + first, len - first);
         c->pend_len += len;
+        c->rx_bytes += len;
         c->expected++;
         c->claimed = 1;
+        /* Batch copied out of the data ring: publish consumption. */
+        c->cursor->consumed_seq = c->expected - 1;
+        c->cursor->consumed_bytes = c->rx_bytes;
     }
 }
 
@@ -184,6 +190,11 @@ dmesh_chan_connect(const char *pci_addr, const char *server_name,
     }
 
     c->descs = (volatile struct dmesh_push_desc *)objs->rcvbuf.buf;
+    c->cursor = (volatile struct dmesh_push_cursor *)((char *)objs->rcvbuf.buf +
+                                                      DMESH_PUSH_CURSOR_OFF);
+    c->cursor->consumed_seq = 0;
+    c->cursor->consumed_bytes = 0;
+    c->cursor->magic = DMESH_PUSH_FC_MAGIC;
     c->data_area = (char *)objs->rcvbuf.buf + DMESH_PUSH_DATA_OFF;
     c->data_size = objs->rcvbuf.size - DMESH_PUSH_DATA_OFF;
     c->expected = 1;
@@ -258,6 +269,18 @@ dmesh_chan_write(struct dmesh_chan *c, const void *buf, size_t len)
         size_t remaining = len - off;
         size_t chunk;
         struct dma_desc *d;
+
+        /* Forward backpressure: the DPA advances consumer_head as it drains
+         * descriptors; never run more than ~120 outstanding (each <=8064B, so
+         * sndbuf's 1MB can never wrap over unconsumed request bytes). The
+         * partial write returns and the Go side retries. */
+        {
+            volatile struct dma_ring_ctrl *rc =
+                (volatile struct dma_ring_ctrl *)c->objs->dma_ring->ctrl;
+
+            if (rc->producer_tail - rc->consumer_head >= 120)
+                break;
+        }
 
         /* producer_dma_copy completion rule: multiple of 128B, or a single
          * <=128B block (mirrors the push splice / client bridge). */

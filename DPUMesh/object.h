@@ -22,6 +22,7 @@ struct dmesh_conn;
 #define DMESH_TASK_NORMAL    0   /* legacy staging->rcvbuf copy */
 #define DMESH_TASK_PUSH_DATA 1   /* backend push: batch data -> host data ring */
 #define DMESH_TASK_PUSH_DESC 2   /* backend push: 16B descriptor -> host slot */
+#define DMESH_TASK_PULL_CURSOR 3 /* flow control: host cursor -> DPU shadow */
 
 struct dma_task_entry {
     struct dmesh_conn *owner;
@@ -152,6 +153,18 @@ struct dmesh_conn {
     uint32_t push_len;                        /* in-flight batch length */
     int push_state;                           /* 0 idle, 1 data in flight, 2 desc in flight */
     struct dmesh_push_desc *push_shadow;      /* in tx_staging's reserved tail */
+
+    /* Push flow control (see struct dmesh_push_cursor). The cursor shadow
+     * lives in tx_staging's reserved tail right after push_shadow, so it is
+     * mmap'd as a read-DMA destination. host_fc: 0 = probing (legacy host
+     * until the magic shows up), 1 = enforced. pushed_bytes counts published
+     * batch bytes for the data-ring occupancy check. */
+    int cursor_state;                         /* 0 idle, 1 pull in flight */
+    int host_fc;
+    uint64_t host_consumed_seq;
+    uint64_t host_consumed_bytes;
+    uint64_t pushed_bytes;
+    struct dmesh_push_cursor *cursor_shadow;  /* in tx_staging's reserved tail */
 };
 
 /* DOCA objects for DPUMesh thread */

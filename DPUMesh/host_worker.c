@@ -463,9 +463,18 @@ run_host_push_splice(struct objects *objs, int cfd, const char *tag)
     doca_dpa_dev_mmap_t local_mmap;
     volatile struct dmesh_push_desc *descs =
         (volatile struct dmesh_push_desc *)objs->rcvbuf.buf;
+    volatile struct dmesh_push_cursor *cursor =
+        (volatile struct dmesh_push_cursor *)((char *)objs->rcvbuf.buf +
+                                              DMESH_PUSH_CURSOR_OFF);
     char *data_area = (char *)objs->rcvbuf.buf + DMESH_PUSH_DATA_OFF;
     size_t data_size = objs->rcvbuf.size - DMESH_PUSH_DATA_OFF;
     uint64_t expected = 1;
+
+    /* Advertise push flow control: the DPU read-DMAs this cursor and stops
+     * publishing past unconsumed slots/bytes (see struct dmesh_push_cursor). */
+    cursor->consumed_seq = 0;
+    cursor->consumed_bytes = 0;
+    cursor->magic = DMESH_PUSH_FC_MAGIC;
     size_t spos = 0;
     char tmp[16384];
 
@@ -508,6 +517,9 @@ run_host_push_splice(struct objects *objs, int cfd, const char *tag)
             req_bytes += len;
             expected++;
             did_work = 1;
+            /* Batch copied out of the data ring: publish consumption. */
+            cursor->consumed_seq = expected - 1;
+            cursor->consumed_bytes = req_bytes;
         }
 
         /* Flush pending DPU bytes to the TCP peer (non-blocking) */
@@ -539,6 +551,18 @@ run_host_push_splice(struct objects *objs, int cfd, const char *tag)
                 size_t remaining = (size_t)n - off;
                 size_t chunk;
                 struct dma_desc *d;
+                volatile struct dma_ring_ctrl *rc =
+                    (volatile struct dma_ring_ctrl *)objs->dma_ring->ctrl;
+
+                /* Forward backpressure (see host_lib.c): cap outstanding
+                 * descriptors so sndbuf never wraps over unconsumed bytes.
+                 * Bytes already read from the socket but not yet staged are
+                 * dropped in this legacy bridge path only under extreme
+                 * pressure; the library path returns a partial write. */
+                if (rc->producer_tail - rc->consumer_head >= 120) {
+                    doca_pe_progress(objs->pe);
+                    continue;
+                }
 
                 /* producer_dma_copy completion rule: multiple of 128B, or a
                  * single <=128B block (see the client bridge) */

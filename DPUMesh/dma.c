@@ -227,6 +227,26 @@ static void dmesh_doca_dpa_dma_task_completed_cb(struct doca_dma_task_memcpy *dm
         dmesh_dma_push_desc_done(conn);
         return;
     }
+    if (kind == DMESH_TASK_PULL_CURSOR) {
+        static int probed;
+
+        conn->cursor_state = 0;
+        if (probed++ < 3)
+            DOCA_LOG_INFO("cursor probe: magic=%lx seq=%lu bytes=%lu",
+                          conn->cursor_shadow != NULL ? conn->cursor_shadow->magic : 0,
+                          conn->cursor_shadow != NULL ? conn->cursor_shadow->consumed_seq : 0,
+                          conn->cursor_shadow != NULL ? conn->cursor_shadow->consumed_bytes : 0);
+        if (conn->cursor_shadow != NULL &&
+            conn->cursor_shadow->magic == DMESH_PUSH_FC_MAGIC) {
+            if (!conn->host_fc) {
+                conn->host_fc = 1;
+                DOCA_LOG_INFO("push flow control enabled (host cursor live)");
+            }
+            conn->host_consumed_seq = conn->cursor_shadow->consumed_seq;
+            conn->host_consumed_bytes = conn->cursor_shadow->consumed_bytes;
+        }
+        return;
+    }
 
     /* a task (and its bufs) just freed up: run this connection's deferred
      * copies. Task submission is allowed inside a completion callback. */
@@ -554,6 +574,47 @@ submit_dma_task(struct dmesh_conn *conn, const struct doca_buf *src, struct doca
  * DMAs a 16B dmesh_push_desc into slot seq % N. The host busy-polls the slots
  * in order. One batch outstanding at a time. Returns bytes accepted (0 while a
  * batch is in flight - caller retries), or a negative doca_error_t. */
+/* Kick a read-DMA pulling the host's consumption cursor into the DPU-local
+ * shadow (tx_staging reserved tail). Fire-and-forget; the completion callback
+ * copies it into conn->host_consumed_*. Safe to call any time - no-ops while
+ * a pull is already in flight or before the reverse path is exported. */
+static void
+dmesh_dma_pull_cursor(struct dmesh_conn *conn)
+{
+    struct doca_buf *sbuf = NULL, *dbuf = NULL;
+    doca_error_t result;
+
+    if (conn->cursor_state != 0 || conn->tx_staging == NULL ||
+        conn->rcvbuf.mmap == NULL || conn->rcvbuf.buf == NULL)
+        return;
+    conn->cursor_shadow = (struct dmesh_push_cursor *)((uint8_t *)conn->tx_staging +
+                                                       conn->tx_staging_len - 48);
+    result = doca_buf_inventory_buf_get_by_data(conn->buf_inv, conn->rcvbuf.mmap,
+                                                (uint8_t *)conn->rcvbuf.buf +
+                                                    DMESH_PUSH_CURSOR_OFF,
+                                                sizeof(struct dmesh_push_cursor), &sbuf);
+    if (result != DOCA_SUCCESS)
+        return;
+    result = doca_buf_inventory_buf_get_by_addr(conn->buf_inv, conn->tx_staging_mmap,
+                                                conn->cursor_shadow,
+                                                sizeof(struct dmesh_push_cursor), &dbuf);
+    if (result != DOCA_SUCCESS) {
+        (void)doca_buf_dec_refcount(sbuf, NULL);
+        return;
+    }
+    result = submit_dma_task_kind(conn, sbuf, dbuf, DMESH_TASK_PULL_CURSOR);
+    if (result == DOCA_SUCCESS)
+        conn->cursor_state = 1;
+    else {
+        static int logged;
+
+        if (logged++ < 3)
+            DOCA_LOG_WARN("cursor pull submit failed: %s", doca_error_get_name(result));
+        (void)doca_buf_dec_refcount(dbuf, NULL);
+        (void)doca_buf_dec_refcount(sbuf, NULL);
+    }
+}
+
 int
 dmesh_dma_push_staged(struct dmesh_conn *conn, uint32_t src_pos, uint32_t len)
 {
@@ -569,6 +630,20 @@ dmesh_dma_push_staged(struct dmesh_conn *conn, uint32_t src_pos, uint32_t len)
         return 0;                       /* previous batch still in flight */
     if (len == 0)
         return 0;
+
+    /* Flow control: once the host has published its cursor (magic seen),
+     * refuse to publish past unconsumed slots or unread data-ring bytes -
+     * the caller retries, so tx_staging soaks the backlog (upstream
+     * backpressure). While gated, keep the cursor fresh. */
+    if (conn->host_fc) {
+        size_t ring = conn->rcvbuf.size - DMESH_PUSH_DATA_OFF;
+
+        if (conn->push_seq - conn->host_consumed_seq >= DMESH_PUSH_DESC_N - 2 ||
+            conn->pushed_bytes - conn->host_consumed_bytes + 2 * DMESH_PUSH_MAX_BATCH > ring) {
+            dmesh_dma_pull_cursor(conn);
+            return 0;
+        }
+    }
 
     /* The bytes are already staged at tx_staging+src_pos (written once by the
      * Rust side). We only build the DMA and publish a descriptor - no memcpy.
@@ -660,8 +735,12 @@ dmesh_dma_push_desc_done(struct dmesh_conn *conn)
 {
     conn->push_seq++;
     conn->push_pos += conn->push_len;
+    conn->pushed_bytes += conn->push_len;
     conn->push_len = 0;
     conn->push_state = 0;
+    /* Keep the host cursor reasonably fresh (also probes legacy hosts). */
+    if ((conn->push_seq & 0xf) == 0 || conn->push_seq < 4)
+        dmesh_dma_pull_cursor(conn);
 }
 
 doca_error_t
