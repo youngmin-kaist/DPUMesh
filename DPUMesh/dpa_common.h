@@ -38,6 +38,14 @@ struct dpa_thread_arg {
 	volatile uint32_t stop;     /* host -> DPA: leave the poll loop */
 	volatile uint32_t stopped;  /* DPA -> host: poll loop has exited */
 
+	/* DPU-side staging flow control. rd_pos: offset up to which the DPU
+	 * reader (proxy) has consumed the staging ring, published by the DPU app
+	 * via h2d_memcpy on its tick. rd_fc: 1 = the DPU app publishes rd_pos,
+	 * so the kernel must not copy past it (opt-in: apps that never publish
+	 * keep the legacy free-running behavior). */
+	volatile uint32_t rd_pos;
+	volatile uint32_t rd_fc;
+
 } __attribute__((__packed__, aligned(8)));
 
 enum comch_msg_type {

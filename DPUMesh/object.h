@@ -160,6 +160,7 @@ struct dmesh_conn {
      * until the magic shows up), 1 = enforced. pushed_bytes counts published
      * batch bytes for the data-ring occupancy check. */
     int cursor_state;                         /* 0 idle, 1 pull in flight */
+    uint64_t gated_calls;                     /* consecutive gated push attempts */
     int host_fc;
     uint64_t host_consumed_seq;
     uint64_t host_consumed_bytes;

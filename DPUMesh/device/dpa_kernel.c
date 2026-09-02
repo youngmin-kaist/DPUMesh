@@ -188,6 +188,19 @@ static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
         producer_tail = ctrl->producer_tail;
 
         while (consumer_head < producer_tail) {
+            /* Staging backpressure (rd_fc): never copy into the DPU staging
+             * ring past what the reader released. Unread = (pos - rd_pos)
+             * circularly; leave room for this batch, a wrap's wasted tail and
+             * a margin (3*8064). If short, stop consuming descriptors -
+             * consumer_head stalls, the host's forward gate holds its writes,
+             * and the pressure reaches the h2 client. Re-checked next spin. */
+            if (thread_arg->rd_fc) {
+                uint32_t rdp = thread_arg->rd_pos;
+                uint32_t unread = ((uint32_t)thread_arg->pos + buf_size - rdp) % buf_size;
+
+                if (buf_size - unread < 3u * 8064u)
+                    break;
+            }
             uint64_t batch_src;
             uint32_t batch_len, batch_cnt;
             uint32_t dst_room = buf_size - (uint32_t)thread_arg->pos;

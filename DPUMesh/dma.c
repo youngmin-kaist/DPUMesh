@@ -285,6 +285,10 @@ static void dmesh_doca_dpa_dma_task_error_cb(struct doca_dma_task_memcpy *dma_ta
         conn->push_state = 0;
         return;
     }
+    if (kind == DMESH_TASK_PULL_CURSOR) {
+        conn->cursor_state = 0;         /* allow a fresh pull; cache stays */
+        return;
+    }
 
     int i;
     for (i = 0; i < conn->num_dma_tasks; i++) {
@@ -640,9 +644,25 @@ dmesh_dma_push_staged(struct dmesh_conn *conn, uint32_t src_pos, uint32_t len)
 
         if (conn->push_seq - conn->host_consumed_seq >= DMESH_PUSH_DESC_N - 2 ||
             conn->pushed_bytes - conn->host_consumed_bytes + 2 * DMESH_PUSH_MAX_BATCH > ring) {
+            /* Stale-pull recovery: a pull whose completion never arrived
+             * would pin cursor_state=1 and freeze the cursor forever. After
+             * enough consecutive gated calls (driver ticks ~1ms), assume it
+             * was lost and allow a fresh pull. */
+            if (++conn->gated_calls % 4096 == 0) {
+                if (conn->cursor_state != 0) {
+                    DOCA_LOG_WARN("push gate: pull stuck, resetting cursor_state");
+                    conn->cursor_state = 0;
+                }
+                DOCA_LOG_WARN("push gate held %lu calls: push_seq=%lu consumed_seq=%lu "
+                              "pushed_bytes=%lu consumed_bytes=%lu ring=%zu cursor_state=%d",
+                              conn->gated_calls, conn->push_seq, conn->host_consumed_seq,
+                              conn->pushed_bytes, conn->host_consumed_bytes, ring,
+                              conn->cursor_state);
+            }
             dmesh_dma_pull_cursor(conn);
             return 0;
         }
+        conn->gated_calls = 0;
     }
 
     /* The bytes are already staged at tx_staging+src_pos (written once by the

@@ -20,6 +20,10 @@
 
 DOCA_LOG_REGISTER(DPA);
 
+/* DPU-side staging flow control opt-in (set by apps that publish rd_pos). */
+int dmesh_staging_fc = 0;
+
+
 /* Kernel function declaration */
 extern doca_dpa_func_t run_dma_manager;
 extern doca_dpa_func_t thread_init_rpc;
@@ -986,6 +990,8 @@ dmesh_fill_dpa_thread_arg(struct dmesh_conn *conn, struct dpa_thread_arg *arg)
         .src_addr = conn->dma_buffer,
         .buf_size = 1024 * 1024,
         .pos = 0,
+        .rd_pos = 0,
+        .rd_fc = (uint32_t)dmesh_staging_fc,
 #endif
     };
 
