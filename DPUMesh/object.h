@@ -44,7 +44,7 @@ typedef uint64_t doca_dpa_dev_buf_arr_t;
 
 /* Keep in sync with DPA_THREAD_POOL_SIZE (dpa.h): one DPA thread per connection.
  * This is the per-worker-thread limit; total = num_threads x this. */
-#define DMESH_MAX_CONNECTIONS 8
+#define DMESH_MAX_CONNECTIONS 16
 
 /* Per-connection init state, advanced by dmesh_doca_ctrl_advance() */
 enum dmesh_conn_state {
