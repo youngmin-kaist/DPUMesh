@@ -209,6 +209,30 @@ diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/ho
  	if err != nil {
  		return fmt.Errorf("failed to listen: %v", err)
  	}
+diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/hotelReservation/services/frontend/server.go hotelres-dmesh/services/frontend/server.go
+--- DeathStarBench/hotelReservation/services/frontend/server.go	2026-08-20 01:18:55.966887467 +0900
++++ hotelres-dmesh/services/frontend/server.go	2026-09-02 09:59:56.888104973 +0900
+@@ -1,6 +1,7 @@
+ package frontend
+ 
+ import (
++	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dmesh"
+ 	"embed"
+ 	"encoding/json"
+ 	"fmt"
+@@ -183,6 +184,12 @@
+ }
+ 
+ func (s *Server) initReservation(name string) error {
++	if bc, err := dmesh.DialReplicated(name); err != nil {
++		return fmt.Errorf("dialer error: %v", err)
++	} else if bc != nil {
++		s.reservationClient = reservation.NewReservationClient(bc)
++		return nil
++	}
+ 	conn, err := s.getGprcConn(name)
+ 	if err != nil {
+ 		return fmt.Errorf("dialer error: %v", err)
 diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/hotelReservation/services/geo/server.go hotelres-dmesh/services/geo/server.go
 --- DeathStarBench/hotelReservation/services/geo/server.go	2026-08-20 01:18:55.970887455 +0900
 +++ hotelres-dmesh/services/geo/server.go	2026-09-02 08:04:38.664716214 +0900
