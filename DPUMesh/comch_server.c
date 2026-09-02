@@ -706,6 +706,10 @@ dmesh_conn_teardown(struct dmesh_conn *conn)
      * ack, then stop it. Its DPA-side msgq/completion ctxs can only idle (and
      * later be destroyed) once the thread is no longer hot-looping. */
     dmesh_doca_dpa_thread_quiesce(conn->dpa_thread);
+    /* Stop the runnable thread while its completion contexts are still
+     * attached (undo doca_dpa_thread_run); the later destroy then succeeds.
+     * DMESH_THREAD_STOP-gated. */
+    dmesh_doca_dpa_thread_stop_only(conn->dpa_thread);
 
     /* Datapath consumer (DPU side, on the shared consumer PE). */
     if (conn->consumer != NULL) {

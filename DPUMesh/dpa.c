@@ -860,6 +860,30 @@ dmesh_doca_dpa_thread_quiesce(struct dmesh_doca_dpa_thread *dpa_thread)
  * recreated fresh for the next connection (dmesh_dpa_thread_pool_alloc).
  * The thread must already be quiesced (dmesh_doca_dpa_thread_quiesce) and its
  * completion contexts destroyed (dmesh_doca_dpa_comch_destroy) first. */
+/* Stop a runnable DPA thread (undo doca_dpa_thread_run) BEFORE its completion
+ * contexts are destroyed and BEFORE doca_dpa_thread_destroy. The thread must
+ * already be quiesced (kernel called doca_dpa_dev_thread_finish); stopping it
+ * then transitions the flexio event handler out of the runnable state so the
+ * later destroy does not fail ("Failed to destroy dpa thread event handler").
+ * Gated by DMESH_THREAD_STOP for A/B comparison. */
+void
+dmesh_doca_dpa_thread_stop_only(struct dmesh_doca_dpa_thread *dpa_thread)
+{
+    doca_error_t result;
+
+    if (dpa_thread == NULL || dpa_thread->thread == NULL)
+        return;
+    /* Opt-in (DMESH_THREAD_STOP): fixes the flexio thread-destroy wedge in the
+     * standalone C-worker sibling-teardown reproducer (errors 2->0), but
+     * REGRESSES the proxy INGRESS_PUSH path (N=1 DSB 7.6k->17 req/s, flexio
+     * still fires) - the proxy client-channel teardown differs. Default off
+     * until that path is understood. */
+    if (getenv("DMESH_THREAD_STOP") == NULL)
+        return;
+    result = doca_dpa_thread_stop(dpa_thread->thread);
+    if (result != DOCA_SUCCESS)
+        DOCA_LOG_WARN("doca_dpa_thread_stop: %s", doca_error_get_name(result));
+}
 void
 dmesh_doca_dpa_thread_destroy(struct dmesh_doca_dpa_thread *dpa_thread)
 {

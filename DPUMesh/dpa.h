@@ -119,6 +119,9 @@ dmesh_doca_dpa_comch_destroy(struct dmesh_conn *conn);
 void
 dmesh_doca_dpa_thread_quiesce(struct dmesh_doca_dpa_thread *dpa_thread);
 void
+dmesh_doca_dpa_thread_stop_only(struct dmesh_doca_dpa_thread *dpa_thread);
+
+void
 dmesh_doca_dpa_thread_destroy(struct dmesh_doca_dpa_thread *dpa_thread);
 
 doca_error_t
