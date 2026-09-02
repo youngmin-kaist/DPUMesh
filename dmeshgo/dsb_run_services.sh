@@ -2,7 +2,7 @@
 # Start hotelReservation services bare-metal with per-service replicas.
 # usage: dsb_run_services.sh <tcp|dmesh> [W] [SPEC]   SPEC="srv-reservation:4,srv-rate:4"
 set -u
-MODE=$1; W=${2:-8}; SPEC=${3:-}
+MODE=$1; W=${2:-8}; SPEC=${3:-}; FE=${4:-1}
 cd ~/hotelres-dmesh
 for b in frontend geo rate profile recommendation user reservation review attractions search; do pkill -9 -f "hotelres-dmesh/bin/$b" 2>/dev/null; done; sleep 2
 ENVV="DMESH_TCP_DIRECT=1"
@@ -21,7 +21,9 @@ for s in geo rate profile recommendation user review attractions reservation sea
   done
 done
 sleep 3
-setsid env $ENVV ~/hotelres-dmesh/bin/frontend > /tmp/dsb-logs/frontend.log 2>&1 </dev/null &
-for i in $(seq 1 40); do (echo > /dev/tcp/127.0.0.1/5000) 2>/dev/null && break; sleep 1; done
-(echo > /dev/tcp/127.0.0.1/5000) 2>/dev/null && echo "frontend up (:5000)" || { echo "FRONTEND-DOWN"; tail -3 /tmp/dsb-logs/frontend.log; exit 1; }
+for f in $(seq 0 $((FE-1))); do
+  setsid env $ENVV DMESH_CLIENT_ID=$f DMESH_PORT_OVERRIDE=$((5000+10000*f)) ~/hotelres-dmesh/bin/frontend > /tmp/dsb-logs/frontend-$f.log 2>&1 </dev/null &
+  sleep 0.3
+done
+for f in $(seq 0 $((FE-1))); do P=$((5000+10000*f)); for i in $(seq 1 40); do (echo > /dev/tcp/127.0.0.1/$P) 2>/dev/null && break; sleep 1; done; (echo > /dev/tcp/127.0.0.1/$P) 2>/dev/null && echo "frontend $f up (:$P)" || { echo "FRONTEND-$f-DOWN"; tail -3 /tmp/dsb-logs/frontend-$f.log; exit 1; }; done
 echo "services started (mode=$MODE spec=$SPEC) procs=$(pgrep -cf hotelres-dmesh/bin)"
