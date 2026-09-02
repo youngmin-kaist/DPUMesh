@@ -1,3 +1,68 @@
+diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/hotelReservation/cmd/frontend/main.go hotelres-dmesh/cmd/frontend/main.go
+--- DeathStarBench/hotelReservation/cmd/frontend/main.go	2026-08-20 01:18:55.962887480 +0900
++++ hotelres-dmesh/cmd/frontend/main.go	2026-09-02 14:58:47.944889671 +0900
+@@ -33,6 +33,9 @@
+ 	json.Unmarshal([]byte(byteValue), &result)
+ 
+ 	servPort, _ := strconv.Atoi(result["FrontendPort"])
++	if po := os.Getenv("DMESH_PORT_OVERRIDE"); po != "" {
++		servPort, _ = strconv.Atoi(po)
++	}
+ 	servIP := result["FrontendIP"]
+ 	knativeDNS := result["KnativeDomainName"]
+ 
+diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/hotelReservation/cmd/geo/main.go hotelres-dmesh/cmd/geo/main.go
+--- DeathStarBench/hotelReservation/cmd/geo/main.go	2026-08-20 01:18:55.962887480 +0900
++++ hotelres-dmesh/cmd/geo/main.go	2026-09-02 14:58:47.944889671 +0900
+@@ -38,6 +38,9 @@
+ 	defer mongoClose()
+ 
+ 	servPort, _ := strconv.Atoi(result["GeoPort"])
++	if po := os.Getenv("DMESH_PORT_OVERRIDE"); po != "" {
++		servPort, _ = strconv.Atoi(po)
++	}
+ 	servIP := result["GeoIP"]
+ 
+ 	var (
+diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/hotelReservation/cmd/profile/main.go hotelres-dmesh/cmd/profile/main.go
+--- DeathStarBench/hotelReservation/cmd/profile/main.go	2026-08-20 01:18:55.962887480 +0900
++++ hotelres-dmesh/cmd/profile/main.go	2026-09-02 14:58:47.944889671 +0900
+@@ -43,6 +43,9 @@
+ 	log.Info().Msg("Success")
+ 
+ 	servPort, _ := strconv.Atoi(result["ProfilePort"])
++	if po := os.Getenv("DMESH_PORT_OVERRIDE"); po != "" {
++		servPort, _ = strconv.Atoi(po)
++	}
+ 	servIP := result["ProfileIP"]
+ 
+ 	var (
+diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/hotelReservation/cmd/rate/main.go hotelres-dmesh/cmd/rate/main.go
+--- DeathStarBench/hotelReservation/cmd/rate/main.go	2026-08-20 01:18:55.962887480 +0900
++++ hotelres-dmesh/cmd/rate/main.go	2026-09-02 14:58:47.944889671 +0900
+@@ -44,6 +44,9 @@
+ 	log.Info().Msg("Success")
+ 
+ 	servPort, _ := strconv.Atoi(result["RatePort"])
++	if po := os.Getenv("DMESH_PORT_OVERRIDE"); po != "" {
++		servPort, _ = strconv.Atoi(po)
++	}
+ 	servIP := result["RateIP"]
+ 
+ 	var (
+diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/hotelReservation/cmd/recommendation/main.go hotelres-dmesh/cmd/recommendation/main.go
+--- DeathStarBench/hotelReservation/cmd/recommendation/main.go	2026-08-20 01:18:55.962887480 +0900
++++ hotelres-dmesh/cmd/recommendation/main.go	2026-09-02 14:58:47.944889671 +0900
+@@ -39,6 +39,9 @@
+ 	defer mongoClose()
+ 
+ 	servPort, _ := strconv.Atoi(result["RecommendPort"])
++	if po := os.Getenv("DMESH_PORT_OVERRIDE"); po != "" {
++		servPort, _ = strconv.Atoi(po)
++	}
+ 	servIP := result["RecommendIP"]
+ 
+ 	var (
 diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/hotelReservation/cmd/reservation/main.go hotelres-dmesh/cmd/reservation/main.go
 --- DeathStarBench/hotelReservation/cmd/reservation/main.go	2026-08-20 01:18:55.962887480 +0900
 +++ hotelres-dmesh/cmd/reservation/main.go	2026-09-02 08:21:05.528832125 +0900
@@ -9,6 +74,32 @@ diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/ho
 +		servPort, _ = strconv.Atoi(po)
 +	}
  	servIP := result["ReserveIP"]
+ 
+ 	var (
+diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/hotelReservation/cmd/search/main.go hotelres-dmesh/cmd/search/main.go
+--- DeathStarBench/hotelReservation/cmd/search/main.go	2026-08-20 01:18:55.962887480 +0900
++++ hotelres-dmesh/cmd/search/main.go	2026-09-02 14:58:47.944889671 +0900
+@@ -35,6 +35,9 @@
+ 	json.Unmarshal([]byte(byteValue), &result)
+ 
+ 	servPort, _ := strconv.Atoi(result["SearchPort"])
++	if po := os.Getenv("DMESH_PORT_OVERRIDE"); po != "" {
++		servPort, _ = strconv.Atoi(po)
++	}
+ 	servIP := result["SearchIP"]
+ 	knativeDNS := result["KnativeDomainName"]
+ 
+diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/hotelReservation/cmd/user/main.go hotelres-dmesh/cmd/user/main.go
+--- DeathStarBench/hotelReservation/cmd/user/main.go	2026-08-20 01:18:55.962887480 +0900
++++ hotelres-dmesh/cmd/user/main.go	2026-09-02 14:58:47.944889671 +0900
+@@ -39,6 +39,9 @@
+ 	defer mongoClose()
+ 
+ 	servPort, _ := strconv.Atoi(result["UserPort"])
++	if po := os.Getenv("DMESH_PORT_OVERRIDE"); po != "" {
++		servPort, _ = strconv.Atoi(po)
++	}
+ 	servIP := result["UserIP"]
  
  	var (
 diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/hotelReservation/config.json hotelres-dmesh/config.json
@@ -211,16 +302,94 @@ diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/ho
  	}
 diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/hotelReservation/services/frontend/server.go hotelres-dmesh/services/frontend/server.go
 --- DeathStarBench/hotelReservation/services/frontend/server.go	2026-08-20 01:18:55.966887467 +0900
-+++ hotelres-dmesh/services/frontend/server.go	2026-09-02 09:59:56.888104973 +0900
-@@ -1,6 +1,7 @@
- package frontend
- 
- import (
-+	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dmesh"
++++ hotelres-dmesh/services/frontend/server.go	2026-09-02 15:12:30.798345147 +0900
+@@ -4,6 +4,7 @@
  	"embed"
  	"encoding/json"
  	"fmt"
-@@ -183,6 +184,12 @@
++	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dmesh"
+ 	"io/fs"
+ 	"net/http"
+ 	"strconv"
+@@ -121,6 +122,12 @@
+ }
+ 
+ func (s *Server) initSearchClient(name string) error {
++	if bc, err := dmesh.DialReplicated(name); err != nil {
++		return fmt.Errorf("dialer error: %v", err)
++	} else if bc != nil {
++		s.searchClient = search.NewSearchClient(bc)
++		return nil
++	}
+ 	conn, err := s.getGprcConn(name)
+ 	if err != nil {
+ 		return fmt.Errorf("dialer error: %v", err)
+@@ -130,6 +137,12 @@
+ }
+ 
+ func (s *Server) initReviewClient(name string) error {
++	if bc, err := dmesh.DialReplicated(name); err != nil {
++		return fmt.Errorf("dialer error: %v", err)
++	} else if bc != nil {
++		s.reviewClient = review.NewReviewClient(bc)
++		return nil
++	}
+ 	conn, err := dialer.Dial(
+ 		name,
+ 		dialer.WithTracer(s.Tracer),
+@@ -143,6 +156,12 @@
+ }
+ 
+ func (s *Server) initAttractionsClient(name string) error {
++	if bc, err := dmesh.DialReplicated(name); err != nil {
++		return fmt.Errorf("dialer error: %v", err)
++	} else if bc != nil {
++		s.attractionsClient = attractions.NewAttractionsClient(bc)
++		return nil
++	}
+ 	conn, err := dialer.Dial(
+ 		name,
+ 		dialer.WithTracer(s.Tracer),
+@@ -156,6 +175,12 @@
+ }
+ 
+ func (s *Server) initProfileClient(name string) error {
++	if bc, err := dmesh.DialReplicated(name); err != nil {
++		return fmt.Errorf("dialer error: %v", err)
++	} else if bc != nil {
++		s.profileClient = profile.NewProfileClient(bc)
++		return nil
++	}
+ 	conn, err := s.getGprcConn(name)
+ 	if err != nil {
+ 		return fmt.Errorf("dialer error: %v", err)
+@@ -165,6 +190,12 @@
+ }
+ 
+ func (s *Server) initRecommendationClient(name string) error {
++	if bc, err := dmesh.DialReplicated(name); err != nil {
++		return fmt.Errorf("dialer error: %v", err)
++	} else if bc != nil {
++		s.recommendationClient = recommendation.NewRecommendationClient(bc)
++		return nil
++	}
+ 	conn, err := s.getGprcConn(name)
+ 	if err != nil {
+ 		return fmt.Errorf("dialer error: %v", err)
+@@ -174,6 +205,12 @@
+ }
+ 
+ func (s *Server) initUserClient(name string) error {
++	if bc, err := dmesh.DialReplicated(name); err != nil {
++		return fmt.Errorf("dialer error: %v", err)
++	} else if bc != nil {
++		s.userClient = user.NewUserClient(bc)
++		return nil
++	}
+ 	conn, err := s.getGprcConn(name)
+ 	if err != nil {
+ 		return fmt.Errorf("dialer error: %v", err)
+@@ -183,6 +220,12 @@
  }
  
  func (s *Server) initReservation(name string) error {
@@ -452,14 +621,13 @@ diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/ho
  	}
 diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/hotelReservation/services/search/server.go hotelres-dmesh/services/search/server.go
 --- DeathStarBench/hotelReservation/services/search/server.go	2026-08-20 01:18:55.970887455 +0900
-+++ hotelres-dmesh/services/search/server.go	2026-09-02 08:04:38.664716214 +0900
-@@ -1,8 +1,8 @@
- package search
++++ hotelres-dmesh/services/search/server.go	2026-09-02 15:12:30.798345147 +0900
+@@ -2,7 +2,7 @@
  
  import (
-+	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dmesh"
  	"fmt"
 -	"net"
++	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dmesh"
  	"time"
  
  	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dialer"
@@ -480,6 +648,32 @@ diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/ho
  	if err != nil {
  		log.Fatal().Msgf("failed to listen: %v", err)
  	}
+@@ -94,6 +95,12 @@
+ }
+ 
+ func (s *Server) initGeoClient(name string) error {
++	if bc, err := dmesh.DialReplicated(name); err != nil {
++		return fmt.Errorf("dialer error: %v", err)
++	} else if bc != nil {
++		s.geoClient = geo.NewGeoClient(bc)
++		return nil
++	}
+ 	conn, err := s.getGprcConn(name)
+ 	if err != nil {
+ 		return fmt.Errorf("dialer error: %v", err)
+@@ -103,6 +110,12 @@
+ }
+ 
+ func (s *Server) initRateClient(name string) error {
++	if bc, err := dmesh.DialReplicated(name); err != nil {
++		return fmt.Errorf("dialer error: %v", err)
++	} else if bc != nil {
++		s.rateClient = rate.NewRateClient(bc)
++		return nil
++	}
+ 	conn, err := s.getGprcConn(name)
+ 	if err != nil {
+ 		return fmt.Errorf("dialer error: %v", err)
 diff -ru '--exclude=bin' '--exclude=vendor' '--exclude=go.sum' DeathStarBench/hotelReservation/services/user/server.go hotelres-dmesh/services/user/server.go
 --- DeathStarBench/hotelReservation/services/user/server.go	2026-08-20 01:18:55.970887455 +0900
 +++ hotelres-dmesh/services/user/server.go	2026-09-02 08:04:38.664716214 +0900
