@@ -167,7 +167,12 @@ func (c *Conn) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
-func (c *Conn) claimed() bool { return C.dmesh_chan_claimed(c.ch) != 0 }
+func (c *Conn) claimed() bool {
+	if c.isClosed() {
+		return false
+	}
+	return C.dmesh_chan_claimed(c.ch) != 0
+}
 
 func connect(server, srcIP string, srcPort int, dstIP string, dstPort int, workload string, mode int) (*Conn, error) {
 	cPci := C.CString(PCIAddr)
