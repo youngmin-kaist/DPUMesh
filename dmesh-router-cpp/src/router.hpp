@@ -19,6 +19,8 @@
 #include <nghttp2/nghttp2.h>
 
 #include "dmesh.hpp"
+#include "relay.hpp"
+#include "relay3.hpp"
 
 namespace dmesh {
 
@@ -46,6 +48,9 @@ struct Config {
     int backend_wait_ms = 5000;
     uint32_t max_streams = 1000;
     bool busy_poll = false;
+    // terminate (nghttp2 h2 termination, default) | l4 | relay — see relay.hpp
+    enum class Mode { kTerminate, kL4, kRelay, kTranscode } mode = Mode::kTerminate;
+    RelayPolicy policy;
 
     static bool from_env(Config *out, std::string *error);
     // Backend key for an authority, if the route table names one.
@@ -116,6 +121,8 @@ class Channel {
     size_t rx_len_ = 0;
     TxRing tx_;
     bool failed_ = false;
+    uint32_t rx_wm_ = 0;
+    bool rx_wm_dirty_ = false;
 
     static ssize_t send_cb(nghttp2_session *session, const uint8_t *data, size_t length, int flags,
                            void *user_data);
@@ -190,6 +197,8 @@ class Router {
     void dispatch(const StreamPtr &st);
 
     const Config &config() const { return cfg_; }
+    // One-line counters for the relay modes (empty string in terminate mode).
+    std::string stats_line();
 
   private:
     void open_slot(int slot);
@@ -197,9 +206,17 @@ class Router {
     H2Backend *pick(const Key &key);
     void retry_pending();
 
+    void open_relay_slot(int slot, bool is_backend, const Key &key);
+    void pair_relays();
+    std::string relay_stats_line();
+
     struct objects *objs_;
     Config cfg_;
     std::map<int, std::unique_ptr<Channel>> channels_;
+    std::map<int, std::unique_ptr<RelayChannel>> relays_;
+    std::map<int, std::unique_ptr<H2Relay>> engines_; // by client slot (relay mode)
+    std::unique_ptr<H2Mux> mux_;                        // transcode mode
+    RelayStats relay_closed_; // totals of channels/engines already closed
     std::map<int, int32_t> states_;
     // Backend channels per service key, round-robin.
     std::map<uint64_t, std::vector<H2Backend *>> backends_;

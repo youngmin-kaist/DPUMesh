@@ -18,6 +18,7 @@
 #include <ctime>
 #include <string>
 
+#include <execinfo.h>
 #include <sys/epoll.h>
 #include <unistd.h>
 
@@ -34,6 +35,21 @@ static volatile sig_atomic_t g_stop = 0;
 
 static void on_signal(int) { g_stop = 1; }
 
+// Crash diagnostics without a debugger: dump a raw backtrace to stderr.
+static void on_crash(int sig) {
+    void *frames[64];
+    const int n = backtrace(frames, 64);
+    std::fprintf(stderr, "\n*** fatal signal %d, backtrace (%d frames):\n", sig, n);
+    backtrace_symbols_fd(frames, n, 2);
+    _exit(128 + sig);
+}
+
+static int64_t now_ns() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<int64_t>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
+}
+
 static int64_t now_ms() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -42,7 +58,7 @@ static int64_t now_ms() {
 
 // Same one-per-second datapath report the Rust router logs, so benchmark output
 // from the two implementations lines up.
-static void report_stats(struct objects *objs, int64_t *last_ms, int64_t prev[5]) {
+static void report_stats(struct objects *objs, Router &router, int64_t *last_ms, int64_t prev[5]) {
     const int64_t now = now_ms();
     const int64_t elapsed = now - *last_ms;
     if (elapsed < 1000) {
@@ -58,6 +74,10 @@ static void report_stats(struct objects *objs, int64_t *last_ms, int64_t prev[5]
                  (static_cast<double>(cur[2] - prev[2]) * 8.0) / secs / 1e9,
                  static_cast<long long>((cur[0] - prev[0]) / secs),
                  static_cast<long long>(cur[3]), static_cast<long long>(cur[4]));
+        const std::string rs = router.stats_line();
+        if (!rs.empty()) {
+            log_info("%s", rs.c_str());
+        }
     }
     std::memcpy(prev, cur, sizeof(cur));
     *last_ms = now;
@@ -74,6 +94,9 @@ int main() {
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
     signal(SIGPIPE, SIG_IGN);
+    signal(SIGSEGV, on_crash);
+    signal(SIGABRT, on_crash);
+    signal(SIGBUS, on_crash);
 
     // Stage 1: open the device and start the comch server the host shim dials.
     struct objects *objs = nullptr;
@@ -84,8 +107,12 @@ int main() {
                      doca_error_get_descr(static_cast<doca_error_t>(rc)));
         return 1;
     }
-    log_info("comch server started server=%s dev=%s rep=%s backend_proto=h2",
-             cfg.server_name.c_str(), cfg.dev_pci.c_str(), cfg.rep_pci.c_str());
+    log_info("comch server started server=%s dev=%s rep=%s backend_proto=h2 mode=%s",
+             cfg.server_name.c_str(), cfg.dev_pci.c_str(), cfg.rep_pci.c_str(),
+             cfg.mode == Config::Mode::kTerminate ? "terminate"
+             : cfg.mode == Config::Mode::kL4      ? "l4"
+             : cfg.mode == Config::Mode::kRelay   ? "relay"
+                                                  : "transcode");
 
     // Stage 2: build the shared infrastructure (DPA pool, consumer PE, DMA
     // engine) before serving connections; this also makes the data PE fd
@@ -130,6 +157,14 @@ int main() {
         log_info("busy-poll mode (progress engines polled, fds unused)");
     }
 
+    // Adaptive polling: after a tick that found work, spin for up to this long
+    // polling the data PE before falling back to arm+epoll. Amortizes the
+    // per-tick syscalls (epoll_wait/read/arm) over more completions under load
+    // while still sleeping when idle. Applies identically to every mode.
+    const int64_t spin_ns = static_cast<int64_t>(std::atoi(std::getenv("DMESH_ROUTER_IDLE_SPIN_US") ? std::getenv("DMESH_ROUTER_IDLE_SPIN_US") : "0")) * 1000;
+    if (spin_ns > 0) {
+        log_info("adaptive polling: spin up to %lld us before sleeping", static_cast<long long>(spin_ns / 1000));
+    }
     Router router(objs, cfg);
     int64_t stats_last = now_ms();
     int64_t stats_prev[5] = {0, 0, 0, 0, 0};
@@ -163,11 +198,26 @@ int main() {
 
         router.poll_slots();
         router.pump();
-        report_stats(objs, &stats_last, stats_prev);
+        report_stats(objs, router, &stats_last, stats_prev);
 
         // Budget exhausted: more datapath work is pending, don't sleep.
         if (drained >= kDataDrainBudget || cfg.busy_poll) {
             continue;
+        }
+        if (spin_ns > 0) {
+            const int64_t t0 = now_ns();
+            bool got = false;
+            do {
+                int d = 0;
+                dmesh_doca_data_drain_only(objs, kDataDrainBudget, &d);
+                if (d > 0) {
+                    got = true;
+                    break;
+                }
+            } while (now_ns() - t0 < spin_ns);
+            if (got) {
+                continue; // completions in hand: process them without sleeping
+            }
         }
 
         // Sleep until either PE signals. The 1ms cap is the same safety net the

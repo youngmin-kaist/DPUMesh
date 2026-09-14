@@ -75,6 +75,34 @@ bool Config::from_env(Config *out, std::string *error) {
     const std::string busy = env_or("DMESH_BUSY_POLL", "");
     out->busy_poll = !busy.empty() && busy != "0";
 
+    const std::string mode = env_or("DMESH_ROUTER_MODE", "terminate");
+    if (mode == "terminate") {
+        out->mode = Config::Mode::kTerminate;
+    } else if (mode == "l4") {
+        out->mode = Config::Mode::kL4;
+    } else if (mode == "relay") {
+        out->mode = Config::Mode::kRelay;
+    } else if (mode == "transcode") {
+        out->mode = Config::Mode::kTranscode;
+    } else {
+        *error = "DMESH_ROUTER_MODE=" + mode + ": expected terminate|l4|relay|transcode";
+        return false;
+    }
+    // "/ok,/api/" — allowed :path prefixes (lookup-only policy); empty ⇒ any "/…"
+    const std::string paths = env_or("DMESH_ROUTER_POLICY_PATHS", "");
+    size_t ps = 0;
+    while (ps < paths.size()) {
+        size_t c = paths.find(',', ps);
+        if (c == std::string::npos) {
+            c = paths.size();
+        }
+        if (c > ps) {
+            out->policy.path_prefixes.push_back(paths.substr(ps, c - ps));
+        }
+        ps = c + 1;
+    }
+    out->policy.authority = env_or("DMESH_ROUTER_POLICY_AUTHORITY", "");
+
     const std::string proto = env_or("DMESH_ROUTER_BACKEND_PROTO", "h2");
     if (proto != "h2" && proto != "http2" && proto != "h2c") {
         *error = "DMESH_ROUTER_BACKEND_PROTO=" + proto +
@@ -249,6 +277,8 @@ int Channel::pump_recv() {
             continue;
         }
         const ssize_t rv = nghttp2_session_mem_recv(session_, rx_base_ + pos, len);
+        rx_wm_ = pos + len; // fully consumed by mem_recv: DPA may reuse staging up to here
+        rx_wm_dirty_ = true;
         if (rv < 0) {
             log_warn("slot %d: nghttp2 recv failed: %s", slot_, nghttp2_strerror(rv));
             failed_ = true;
@@ -279,6 +309,10 @@ bool Channel::pump_send() {
         return false;
     }
     wire();
+    if (rx_wm_dirty_) {
+        rx_wm_dirty_ = false;
+        dmesh_doca_conn_rx_watermark(objs_, slot_, rx_wm_);
+    }
 
     // Publish first: anything already staged frees room for this round.
     for (;;) {
@@ -692,6 +726,10 @@ void Router::open_slot(int slot) {
     key.port = dst_port;
 
     const bool is_backend = dmesh_doca_conn_mode_get(objs_, slot) == kFlowModeBackend;
+    if (cfg_.mode != Config::Mode::kTerminate) {
+        open_relay_slot(slot, is_backend, key);
+        return;
+    }
     if (is_backend) {
         auto backend = std::make_unique<H2Backend>(this, objs_, slot, key);
         H2Backend *raw = backend.get();
@@ -714,6 +752,25 @@ void Router::open_slot(int slot) {
 }
 
 void Router::close_slot(int slot) {
+    auto rit = relays_.find(slot);
+    if (rit != relays_.end()) {
+        rit->second->tx().kill();
+        if (mux_) {
+            mux_->remove_leg(slot);
+        }
+        RelayChannel *peer = rit->second->peer();
+        const int cslot = rit->second->is_backend() ? (peer ? peer->slot() : -1) : slot;
+        auto eit = engines_.find(cslot);
+        if (eit != engines_.end()) {
+            relay_closed_.add(eit->second->stats());
+            engines_.erase(eit);
+        }
+        rit->second->unpair();
+        relay_closed_.add(rit->second->stats());
+        relays_.erase(rit);
+        log_info("relay connection closed slot=%d", slot);
+        return;
+    }
     auto it = channels_.find(slot);
     if (it == channels_.end()) {
         return;
@@ -802,6 +859,26 @@ void Router::retry_pending() {
 }
 
 void Router::pump() {
+    if (!relays_.empty()) {
+        pair_relays();
+        for (auto &entry : relays_) {
+            entry.second->wire();
+        }
+        if (cfg_.mode == Config::Mode::kRelay) {
+            for (auto &entry : engines_) {
+                entry.second->pump();
+            }
+        } else if (cfg_.mode == Config::Mode::kTranscode) {
+            mux_->pump();
+        } else {
+            for (auto &entry : relays_) {
+                entry.second->l4_pump_recv();
+            }
+        }
+        for (auto &entry : relays_) {
+            entry.second->pump_send();
+        }
+    }
     retry_pending();
     for (auto &entry : channels_) {
         Channel *ch = entry.second.get();
@@ -813,6 +890,80 @@ void Router::pump() {
     for (auto &entry : channels_) {
         entry.second->pump_send();
     }
+}
+
+// ---------------------------------------------------------------------------
+// l4 / relay modes
+// ---------------------------------------------------------------------------
+
+void Router::open_relay_slot(int slot, bool is_backend, const Key &key) {
+
+    auto ch = std::make_unique<RelayChannel>(objs_, slot, is_backend, key.packed());
+    ch->wire();
+    RelayChannel *raw = ch.get();
+    relays_[slot] = std::move(ch);
+    if (cfg_.mode == Config::Mode::kTranscode) {
+        if (!mux_) {
+            mux_ = std::make_unique<H2Mux>(&cfg_.policy, cfg_.have_default_backend, cfg_.default_backend.packed());
+        }
+        mux_->add_leg(raw);
+    }
+    log_info("%s %s channel slot=%d key=%s (mode=%s)", is_backend ? "backend" : "client",
+             is_backend ? "registered" : "ready", slot, key.str().c_str(),
+             cfg_.mode == Config::Mode::kRelay ? "relay" : cfg_.mode == Config::Mode::kTranscode ? "transcode" : "l4");
+    if (cfg_.mode != Config::Mode::kTranscode) {
+        pair_relays();
+    }
+}
+
+// Pin every unpaired client channel to a never-used backend channel with the
+// same key (or the default backend). Backend channels are single-use: their
+// HPACK decoder table belongs to the first client that spoke through them.
+void Router::pair_relays() {
+    for (auto &centry : relays_) {
+        RelayChannel *c = centry.second.get();
+        if (c->is_backend() || c->paired() || c->used()) {
+            continue;
+        }
+        RelayChannel *pick = nullptr;
+        for (auto &bentry : relays_) {
+            RelayChannel *b = bentry.second.get();
+            if (!b->is_backend() || b->used()) {
+                continue;
+            }
+            if (b->key() == c->key() ||
+                (cfg_.have_default_backend && b->key() == cfg_.default_backend.packed())) {
+                pick = b;
+                break;
+            }
+        }
+        if (pick == nullptr) {
+            continue; // backend bridge not up yet; retried every tick
+        }
+        c->pair(pick);
+        if (cfg_.mode == Config::Mode::kRelay) {
+            engines_[c->slot()] = std::make_unique<H2Relay>(c, pick, &cfg_.policy);
+        }
+        log_info("relay pair: client slot=%d <-> backend slot=%d", c->slot(), pick->slot());
+    }
+}
+
+std::string Router::stats_line() {
+    if (cfg_.mode == Config::Mode::kTerminate) {
+        return std::string();
+    }
+    RelayStats t = relay_closed_;
+    for (auto &entry : relays_) {
+        t.add(entry.second->stats());
+    }
+    for (auto &entry : engines_) {
+        t.add(entry.second->stats());
+    }
+    if (mux_) {
+        t.add(mux_->stats());
+        return t.line() + " | " + mux_->tstats_line();
+    }
+    return t.line();
 }
 
 } // namespace dmesh

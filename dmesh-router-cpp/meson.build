@@ -26,6 +26,7 @@ endif
 inc_dirs = [
   include_directories('/opt/mellanox/doca/include/'),
   include_directories('../DPUMesh'),
+  include_directories('../DPUMesh/device'),
   include_directories('src'),
 ]
 
@@ -119,6 +120,8 @@ datapath_srcs = files(
 router_srcs = files(
   'src/main.cpp',
   'src/router.cpp',
+  'src/relay.cpp',
+  'src/relay3.cpp',
 )
 
 executable('dmesh-router-cpp',

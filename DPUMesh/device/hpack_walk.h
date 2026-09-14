@@ -12,8 +12,12 @@
 
 #include "huff_fsm.h"
 
+#ifndef HW_VAL_CAP
 #define HW_VAL_CAP   128
+#endif
+#ifndef HW_TBL_CAP
 #define HW_TBL_CAP   64          /* dynamic-table entries tracked (ring) */
+#endif
 
 /* RFC 7541 Appendix A static-table name lengths (index 1..61), for exact
  * entry-size accounting when a literal references a static name. */

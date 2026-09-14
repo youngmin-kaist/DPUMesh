@@ -1,2 +1,9 @@
 .vscode/*
 .claude/
+
+# bench run artifacts: keep the dir + README, ignore per-run files
+bench-results/*
+!bench-results/README.md
+
+# local test binary
+dmesh-router-cpp/test/test_transcode
