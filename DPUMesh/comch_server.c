@@ -451,6 +451,7 @@ start_comch_ctrl_path_server(const char *server_name, struct objects *objs, bool
         DOCA_LOG_ERR("Failed to create server with error = %s", doca_error_get_name(result));
         goto destroy_pe;
     }
+    objs->is_server = true;
 
     ctx = doca_comch_server_as_ctx(objs->cc_server);
 
@@ -987,8 +988,55 @@ dmesh_doca_conn_advance(struct dmesh_conn *conn)
 		 * Root cause of the flexio failure is still open. */
 		if (getenv("DMESH_NO_TEARDOWN") != NULL) {
 			dmesh_doca_dpa_thread_quiesce(conn->dpa_thread);
-			if (conn->connection != NULL)
-				(void)doca_comch_server_disconnect(objs->cc_server, conn->connection);
+			/* Stop the data-path contexts first. With them still RUNNING,
+			 * doca_comch_server_disconnect() fails ("connection still has
+			 * active consumers or producers"), the dead connection stays
+			 * live and its posted recvs fail IO_FAILED in a loop, and the
+			 * refused disconnect was followed by healthy slots being
+			 * disconnected too (the post-kill cascade). Stop, never destroy,
+			 * here - see the flexio note above. */
+			if (conn->consumer != NULL) {
+				enum doca_ctx_states st;
+				int spins = 0;
+				struct doca_ctx *cctx = doca_comch_consumer_as_ctx(conn->consumer);
+
+				if (doca_ctx_get_state(cctx, &st) == DOCA_SUCCESS && st != DOCA_CTX_STATE_IDLE) {
+					(void)doca_ctx_stop(cctx);
+					while (spins++ < 100000 &&
+					       doca_ctx_get_state(cctx, &st) == DOCA_SUCCESS && st != DOCA_CTX_STATE_IDLE)
+						doca_pe_progress(objs->consumer_pe);
+				}
+			}
+			/* Stopping is not enough: doca_comch_server_disconnect() still
+			 * reports "active consumers or producers" while the consumer and
+			 * MsgQ objects merely exist on the connection (teardown succeeds
+			 * because it destroys them first). Destroy them here too. Only
+			 * the DPA thread itself is kept (that destroy is the flexio
+			 * hazard) - the slot leaks its pool thread, as parking always did. */
+			if (conn->consumer != NULL) {
+				(void)doca_comch_consumer_destroy(conn->consumer);
+				conn->consumer = NULL;
+			}
+			if (conn->consumer_mem != NULL) {
+				clean_local_mem_bufs(conn->consumer_mem);
+				free(conn->consumer_mem);
+				conn->consumer_mem = NULL;
+			}
+			dmesh_doca_dpa_comch_destroy(conn);
+			if (conn->connection != NULL) {
+				doca_error_t dres = doca_comch_server_disconnect(objs->cc_server, conn->connection);
+
+				if (dres != DOCA_SUCCESS)
+					DOCA_LOG_WARN("park: server-side disconnect failed: %s", doca_error_get_name(dres));
+			}
+			/* Drop the pointer: the DOCA connection object is freed by the
+			 * disconnect and its address gets reused by the next client.
+			 * A parked slot that still held it would alias that new
+			 * connection in dmesh_conn_get()/dmesh_conn_open(): the new
+			 * client gets glued to this dead slot (never set up, silently
+			 * hangs), its events land here, and its metadata is re-imported
+			 * in a loop (the doca_mmap "isn't aligned" storm at churn). */
+			conn->connection = NULL;
 			conn->state = DMESH_CONN_ERROR;
 			DOCA_LOG_INFO("Parked dead connection slot %ld (DMESH_NO_TEARDOWN)",
 				      conn - objs->conns);

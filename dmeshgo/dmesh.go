@@ -203,14 +203,24 @@ func Dial(server, srcIP string, srcPort int, dstIP string, dstPort int, workload
 
 // Listener serves flows the proxy routes to (svcIP, svcPort). Accept keeps
 // exactly one spare BACKEND channel registered with the proxy: the next
-// Accept blocks until the previously returned channel is claimed by a flow.
+// Accept returns a backend channel only once the DPU proxy has attached a
+// flow to it (bytes seen from the DPU), i.e. TCP accept semantics.
+//
+// One spare channel is always kept registered with the DPU so the proxy can
+// connect the next flow immediately, but the spare is NOT handed to the
+// caller until it is claimed. The previous design returned the fresh spare
+// right away; grpc.Serve then started its ConnectionTimeout (default 120 s)
+// on a connection that carries no preface until the proxy actually needs it,
+// closed it, and the listener replaced it - burning one DPU slot per
+// replica every 120 s (each parked, never freed) and firing a churn wave
+// across every service in lockstep.
 type Listener struct {
 	server, svcIP, workload string
 	svcPort                 int
 	addr                    net.Addr
 
 	mu     sync.Mutex
-	prev   *Conn
+	spare  *Conn
 	closed bool
 }
 
@@ -220,26 +230,46 @@ func Listen(server, svcIP string, svcPort int, workload string) (*Listener, erro
 }
 
 func (l *Listener) Accept() (net.Conn, error) {
-	l.mu.Lock()
-	prev := l.prev
-	l.mu.Unlock()
-	for prev != nil && !prev.claimed() {
+	for {
 		if l.isClosed() {
 			return nil, net.ErrClosed
 		}
-		if prev.isClosed() {
-			break // gRPC gave up on the spare; replace it
+		l.mu.Lock()
+		spare := l.spare
+		l.mu.Unlock()
+		if spare == nil {
+			c, err := connect(l.server, l.svcIP, l.svcPort, l.svcIP, l.svcPort, l.workload, ModeBackend)
+			if err != nil {
+				return nil, err
+			}
+			l.mu.Lock()
+			l.spare = c
+			l.mu.Unlock()
+			spare = c
 		}
-		time.Sleep(200 * time.Microsecond)
+		// Wait for the proxy to attach a flow. A spare the DPU dropped reads
+		// as claimed (dead channels report claimed so nothing waits on them)
+		// and is handed out; its first Read returns EOF and the caller closes
+		// it, which is the same thing a reset TCP accept would do.
+		for !spare.claimed() {
+			if l.isClosed() {
+				return nil, net.ErrClosed
+			}
+			if spare.isClosed() {
+				break
+			}
+			time.Sleep(200 * time.Microsecond)
+		}
+		l.mu.Lock()
+		if l.spare == spare {
+			l.spare = nil // next Accept registers a fresh spare at once
+		}
+		l.mu.Unlock()
+		if spare.isClosed() {
+			continue
+		}
+		return spare, nil
 	}
-	c, err := connect(l.server, l.svcIP, l.svcPort, l.svcIP, l.svcPort, l.workload, ModeBackend)
-	if err != nil {
-		return nil, err
-	}
-	l.mu.Lock()
-	l.prev = c
-	l.mu.Unlock()
-	return c, nil
 }
 
 func (l *Listener) isClosed() bool {

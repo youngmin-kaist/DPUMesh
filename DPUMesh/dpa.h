@@ -12,7 +12,7 @@
 
 /* Number of DPA threads pre-created per DPU worker thread and handed out per
  * connection (each worker owns a private pool - shared-nothing design) */
-#define DPA_THREAD_POOL_SIZE 16
+#define DPA_THREAD_POOL_SIZE 32
 
 struct objects;
 struct doca_comch_connection;
@@ -114,6 +114,7 @@ dmesh_doca_dpa_comch_create(struct dmesh_conn *conn);
 /* Teardown counterparts (per-connection reuse without a proxy restart) */
 void
 dmesh_doca_dpa_comch_destroy(struct dmesh_conn *conn);
+void dmesh_doca_dpa_comch_stop(struct dmesh_conn *conn);
 /* Signal the kernel poll loop to exit, wait for the ack, then stop the thread
  * (must precede comch/thread destruction - a hot thread cannot be stopped). */
 void

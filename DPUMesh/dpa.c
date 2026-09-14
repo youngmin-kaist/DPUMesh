@@ -441,14 +441,13 @@ dmesh_doca_dpa_msgq_create(const struct dmesh_doca_dpa_msgq_create_attr *attr,
 
     msgq->is_send = attr->is_send;
 
-    if (msgq->pe == NULL) {
-        result = doca_pe_create(&msgq->pe);
-        if (result != DOCA_SUCCESS) {
-            DOCA_LOG_ERR("Failed to create PE - %s",
-                    doca_error_get_name(result));
-            return result;
-        }
-    }
+    /* No private PE here. The MsgQ's producer/consumer ctxs are driven by the
+     * worker's shared consumer PE (passed to every progress/stop call), and
+     * nothing ever progressed a per-MsgQ PE. Creating one anyway cost an
+     * epoll + eventfd pair per MsgQ (two per connection) that teardown never
+     * released, so every reconnect leaked 4 fds until the proxy hit
+     * RLIMIT_NOFILE and new channels died mid-setup at
+     * "Failed to create epoll file descriptor (errno 24)". */
 
     result = doca_comch_msgq_create(attr->dev, &msgq->msgq);
     if (result != DOCA_SUCCESS) {
@@ -784,8 +783,37 @@ dmesh_doca_dpa_msgq_destroy(struct dmesh_doca_dpa_msgq *msgq, struct doca_pe *pe
         (void)doca_comch_msgq_destroy(msgq->msgq);
         msgq->msgq = NULL;
     }
-    /* msgq->pe is the shared consumer PE - do NOT destroy it here */
-    msgq->pe = NULL;
+    /* The MsgQ owns no PE (see dmesh_doca_dpa_msgq_create). */
+}
+
+/* Stop (do not destroy) a connection's DPA comch contexts: both MsgQ
+ * producer/consumer ctxs and both completion objects, progressed to IDLE on
+ * the shared consumer PE. Used by the park path so the comch connection can
+ * be disconnected: doca_comch_server_disconnect() refuses while the
+ * connection "still has active consumers or producers", and a refused
+ * disconnect leaves the dead connection live with 512 posted recvs failing
+ * IO_FAILED forever. Destroy stays out of this path (flexio thread-destroy
+ * hazard); teardown does the full sequence. */
+void
+dmesh_doca_dpa_comch_stop(struct dmesh_conn *conn)
+{
+    struct dmesh_doca_dpa_comch *comch = conn->dpa_comch;
+    struct doca_pe *pe = conn->objs->consumer_pe;
+
+    if (comch == NULL)
+        return;
+    if (comch->send.producer != NULL)
+        stop_ctx_bounded(doca_comch_producer_as_ctx(comch->send.producer), pe);
+    if (comch->send.consumer != NULL)
+        stop_ctx_bounded(doca_comch_consumer_as_ctx(comch->send.consumer), pe);
+    if (comch->recv.producer != NULL)
+        stop_ctx_bounded(doca_comch_producer_as_ctx(comch->recv.producer), pe);
+    if (comch->recv.consumer != NULL)
+        stop_ctx_bounded(doca_comch_consumer_as_ctx(comch->recv.consumer), pe);
+    if (comch->consumer_comp != NULL)
+        (void)doca_comch_consumer_completion_stop(comch->consumer_comp);
+    if (comch->producer_comp != NULL)
+        (void)doca_dpa_completion_stop(comch->producer_comp);
 }
 
 /* Destroy a connection's DPA comch: both MsgQs and both completion objects.

@@ -56,9 +56,44 @@ static void client_send_task_completion_err_callback(struct doca_comch_task_send
 	(void)task_user_data;
 
 	objs = (struct objects *)(ctx_user_data.ptr);
-	(void)objs;
+	{
+		doca_error_t st = doca_task_get_status(doca_comch_task_send_as_task(task));
+
+		/* Instrumented: this callback used to stop the whole client ctx
+		 * silently on any failed send. Log what failed so a stopped channel
+		 * can be attributed to a control-path send error vs a peer drop. */
+		DOCA_LOG_WARN("comch client: send task failed (%s) - stopping client ctx",
+			      doca_error_get_name(st));
+	}
 	doca_task_free(doca_comch_task_send_as_task(task));
 	(void)doca_ctx_stop(doca_comch_client_as_ctx(objs->cc_client));
+}
+
+/*
+ * Client ctx state changes. The one that matters is the peer dropping us: the
+ * DPU calls doca_comch_server_disconnect() when it tears a slot down, which
+ * moves this client ctx RUNNING -> STOPPING -> IDLE. Without observing that,
+ * the host channel never reports EOF, so the reader above it (dmeshgo's
+ * net.Conn, then gRPC) hangs on a dead-but-READY connection. Runs inside
+ * doca_pe_progress() on the caller's thread.
+ */
+static void client_state_changed_callback(const union doca_data user_data,
+                                          struct doca_ctx *ctx,
+                                          enum doca_ctx_states prev_state,
+                                          enum doca_ctx_states next_state)
+{
+    struct objects *objs = (struct objects *)user_data.ptr;
+
+    (void)ctx;
+    if (objs == NULL)
+        return;
+    if (prev_state == DOCA_CTX_STATE_RUNNING &&
+        (next_state == DOCA_CTX_STATE_STOPPING || next_state == DOCA_CTX_STATE_IDLE)) {
+        if (!objs->peer_gone)
+            DOCA_LOG_INFO("comch client: peer disconnected (ctx %s)",
+                          next_state == DOCA_CTX_STATE_IDLE ? "idle" : "stopping");
+        objs->peer_gone = 1;
+    }
 }
 
 /**
@@ -178,6 +213,7 @@ doca_error_t init_comch_ctrl_path_client(const char *server_name,
         DOCA_LOG_ERR("Failed to create client with error = %s", doca_error_get_name(result));
         goto destroy_pe;
     }
+    objs->is_server = false;
 
     ctx = doca_comch_client_as_ctx(objs->cc_client);
 
@@ -187,11 +223,11 @@ doca_error_t init_comch_ctrl_path_client(const char *server_name,
         goto destroy_client;
     }
 
-    // result = doca_ctx_set_state_changed_cb(ctx, client_state_changed_callback);
-    // if (result != DOCA_SUCCESS) {   
-    //     DOCA_LOG_ERR("Failed setting state change callback with error = %s", doca_error_get_name(result));
-    //     goto destroy_client;
-    // }
+    result = doca_ctx_set_state_changed_cb(ctx, client_state_changed_callback);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed setting state change callback with error = %s", doca_error_get_name(result));
+        goto destroy_client;
+    }
 
     result = doca_comch_client_task_send_set_conf(objs->cc_client,
                                                   client_send_task_completion_callback,

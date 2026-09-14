@@ -44,7 +44,7 @@ typedef uint64_t doca_dpa_dev_buf_arr_t;
 
 /* Keep in sync with DPA_THREAD_POOL_SIZE (dpa.h): one DPA thread per connection.
  * This is the per-worker-thread limit; total = num_threads x this. */
-#define DMESH_MAX_CONNECTIONS 16
+#define DMESH_MAX_CONNECTIONS 32
 
 /* Per-connection init state, advanced by dmesh_doca_ctrl_advance() */
 enum dmesh_conn_state {
@@ -186,6 +186,17 @@ struct objects {
         struct doca_comch_server *cc_server;
         struct doca_comch_client *cc_client;
     };
+    /* Which arm of the union above is live. cleanup_objects() must stop and
+     * destroy the comch endpoint as the right type; destroying a client as a
+     * server leaves the channel service object alive on the device, and the
+     * next process then fails to create one (devx syndrome 0x64b4). */
+    bool is_server;
+    /* Host side: set from the comch client ctx state-changed callback when the
+     * DPU drops the connection (RUNNING -> STOPPING/IDLE). dmesh_chan_read /
+     * write turn it into -1 (EOF) so the Go net.Conn - and gRPC's transport
+     * reader on top of it - learns the peer is gone instead of spinning
+     * forever on "no data yet" while its subconn stays READY. */
+    int peer_gone;
     struct doca_comch_connection *connection;
 
     /* DMesh application recv/send buffers */

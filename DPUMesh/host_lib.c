@@ -237,6 +237,10 @@ dmesh_chan_read(struct dmesh_chan *c, void *buf, size_t len)
         return -1;
     }
     (void)doca_pe_progress(c->objs->pe);        /* control path (comch) */
+    if (c->objs->peer_gone) {                   /* DPU tore the slot down: EOF */
+        pthread_mutex_unlock(&c->lock);
+        return -1;
+    }
     chan_pump_rx(c);
     n = c->pend_len < len ? c->pend_len : len;
     if (n > 0) {
@@ -265,6 +269,10 @@ dmesh_chan_write(struct dmesh_chan *c, const void *buf, size_t len)
         return -1;
     }
     (void)doca_pe_progress(c->objs->pe);
+    if (c->objs->peer_gone) {                   /* peer gone: fail the write */
+        pthread_mutex_unlock(&c->lock);
+        return -1;
+    }
     while (off < len) {
         size_t remaining = len - off;
         size_t chunk;
@@ -318,6 +326,12 @@ dmesh_chan_claimed(struct dmesh_chan *c)
         return 0;
     }
     (void)doca_pe_progress(c->objs->pe);
+    /* A dead channel counts as claimed so Listener.Accept stops waiting on
+     * it; the next read on it returns -1 and the caller closes it. */
+    if (c->objs->peer_gone) {
+        pthread_mutex_unlock(&c->lock);
+        return 1;
+    }
     chan_pump_rx(c);
     v = c->claimed;
     pthread_mutex_unlock(&c->lock);
