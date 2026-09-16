@@ -7,3 +7,7 @@ bench-results/*
 
 # local test binary
 dmesh-router-cpp/test/test_transcode
+
+# host library build tree
+/build/
+/DPUMesh/build/
