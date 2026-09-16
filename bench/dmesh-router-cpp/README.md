@@ -74,8 +74,8 @@ ninja -C build                 # -> build/dmesh-router-cpp
 ```
 
 The testbed has `libnghttp2.so.14` but no `-dev` package, so the build falls
-back to the headers vendored under `hpack-h2-bench/c/nghttp2/` and links the
-versioned SONAME directly (same trick as `hpack-h2-bench/c/build.sh` and
+back to the headers vendored under `bench/hpack-h2-bench/c/nghttp2/` and links the
+versioned SONAME directly (same trick as `bench/hpack-h2-bench/c/build.sh` and
 `linkerd/http/nghttp2/build.rs`). If a real `libnghttp2` pkg-config file ever
 appears, it is used instead.
 

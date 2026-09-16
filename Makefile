@@ -1,5 +1,5 @@
-# Host library, façades, tests and benchmarks. The DPU side is Youngmin's
-# DPUMesh/ tree, built with its own Meson project (see `make dpu-help`).
+# Host library, façades, tests and examples. The DPU side is the DPUMesh tree
+# (`DPUMesh/`), built with its own Meson project on the DPU.
 CC ?= cc
 CXX ?= c++
 PYTHON ?= python3
@@ -17,13 +17,12 @@ WIRE_SRCS := $(addprefix DPUMesh/,object.c buffer.c common.c comch_common.c comc
     comch_consumer.c comch_producer.c ring.c)
 LIB_SRCS := src/core/dmesh_core.c src/core/carrier_push.c src/core/wire_push.c \
     src/core/wire_host_stubs.c src/core/service_registry.c src/facade/dmesh_api.c $(WIRE_SRCS)
-HOST_TESTS := carrier_push_logic_test service_registry_test native_writable_test native_core_transport_test topology_test \
-    native_api_contract_test preload_api_contract_test benchmark_result_contract_test
-POSIX_BINS := bench_sock echo_sock http1_bench http1_echo tcp_client tcp_echo preload_runner
-NATIVE_BINS := bench_dpumesh echo_dpumesh
+HOST_TESTS := carrier_push_logic_test service_registry_test native_writable_test native_core_transport_test \
+    topology_test native_api_contract_test preload_api_contract_test
+EXAMPLES := hello_dpumesh hello_dpumesh_server tcp_echo tcp_client
 
-.PHONY: all lib test test-hostfree test-native-headers test-generator test-abi bench examples dpu-help clean
-all: lib bench
+.PHONY: all lib test test-native-headers test-abi examples clean
+all: lib
 
 lib: $(LIBDIR)/libdpumesh.so.$(ABI_MAJOR) $(LIBDIR)/libdpumesh_preload.so
 
@@ -38,9 +37,7 @@ $(LIBDIR)/libdpumesh.so.$(ABI_MAJOR): $(LIB_SRCS) include/dpumesh/*.h src/core/*
 $(LIBDIR)/libdpumesh_preload.so: src/facade/dmesh_preload.c $(LIBDIR)/libdpumesh.so.$(ABI_MAJOR)
 	$(CC) $(HOST_CFLAGS) -U_FILE_OFFSET_BITS -fPIC -shared $< -L$(LIBDIR) -ldpumesh -ldl -pthread -o $@
 
-test: test-hostfree test-abi
-
-test-hostfree: test-native-headers $(addprefix $(TESTDIR)/,$(HOST_TESTS)) test-generator
+test: test-native-headers $(addprefix $(TESTDIR)/,$(HOST_TESTS)) test-abi
 	@set -e; for test in $(HOST_TESTS); do $(TESTDIR)/$$test; done
 
 test-native-headers:
@@ -55,14 +52,11 @@ $(TESTDIR)/carrier_push_logic_test: tests/carrier_push_logic_test.c src/core/car
 $(TESTDIR)/topology_test: tests/topology_test.c include/dpumesh/dmesh_topology.h | $(TESTDIR)
 	$(CC) $(HOST_CFLAGS) $< -o $@
 
-$(TESTDIR)/native_api_contract_test: tests/native_api_contract_test.c src/facade/dmesh_api.c src/core/dmesh_core.h include/dpumesh/dmesh.h | $(TESTDIR)
+$(TESTDIR)/native_api_contract_test: tests/native_api_contract_test.c src/facade/dmesh_api.c src/core/dmesh_core.h include/dpumesh/dmesh.h include/dpumesh/dmesh_common.h | $(TESTDIR)
 	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections -Wl,--gc-sections tests/native_api_contract_test.c src/facade/dmesh_api.c -o $@
 
-$(TESTDIR)/preload_api_contract_test: tests/preload_api_contract_test.c src/facade/dmesh_preload.c src/core/dmesh_core.h include/dpumesh/dmesh.h | $(TESTDIR)
+$(TESTDIR)/preload_api_contract_test: tests/preload_api_contract_test.c src/facade/dmesh_preload.c src/core/dmesh_core.h include/dpumesh/dmesh.h include/dpumesh/dmesh_common.h | $(TESTDIR)
 	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections -Wl,--gc-sections $< -ldl -lpthread -o $@
-
-$(TESTDIR)/benchmark_result_contract_test: tests/benchmark_result_contract_test.c bench/apps/bench_result.h | $(TESTDIR)
-	$(CC) $(HOST_CFLAGS) $< -o $@
 
 $(TESTDIR)/native_writable_test: tests/native_writable_test.c src/core/dmesh_core.c src/core/native_transport.h | $(TESTDIR)
 	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< -Wl,--gc-sections -pthread -o $@
@@ -73,30 +67,13 @@ $(TESTDIR)/native_core_transport_test: tests/native_core_transport_test.c tests/
 $(TESTDIR)/service_registry_test: tests/service_registry_test.c src/core/service_registry.c src/core/service_registry.h | $(TESTDIR)
 	$(CC) $(HOST_CFLAGS) $(filter %.c,$^) -o $@
 
-test-generator: $(BINDIR)/bench_sock
-	sh tests/generator_selftest_test.sh $(BINDIR)/bench_sock
+examples: lib $(addprefix $(BINDIR)/,$(EXAMPLES))
 
-bench: $(addprefix $(BINDIR)/,$(POSIX_BINS))
-
-$(BINDIR)/%: bench/apps/%.c bench/apps/bench.h bench/apps/bench_selftest.h bench/apps/bench_result.h | $(BINDIR)
-	$(CC) $(HOST_CFLAGS) $< -lm -lpthread -o $@
-
-$(BINDIR)/%: bench/validators/%.c | $(BINDIR)
-	$(CC) $(HOST_CFLAGS) $< -ldl -lpthread -o $@
-
-bench-native: lib $(addprefix $(BINDIR)/,$(NATIVE_BINS))
-
-$(BINDIR)/bench_dpumesh $(BINDIR)/echo_dpumesh: $(BINDIR)/%: bench/apps/%.c bench/apps/bench.h | $(BINDIR)
-	$(CC) $(HOST_CFLAGS) $< -L$(LIBDIR) -ldpumesh -Wl,-rpath,$(abspath $(LIBDIR)) -lm -lpthread -o $@
-
-examples: lib $(BINDIR)/hello_dpumesh $(BINDIR)/hello_dpumesh_server
-
-$(BINDIR)/hello_dpumesh $(BINDIR)/hello_dpumesh_server: $(BINDIR)/%: bench/examples/%.c | $(BINDIR)
+$(BINDIR)/hello_dpumesh $(BINDIR)/hello_dpumesh_server: $(BINDIR)/%: examples/native/%.c | $(BINDIR)
 	$(CC) $(HOST_CFLAGS) $< -L$(LIBDIR) -ldpumesh -Wl,-rpath,$(abspath $(LIBDIR)) -lpthread -o $@
 
-dpu-help:
-	@echo "DPU side (Youngmin's tree): cd DPUMesh && meson setup build && meson compile -C build"
-	@echo "Proxy: see linkerd2-proxy (pinned submodule)."
+$(BINDIR)/tcp_echo $(BINDIR)/tcp_client: $(BINDIR)/%: examples/preload/%.c | $(BINDIR)
+	$(CC) $(HOST_CFLAGS) $< -lpthread -o $@
 
 clean:
 	rm -rf $(BUILD)

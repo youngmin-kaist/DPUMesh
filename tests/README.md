@@ -11,7 +11,7 @@
 | `native_writable_test` | Writable-buffer accounting of the core |
 | `carrier_push_logic_test` | Forward chunking to the DPUMesh copy rule and the in-order release window of the push carrier |
 | `service_registry_test` | Registry validation and transactional reload |
-| `topology_test`, `benchmark_result_contract_test`, `generator_selftest_test.sh` | Topology header, benchmark result format, generator self-test |
+| `topology_test` | Topology header |
 
 `support/native_memory_transport.c` is a deterministic loopback carrier for the
 core: it implements the private carrier contract in memory, can hold custody

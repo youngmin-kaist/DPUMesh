@@ -8,7 +8,7 @@ read/write, deadlines and connection close follow the Go networking contract.
 Build the native library from the repository root, then compile the module:
 
 ```sh
-make doca
+make lib
 (cd integrations/grpc/go && go test ./...)
 ```
 
@@ -22,8 +22,6 @@ physical registrations.
 Use `DialContext(ctx, serviceIP, port)` in `grpc.WithContextDialer` and
 `ListenAddress(serviceIP, port)` with `grpc.Server.Serve`. A service address
 identifies a registry entry; the DPU chooses its native backend. The examples
-in `cmd/echo-client` and `cmd/echo-server` run the standard gRPC health RPC.
+in `cmd/echo-client` and `cmd/echo-server` run the standard gRPC health RPC
+against `DPUMESH_SERVICE_IP:DPUMESH_SERVICE_PORT`.
 Close all connections and listeners before calling `CloseTransport`.
-
-`bench` and `cmd/bench-*` implement the raw-payload RPC benchmark. `dsb/dmesh`
-contains the DeathStarBench dialer and replica-connection adapter.

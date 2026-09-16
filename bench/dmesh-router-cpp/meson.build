@@ -15,7 +15,7 @@ add_project_arguments('-Wno-unused-parameter', language: 'c')
 fs = import('fs')
 cc = meson.get_compiler('c')
 
-repo_root = meson.project_source_root() / '..'
+repo_root = meson.project_source_root() / '..' / '..'
 dpumesh_dir = repo_root / 'DPUMesh'
 shim_c = repo_root / 'linkerd2-proxy' / 'linkerd' / 'doca' / 'src' / 'shim.c'
 
@@ -25,8 +25,8 @@ endif
 
 inc_dirs = [
   include_directories('/opt/mellanox/doca/include/'),
-  include_directories('../DPUMesh'),
-  include_directories('../DPUMesh/device'),
+  include_directories('../../DPUMesh'),
+  include_directories('../../DPUMesh/device'),
   include_directories('src'),
 ]
 

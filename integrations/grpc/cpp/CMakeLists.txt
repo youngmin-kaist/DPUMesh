@@ -15,10 +15,7 @@ option(DPUMESH_GRPC_ENABLE_SANITIZERS
 option(DPUMESH_GRPC_ENABLE_TSAN
        "Enable ThreadSanitizer for the full build"
        OFF)
-option(DPUMESH_GRPC_BUILD_EXAMPLES "Build native gRPC and DPA RPC examples" ON)
-option(DPUMESH_GRPC_BUILD_QPS_BENCHMARK
-       "Build the grpc.testing.BenchmarkService unary QPS harness"
-       ON)
+option(DPUMESH_GRPC_BUILD_EXAMPLES "Build the hello gRPC example" ON)
 
 if(DPUMESH_GRPC_ENABLE_SANITIZERS AND DPUMESH_GRPC_ENABLE_TSAN)
   message(FATAL_ERROR
@@ -60,7 +57,7 @@ if(DPUMESH_GRPC_SOURCE_DIR)
   endif()
 
   set(gRPC_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-  if(DPUMESH_GRPC_BUILD_QPS_BENCHMARK OR DPUMESH_GRPC_BUILD_EXAMPLES)
+  if(DPUMESH_GRPC_BUILD_EXAMPLES)
     set(gRPC_BUILD_CODEGEN ON CACHE BOOL "" FORCE)
     set(gRPC_BUILD_GRPC_CPP_PLUGIN ON CACHE BOOL "" FORCE)
     set(gRPC_BUILD_GRPC_CSHARP_PLUGIN OFF CACHE BOOL "" FORCE)
@@ -154,76 +151,9 @@ if(DPUMESH_INCLUDE_DIR AND DPUMESH_LIBRARY)
   target_link_libraries(grpc_dpumesh INTERFACE
     grpc_dpumesh_endpoint grpc_dpumesh_reactor grpc_dpumesh_native)
 
-  if(DPUMESH_GRPC_BUILD_QPS_BENCHMARK AND DPUMESH_GRPC_SOURCE_DIR)
-    set(DPUMESH_QPS_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/qps_gen")
-    set(DPUMESH_QPS_MESSAGES_PROTO
-        "${DPUMESH_GRPC_SOURCE_DIR}/src/proto/grpc/testing/messages.proto")
-    set(DPUMESH_QPS_SERVICE_PROTO
-        "${DPUMESH_GRPC_SOURCE_DIR}/src/proto/grpc/testing/benchmark_service.proto")
-    set(DPUMESH_QPS_GENERATED
-      "${DPUMESH_QPS_GEN_DIR}/src/proto/grpc/testing/messages.pb.cc"
-      "${DPUMESH_QPS_GEN_DIR}/src/proto/grpc/testing/messages.pb.h"
-      "${DPUMESH_QPS_GEN_DIR}/src/proto/grpc/testing/benchmark_service.pb.cc"
-      "${DPUMESH_QPS_GEN_DIR}/src/proto/grpc/testing/benchmark_service.pb.h"
-      "${DPUMESH_QPS_GEN_DIR}/src/proto/grpc/testing/benchmark_service.grpc.pb.cc"
-      "${DPUMESH_QPS_GEN_DIR}/src/proto/grpc/testing/benchmark_service.grpc.pb.h")
-
-    add_custom_command(
-      OUTPUT ${DPUMESH_QPS_GENERATED}
-      COMMAND "${CMAKE_COMMAND}" -E make_directory
-              "${DPUMESH_QPS_GEN_DIR}/src/proto/grpc/testing"
-      COMMAND $<TARGET_FILE:protoc>
-      ARGS
-        "--proto_path=${DPUMESH_GRPC_SOURCE_DIR}"
-        "--cpp_out=${DPUMESH_QPS_GEN_DIR}"
-        "--grpc_out=${DPUMESH_QPS_GEN_DIR}"
-        "--plugin=protoc-gen-grpc=$<TARGET_FILE:grpc_cpp_plugin>"
-        "src/proto/grpc/testing/messages.proto"
-        "src/proto/grpc/testing/benchmark_service.proto"
-      DEPENDS
-        protoc grpc_cpp_plugin
-        "${DPUMESH_QPS_MESSAGES_PROTO}"
-        "${DPUMESH_QPS_SERVICE_PROTO}"
-      WORKING_DIRECTORY "${DPUMESH_GRPC_SOURCE_DIR}"
-      COMMENT "Generating the official gRPC QPS BenchmarkService protocol"
-      VERBATIM)
-
-    add_library(grpc_dpumesh_qps_proto STATIC
-      "${DPUMESH_QPS_GEN_DIR}/src/proto/grpc/testing/messages.pb.cc"
-      "${DPUMESH_QPS_GEN_DIR}/src/proto/grpc/testing/benchmark_service.pb.cc"
-      "${DPUMESH_QPS_GEN_DIR}/src/proto/grpc/testing/benchmark_service.grpc.pb.cc")
-    target_compile_features(grpc_dpumesh_qps_proto PUBLIC cxx_std_17)
-    target_include_directories(grpc_dpumesh_qps_proto
-      PUBLIC "${DPUMESH_QPS_GEN_DIR}")
-    target_link_libraries(grpc_dpumesh_qps_proto PUBLIC gRPC::grpc++)
-
-    add_executable(grpc_dpumesh_qps_benchmark
-      "${CMAKE_CURRENT_LIST_DIR}/../../../bench/apps/qps_benchmark.cc")
-    target_compile_features(grpc_dpumesh_qps_benchmark PRIVATE cxx_std_17)
-    target_compile_options(grpc_dpumesh_qps_benchmark PRIVATE -Wall -Wextra)
-    target_include_directories(grpc_dpumesh_qps_benchmark PRIVATE
-      "${CMAKE_CURRENT_LIST_DIR}/src")
-    target_link_libraries(grpc_dpumesh_qps_benchmark PRIVATE
-      grpc_dpumesh grpc_dpumesh_qps_proto Threads::Threads)
-
-    # L4-harness peers: same control protocol and result line as bench_sock and
-    # bench_dpumesh, so the DPUmesh collector drives gRPC unchanged.
-    foreach(app bench_grpc echo_grpc)
-      add_executable(${app} "${CMAKE_CURRENT_LIST_DIR}/../../../bench/apps/${app}.cc")
-      target_compile_features(${app} PRIVATE cxx_std_17)
-      target_compile_options(${app} PRIVATE -Wall -Wextra)
-      target_include_directories(${app} PRIVATE
-        "${CMAKE_CURRENT_LIST_DIR}/src"
-        "${CMAKE_CURRENT_LIST_DIR}/../../../bench/apps")
-      target_link_libraries(${app} PRIVATE
-        grpc_dpumesh grpc_dpumesh_qps_proto Threads::Threads)
-    endforeach()
-
-  endif()
   if(DPUMESH_GRPC_BUILD_EXAMPLES AND DPUMESH_GRPC_SOURCE_DIR)
-    # Compile documented examples and RPC offload checks independently of QPS.
-    if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../../../bench/examples/grpc/CMakeLists.txt")
-      add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/../../../bench/examples/grpc"
+    if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../../../examples/grpc/CMakeLists.txt")
+      add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/../../../examples/grpc"
                        "${CMAKE_CURRENT_BINARY_DIR}/examples/grpc")
     endif()
   endif()

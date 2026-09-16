@@ -53,7 +53,8 @@ in the proxy's notification handling, not in this library.
 
 ## Configuration
 
-`DPUMESH_PCI_ADDR`, `DPUMESH_SERVER` (default `DPUMesh0`), `DPUMESH_CONFIG`
+All values come from the environment; `.env.example` lists them with
+placeholders. `DPUMESH_PCI_ADDR`, `DPUMESH_SERVER` (default `DPUMesh0`), `DPUMESH_CONFIG`
 (registry, default `/etc/dpumesh/registry`), `DPUMESH_POD_IP`,
 `DPUMESH_WORKLOAD`, `DPUMESH_POD_ID` (default 0), `DPUMESH_SERVICE` for a
 server, `DPUMESH_BACKEND_POOL` (spare flows, default 8), `DPUMESH_BACKEND_MAX`
@@ -66,6 +67,6 @@ descriptor and event traces to stderr.
 ```sh
 make lib            # host library and preload shim
 make test           # host-only checks and ABI contract
-make examples       # hello_dpumesh, hello_dpumesh_server
+make examples       # native and preload examples; see examples/README.md
 cd DPUMesh && meson setup build && meson compile -C build   # DPU side, on the DPU
 ```

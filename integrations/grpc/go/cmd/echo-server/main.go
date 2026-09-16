@@ -34,18 +34,18 @@ func main() {
 	}
 }
 
-// The service address is the registry row the DPU routes; override for a bench registry.
+// The service address is the registry row the DPU routes to this process.
 func serviceIP() string {
-	if v := os.Getenv("DMESH_SERVICE_IP"); v != "" {
-		return v
+	v := os.Getenv("DPUMESH_SERVICE_IP")
+	if v == "" {
+		log.Fatal("DPUMESH_SERVICE_IP is not set")
 	}
-	return "10.0.0.42"
+	return v
 }
 func servicePort() int {
-	if v := os.Getenv("DMESH_SERVICE_PORT"); v != "" {
-		if p, err := strconv.Atoi(v); err == nil {
-			return p
-		}
+	p, err := strconv.Atoi(os.Getenv("DPUMESH_SERVICE_PORT"))
+	if err != nil || p <= 0 {
+		log.Fatal("DPUMESH_SERVICE_PORT is not set")
 	}
-	return 8086
+	return p
 }

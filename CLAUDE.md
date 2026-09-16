@@ -69,8 +69,8 @@ only the HTTP engine differs. Measured with `h2load -c1 -m100 -n20000`, h2 on
 both legs, 1 core: **`dmesh-router-cpp` ~100k req/s (jemalloc + no-copy headers; ~68k before), `dmesh-router` ~31k,
 DMA linkerd2-proxy ~16.6k**.
 
-- `dmesh-router-cpp/` — C++ + libnghttp2, standalone meson project. See
-  `dmesh-router-cpp/README.md`. HTTP/2 backend leg only.
+- `bench/dmesh-router-cpp/` — C++ + libnghttp2, standalone meson project. See
+  `bench/dmesh-router-cpp/README.md`. HTTP/2 backend leg only.
 - `linkerd2-proxy/dmesh-router/` — Rust + hyper, member of the proxy workspace
   (details below). HTTP/1.1 or HTTP/2 backend leg.
 
