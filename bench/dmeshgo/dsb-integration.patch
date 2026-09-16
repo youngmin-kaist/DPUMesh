@@ -537,7 +537,7 @@ diff -ruN '--exclude=bin' '--exclude=vendor' DeathStarBench/hotelReservation/go.
 +
 +require dmeshgo v0.0.0
 +
-+replace dmeshgo => /home/youngmin/bf-workspace/dmeshgo
++replace dmeshgo => /home/<user>/bf-workspace/dmeshgo
 diff -ruN '--exclude=bin' '--exclude=vendor' DeathStarBench/hotelReservation/go.sum hotelres-dmesh/go.sum
 --- DeathStarBench/hotelReservation/go.sum	2026-08-20 01:18:55.962887480 +0900
 +++ hotelres-dmesh/go.sum	2026-09-02 06:50:42.445580884 +0900

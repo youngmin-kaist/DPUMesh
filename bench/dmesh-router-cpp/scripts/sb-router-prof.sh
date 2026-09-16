@@ -3,8 +3,8 @@
 # M ingress pairs (port 38080+i, dst 10.0.0.(1+i)) + M backend bridges, K=M.
 set -u
 RMODE=$1; M=$2; MODE=${3:-load}; CORES=1; W=1
-cd /home/youngmin/DPUMesh/dmesh-router-cpp
-LOG=/home/youngmin/.claude/jobs/3aac3b67/tmp/prof
+cd $HOME/DPUMesh/dmesh-router-cpp
+LOG=$HOME/.claude/jobs/3aac3b67/tmp/prof
 HOST=192.168.100.1
 step(){ echo "[$(date +%H:%M:%S)] $*"; }
 die(){ step "FATAL: $*"; cleanup; exit 1; }

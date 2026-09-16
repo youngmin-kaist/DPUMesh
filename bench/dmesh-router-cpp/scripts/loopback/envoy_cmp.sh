@@ -1,6 +1,6 @@
 #!/bin/bash
 # DPU loopback TCP engine comparison: h2load x4 (cores 8-11) -> proxy (core 15) -> nginx (cores 12-13)
-D=/home/youngmin/.claude/jobs/3aac3b67/tmp/envoy; P=/home/youngmin/DPUMesh/linkerd2-proxy
+D=/tmp/dmesh-envoy-cmp; P=$HOME/DPUMesh/linkerd2-proxy
 MODES=${MODES:-"envoy nghttpx linkerd linkerd-nghttp2"}; DUR=${DUR:-16}; NPROC=${NPROC:-4}
 stop_all(){ for p in $(pgrep -x envoy) $(pgrep -x nghttpx) $(pgrep -x linkerd2-proxy); do sudo -n kill $p 2>/dev/null; done; pkill -x mock-identity; pkill -x mock-policy; pkill -f "[m]ock-destinatio"; sudo -n nginx -c $D/nginx.conf -s quit 2>/dev/null; sleep 2; }
 stop_all
@@ -15,7 +15,7 @@ for M in $MODES; do
       setsid ./target/release/mock-identity > $D/mock-identity.log 2>&1 & setsid ./target/release/mock-destination > $D/mock-destination.log 2>&1 & setsid ./target/release/mock-policy > $D/mock-policy.log 2>&1 &
       for p in 8087 8088 8089; do for i in $(seq 1 50); do (echo > /dev/tcp/127.0.0.1/$p) 2>/dev/null && break; sleep 0.2; done; done
       NG=""; [ $M = linkerd-nghttp2 ] && NG="DMESH_NGHTTP2=1"
-      setsid sudo -n -E env DMESH_SHARDED=1 DMESH_NUM_WORKERS=1 LINKERD2_PROXY_CORES=1 $NG taskset -c 15 /home/youngmin/.claude/jobs/3aac3b67/tmp/envoy/linkerd2-proxy.native > $D/linkerd.log 2>&1 & PROXY_PID=""
+      setsid sudo -n -E env DMESH_SHARDED=1 DMESH_NUM_WORKERS=1 LINKERD2_PROXY_CORES=1 $NG taskset -c 15 $D/linkerd2-proxy.native > $D/linkerd.log 2>&1 & PROXY_PID=""
       cd $D ;;
   esac
   for i in $(seq 1 40); do (echo > /dev/tcp/127.0.0.1/$PORT) 2>/dev/null && break; sleep 0.5; done

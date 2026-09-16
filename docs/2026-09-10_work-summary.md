@@ -9,7 +9,7 @@ linkerd 포크에 통합해 순이득까지 도달(P1 +3.3%, JWT 헤더 +41%)했
 | # | 작업 | 결과 | 기록 |
 |---|---|---|---|
 | 1 | DSB k8s 1k~4k 재측정(단일 프로세스 wrk2) | no-mesh 평평, Linkerd 저부하 tail은 커넥션 6,000개 효과로 동일 재현. `reconnect_socket`은 롤아웃 중 실행이 원인, 정상 상태 재현 불가 | `bench-results/2026-09-04_dsb-k8s-FINAL-3way-*` 참고 |
-| 2 | pod CPU 실시간 도구 | `podtop.py`(cgroup 직접, 1 s), metrics-server v0.9.0 설치(10 s 해상도, `--kubelet-insecure-tls`) | jet1 `/home/youngmin/dpumesh/setup/final/` |
+| 2 | pod CPU 실시간 도구 | `podtop.py`(cgroup 직접, 1 s), metrics-server v0.9.0 설치(10 s 해상도, `--kubelet-insecure-tls`) | jet1 `~/dpumesh/setup/final/` |
 | 3 | replica 변경 | frontend 8, geo/profile/rate/reservation 3, recommendation 2; CPU limit 없음(BestEffort) 확인 | — |
 | 4 | 선택적 디코딩 타당성 검토 + 플랜 | 1:1 고정 조건, 워커 306 ns vs 종단 1,315 ns, linkerd에서의 상한 ~12% | `docs/2026-09-09_h2-selective-relay-plan.md`, `…-experiment-plan.md` |
 | 5 | DMA linkerd 1코어 프로파일 | 106k cycles/req: h2 20%, atomics 18%, alloc 8%, tokio 6%, 레이어 13%, HeaderMap 5%, 전송 3.5% | `2026-09-09_dma-proxy-1core-perf-profile.md` |
