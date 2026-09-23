@@ -14,11 +14,13 @@ descriptor ring per connection and the DPA-free push channel back to the host.
 - `src/core/native_transport.h`: the private carrier contract
   (open, connect, submit, poll, release, wait, resolve, disconnect, close).
 - `src/core/carrier_push.c`: the carrier over the DPUMesh wire.
-- `src/core/wire_push.[ch]`: the only files that include DPUMesh headers; they
-  call the unmodified DPUMesh host sources (`DPUMesh/*.c`) for device open,
-  Comch client and producer setup, ring setup and the export message.
-- `src/core/wire_host_stubs.c`: two server-only symbols the shared DPUMesh
-  sources reference but a host never executes.
+- `src/transport/host/wire_push.[ch]`: the wire layer, the only host-library
+  files that include DOCA headers; they call the transport's host sources
+  (`src/transport/{common,host}/*.c`) for device open, Comch client and
+  producer setup, ring setup and the export message. `src/core` includes only
+  `wire_push.h`, which exposes no DOCA types.
+- `src/transport/host/wire_host_stubs.c`: two server-only symbols the shared
+  transport sources reference but a host never executes.
 - `src/facade`: the native API and the POSIX preload shim.
 
 ## Mapping onto the wire
@@ -68,5 +70,5 @@ descriptor and event traces to stderr.
 make lib            # host library and preload shim
 make test           # host-only checks and ABI contract
 make examples       # native and preload examples; see examples/README.md
-cd DPUMesh && meson setup build && meson compile -C build   # DPU side, on the DPU
+cd src/transport && meson setup build && meson compile -C build   # transport, on the DPU
 ```

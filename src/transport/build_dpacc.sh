@@ -81,3 +81,4 @@ $DOCA_DPACC $DPA_KERNELS_DEVICE_SRC \
 	-flto \
 	-I${DOCA_INCLUDE} \
 	-I"${PROJECT_SRC_DIR}/" \
+	-I"${PROJECT_SRC_DIR}/common" \

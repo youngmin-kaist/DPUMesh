@@ -10,4 +10,4 @@ bench/dmesh-router-cpp/test/test_transcode
 
 # host library build tree
 /build/
-/DPUMesh/build/
+/src/transport/build/

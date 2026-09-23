@@ -19,7 +19,7 @@ nginx ◀─TCP─ host backend bridge ◀──push DMA─│  nghttp2 client s
              (DMESH_BACKEND_CONNECT)         └───────────────────────────┘
 ```
 
-No C-side changes are needed: the host bridges in `DPUMesh/host_worker.c` are
+No C-side changes are needed: the host bridges in `src/transport/legacy/host_worker.c` are
 the same ones the Rust router uses.
 
 ## How it maps onto the datapath
@@ -38,7 +38,7 @@ Each request is a `Stream` bridging one server-session stream to one
 client-session stream; response bodies stream back through an
 `NGHTTP2_ERR_DEFERRED` data provider that is resumed as backend DATA arrives.
 The event loop (`src/main.cpp`) mirrors `run_dpu_worker_event_driven()` in
-`DPUMesh/dpu_worker.c`: arm both progress engines, drain control, drain data
+`src/transport/dpu/dpu_worker.c`: arm both progress engines, drain control, drain data
 with a budget, advance the state machine, pump the sessions, sleep on the two
 notification fds with a 1 ms cap.
 
@@ -68,7 +68,7 @@ backend failure → `502`.
 ## Build
 
 ```bash
-ninja -C ../DPUMesh/build      # dpa_kernel.a must exist first
+ninja -C ../../src/transport/build   # transport archives + dpa_kernel.a must exist first
 meson setup build
 ninja -C build                 # -> build/dmesh-router-cpp
 ```
