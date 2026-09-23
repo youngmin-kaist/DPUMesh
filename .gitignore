@@ -6,4 +6,8 @@ bench-results/*
 !bench-results/README.md
 
 # local test binary
-dmesh-router-cpp/test/test_transcode
+bench/dmesh-router-cpp/test/test_transcode
+
+# host library build tree
+/build/
+/src/transport/build/
