@@ -49,7 +49,8 @@ int dmesh_tx_call_active(dmesh_qp_t *qp) { return qp != NULL && gate_depth > 0; 
 int dmesh_tx_after_commit(dmesh_qp_t *qp) { assert(qp != NULL); after_commit_calls++; return 0; }
 void dmesh_tx_pressure(dmesh_qp_t *qp) { assert(qp != NULL); pressure_calls++; }
 void dpumesh_publish_due_tails(struct dmesh_eq *eq) { assert(eq != NULL); publish_due_calls++; }
-int dpumesh_drain_assist(struct dmesh_eq *eq) { assert(eq != NULL); return 0; }
+int dpumesh_eq_drain(struct dmesh_eq *eq) { assert(eq != NULL); return 0; }
+void dpumesh_eq_arm(struct dmesh_eq *eq) { assert(eq != NULL); }
 void dmesh_eq_suppress_notify(dmesh_eq_t *eq, int delta)
 {
     assert(eq != NULL && (delta == 1 || delta == -1));

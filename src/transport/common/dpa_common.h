@@ -46,6 +46,12 @@ struct dpa_thread_arg {
 	volatile uint32_t rd_pos;
 	volatile uint32_t rd_fc;
 
+	/* Extended DPA context (host PF process extended to an SF): the handle
+	 * from doca_dpa_get_dpa_handle(extended ctx); the kernel switches to it
+	 * with doca_dpa_dev_device_set() before touching that device's objects
+	 * (the official extended-context flow). 0 = base context, no switch. */
+	uint64_t dpa_dev;
+
 } __attribute__((__packed__, aligned(8)));
 
 enum comch_msg_type {

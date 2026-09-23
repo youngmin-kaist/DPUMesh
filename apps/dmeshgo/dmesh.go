@@ -10,8 +10,8 @@
 package dmeshgo
 
 /*
-#cgo CFLAGS: -I${SRCDIR}/../../src/transport/common -I${SRCDIR}/../../src/transport/host -I${SRCDIR}/../../src/transport/legacy -I/opt/mellanox/doca/include
-#cgo LDFLAGS: -L${SRCDIR}/../../src/transport/build -ldmesh_hostlib -Wl,-rpath,${SRCDIR}/../../src/transport/build
+#cgo CFLAGS: -I${SRCDIR}/hostlib -I${SRCDIR}/../../src/transport/common -I${SRCDIR}/../../src/transport/host -I/opt/mellanox/doca/include
+#cgo LDFLAGS: -L${SRCDIR}/hostlib/build -ldmesh_hostlib -Wl,-rpath,${SRCDIR}/hostlib/build
 #include <stdlib.h>
 #include "host_lib.h"
 */

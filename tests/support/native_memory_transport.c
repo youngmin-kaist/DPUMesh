@@ -123,11 +123,11 @@ void dmesh_native_release(struct dmesh_native_transport *t, int pos) {
     t->leased[pos / DPUMESH_SLOT_SIZE] = 0;
     pthread_mutex_unlock(&lock);
 }
-void dmesh_native_wait(struct dmesh_native_transport *t, int shard, int shards, int ms) {
-    (void)t; (void)shard; (void)shards;
-    struct timespec delay = {.tv_sec = 0, .tv_nsec = ms * 1000000L};
-    nanosleep(&delay, NULL);
-}
+/* No doorbells: every stripe asks for the fallback tick. */
+int dmesh_native_stripe_fd(struct dmesh_native_transport *t, int stripe) { (void)t; (void)stripe; return -1; }
+int dmesh_native_stripe_of(struct dmesh_native_transport *t, uint16_t port) { (void)t; (void)port; return -1; }
+int dmesh_native_stripe_arm(struct dmesh_native_transport *t, int stripe) { (void)t; (void)stripe; return 1; }
+void dmesh_native_stripe_clear(struct dmesh_native_transport *t, int stripe) { (void)t; (void)stripe; }
 int dmesh_native_connect(struct dmesh_native_transport *t, uint16_t port, int service_id) {
     (void)t; (void)port; (void)service_id; return 0;
 }

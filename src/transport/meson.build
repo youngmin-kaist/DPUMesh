@@ -13,20 +13,21 @@ project('dpumesh', 'c', 'cpp',
 #
 #   common/  buffers, rings, per-worker objects, Comch control-path framing,
 #            DPA thread/msgq management (both sides)
-#   dpu/     Comch server, forward DPA pool + DMA push engine, DPU worker
+#   dpu/     Comch server, forward DPA pool + DMA push engine
 #   host/    Comch client, and the wire layer the host library builds on
 #   device/  the DPA kernel (compiled by dpacc, see build_dpacc.sh)
-#   legacy/  the host worker's TCP bridges and the old Go host library
-#   apps/    the `dpumesh` CLI (HOST_MODE / DPU_MODE picked by DOCA_ARCH_DPU)
-#            and `dpumesh-echo`, the DMA benchmark peer over the shim API
+#
+# The programs live elsewhere and link these archives: apps/dma_bench
+# (`dpumesh`, the original worker pair, and `dpumesh-echo`),
+# apps/dmesh-router-cpp, apps/dmeshgo (the old Go host library) and the Rust
+# proxy (linkerd/doca/build.rs).
 
 # Comment this line to restore warnings of experimental DOCA features
 add_project_arguments('-D DOCA_ALLOW_EXPERIMENTAL_API', language: ['c', 'cpp'])
 
 # Every subdirectory is on the include path so sources keep their bare
 # `#include "x.h"` lines; a header lives next to its .c.
-inc_dirs = include_directories('/opt/mellanox/doca/include/',
-                               'common', 'dpu', 'host', 'legacy', 'apps')
+inc_dirs = include_directories('/opt/mellanox/doca/include/', 'common', 'dpu', 'host')
 
 deps = []
 deps += dependency('threads')
@@ -37,8 +38,8 @@ deps += dependency('doca-dpa')
 deps += dependency('libflexio')
 
 # DPA management (common/dpa.c, and comch_msgq.c on top of it) references the
-# dpacc host stub, so it is kept apart from the DPA-free sources for the
-# shared library below and for the host library's Makefile.
+# dpacc host stub; the DPA-free set is what the host library's Makefile and
+# apps/dmeshgo's shared library compile on their own.
 common_nodpa_srcs = files(
   'common/buffer.c',
   'common/ring.c',
@@ -52,7 +53,6 @@ common_srcs = common_nodpa_srcs + files('common/dpa.c', 'common/comch_msgq.c')
 dpu_srcs = files(
   'dpu/comch_server.c',
   'dpu/dma.c',
-  'dpu/dpu_worker.c',
 )
 host_srcs = files(
   'host/comch_client.c',
@@ -96,41 +96,3 @@ dmesh_wire = static_library('dmesh_wire', wire_srcs,
   dependencies : deps,
   include_directories : inc_dirs,
 )
-
-# The standalone data plane (DPU side) / bridge host (host side).
-executable('dpumesh',
-  files('apps/main.c', 'apps/config.c', 'legacy/host_worker.c'),
-  link_whole : [dmesh_dpu, dmesh_common, dmesh_host],
-  dependencies : deps + [dependency('doca-argp'), dpa_program_lib],
-  include_directories : inc_dirs,
-  install : false,
-)
-
-# The old Go host library (bench/dmeshgo): the push channel as a byte stream.
-# No host DPA, so the DPA archive (non-PIC) and dpa.c stay out; the DPU-side
-# symbols the shared sources reference are stubbed in host_lib.c, which is why
-# this links the common sources directly rather than dmesh_dpu.
-shared_library('dmesh_hostlib',
-  common_nodpa_srcs + host_srcs + files('legacy/host_lib.c'),
-  dependencies : deps,
-  include_directories : inc_dirs,
-  install : false,
-)
-
-# dpumesh-echo: the DPU-side benchmark peer (sink / echo) over the same shim the
-# proxy and the C++ router drive. shim.c lives in the linkerd2-proxy submodule;
-# the target is skipped when the submodule is not checked out.
-fs = import('fs')
-shim_c = meson.project_source_root() / '..' / '..' / 'linkerd2-proxy' / 'linkerd' / 'doca' / 'src' / 'shim.c'
-if fs.exists(shim_c)
-  executable('dpumesh-echo',
-    files('apps/dpu_echo.c') + files(shim_c),
-    link_whole : [dmesh_dpu, dmesh_common, dmesh_host],
-    dependencies : deps + [dependency('doca-aes-gcm'), dependency('doca-sha'), dpa_program_lib],
-    include_directories : inc_dirs,
-    c_args : ['-DALLOW_EXPERIMENTAL_API', '-DFLEXIO_ALLOW_EXPERIMENTAL_API', '-Wno-unused-parameter'],
-    install : false,
-  )
-else
-  message('linkerd2-proxy submodule not checked out: skipping dpumesh-echo')
-endif

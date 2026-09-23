@@ -1,0 +1,2 @@
+option('side', type : 'combo', choices : ['auto', 'host', 'dpu'], value : 'auto',
+       description : 'Which worker to build: dpumesh_host or dpumesh_dpu (auto = by CPU: aarch64 is the DPU)')

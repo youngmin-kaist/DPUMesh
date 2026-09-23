@@ -29,7 +29,17 @@ int dmesh_native_submit(struct dmesh_native_transport *, const sw_descriptor_t *
 /* A stripe has one consumer at a time; the core provides per-stripe exclusion. */
 int dmesh_native_poll(struct dmesh_native_transport *, int stripe, struct dmesh_native_event *);
 void dmesh_native_release(struct dmesh_native_transport *, int byte_offset);
-void dmesh_native_wait(struct dmesh_native_transport *, int shard, int shards, int timeout_ms);
+/* Doorbell of a stripe: an fd readable while the stripe has signalled work, or
+ * -1 when the stripe has none. Stable for the carrier's lifetime. */
+int dmesh_native_stripe_fd(struct dmesh_native_transport *, int stripe);
+/* The stripe carrying a port's stream, or -1. */
+int dmesh_native_stripe_of(struct dmesh_native_transport *, uint16_t port);
+/* Arms the doorbell before the stripe's consumer sleeps. Returns 1 when the
+ * stripe also needs periodic polling (traffic without a doorbell, or custody
+ * ACKs outstanding), 0 when the doorbell alone wakes the consumer. */
+int dmesh_native_stripe_arm(struct dmesh_native_transport *, int stripe);
+/* Acknowledges a signalled doorbell; the stripe is then polled. */
+void dmesh_native_stripe_clear(struct dmesh_native_transport *, int stripe);
 int dmesh_native_resolve(struct dmesh_native_transport *, const char *name, uint32_t addr, uint16_t port);
 /* A client port's stream exists from connect until its FIN or disconnect. */
 int dmesh_native_connect(struct dmesh_native_transport *, uint16_t port, int service_id);

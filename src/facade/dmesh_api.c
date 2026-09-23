@@ -83,12 +83,11 @@ static int eq_drain_conn(dmesh_channel_t *s, dmesh_qp_t *c,
     return n;
 }
 
-int dmesh_poll_eq(dmesh_eq_t *eq, dmesh_event_t *events, int max_events) {
-    if (!eq || !events || max_events <= 0) { errno = EINVAL; return -1; }
+static int poll_eq_once(dmesh_eq_t *eq, dmesh_event_t *events, int max_events) {
     dmesh_channel_t *s = eq->ch;
     int n = 0, drained;
 
-    (void)dpumesh_drain_assist(eq);
+    (void)dpumesh_eq_drain(eq);
 
     /* 0. Publish any tail whose deadline expired; each QP's transmit gate
      * serializes this against its owner. */
@@ -159,6 +158,18 @@ int dmesh_poll_eq(dmesh_eq_t *eq, dmesh_event_t *events, int max_events) {
         if (!drained) { eq->drain_cur = c; return n; }
     }
     return n;
+}
+
+/* An empty poll is what precedes the caller's sleep on dmesh_eq_fd: arm the
+ * doorbells, then drain once more so a completion that landed between the
+ * drain and the arm is not slept through. */
+int dmesh_poll_eq(dmesh_eq_t *eq, dmesh_event_t *events, int max_events) {
+    if (!eq || !events || max_events <= 0) { errno = EINVAL; return -1; }
+    int n = poll_eq_once(eq, events, max_events);
+    if (n != 0) return n;
+    dpumesh_eq_arm(eq);
+    if (dpumesh_eq_drain(eq) <= 0) return 0;
+    return poll_eq_once(eq, events, max_events);
 }
 
 void dmesh_release_rx_buffer(dmesh_channel_t *s, dmesh_event_t *event) {

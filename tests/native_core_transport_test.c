@@ -50,7 +50,12 @@ int main(void) {
     /* Payload landing does not stand in for the source's custody ACK. */
     assert(dmesh_tx_inflight(cq) > 0);
     test_native_hold_acks(0);
-    for (int i = 0; i < 5000 && dmesh_tx_inflight(cq); ++i) usleep(1000);
+    /* No thread reclaims custody in the background: the ACKs are polled. */
+    for (int i = 0; i < 5000 && dmesh_tx_inflight(cq); ++i) {
+        dmesh_event_t none;
+        assert(dmesh_poll_eq(ce, &none, 1) == 0);
+        usleep(1000);
+    }
     assert(dmesh_tx_inflight(cq) == 0);
     void *reply = dmesh_alloc(sq, 4); assert(reply); memcpy(reply, "pong", 4);
     assert(dmesh_post_send(sq, reply, 4) == 0); assert(dmesh_flush(sq) == 0);

@@ -50,7 +50,7 @@ DOCA_INCLUDE="${DOCA_DIR}/include"
 DOCA_TOOLS="${DOCA_DIR}/tools"
 DOCA_DPACC="${DOCA_TOOLS}/dpacc"
 
-HOST_CC_FLAGS="-Wno-deprecated-declarations -Werror -Wall -Wextra -DFLEXIO_ALLOW_EXPERIMENTAL_API"
+HOST_CC_FLAGS="-Wno-deprecated-declarations -Werror -Wall -Wextra -DFLEXIO_ALLOW_EXPERIMENTAL_API -fPIC"
 DEVICE_CC_FLAGS="-Wno-deprecated-declarations -Wno-error -Wall -Wextra -DFLEXIO_DEV_ALLOW_EXPERIMENTAL_API -O2"
 
 # DOCA DPA APP Configuration

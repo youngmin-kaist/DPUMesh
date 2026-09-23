@@ -15,8 +15,23 @@
 #include "dpa_common.h"
 #include "dpa.h"
 #include "dma.h"
+/* DPUMESH_DPU_SIDE (0/1) comes from meson.build: the side is chosen by the
+ * building machine's CPU (aarch64 = the DPU) or -Dside=, and only that side's
+ * worker is compiled in — dpumesh_dpu or dpumesh_host. */
+#ifndef DPUMESH_DPU_SIDE
+#error "DPUMESH_DPU_SIDE must be defined (build with apps/dma_bench/meson.build)"
+#endif
+#if DPUMESH_DPU_SIDE && !defined(DOCA_ARCH_DPU)
+#error "building dpumesh_dpu with a host DOCA package (DOCA_ARCH_DPU undefined)"
+#endif
+#if !DPUMESH_DPU_SIDE && defined(DOCA_ARCH_DPU)
+#error "building dpumesh_host with a DPU DOCA package (DOCA_ARCH_DPU defined)"
+#endif
+#if DPUMESH_DPU_SIDE
 #include "dpu_worker.h"
+#else
 #include "host_worker.h"
+#endif
 
 DOCA_LOG_REGISTER(MAIN);
 
@@ -59,7 +74,7 @@ int main(int argc, char **argv)
         goto exit;
     }
     
-#ifdef DOCA_ARCH_DPU
+#if DPUMESH_DPU_SIDE
     gcfg.mode = DPU_MODE;
 #else
     gcfg.mode = HOST_MODE;
@@ -95,14 +110,14 @@ int main(int argc, char **argv)
     }
     DOCA_LOG_INFO("Start %s application.", gcfg.mode == DPU_MODE ? "DPU" : "Host");
 
-    if (gcfg.mode == HOST_MODE) {
-        /* one thread per connection; count set via -t/--threads */
-        run_host_workers(&gcfg);
-    } else {
-        /* shared-nothing worker threads, one comch server each (-t/--threads).
-         * Set DPUMESH_BUSY_POLL=1 to run the busy-poll variant for comparison. */
-        run_dpu_workers(&gcfg);
-    }
+#if DPUMESH_DPU_SIDE
+    /* shared-nothing worker threads, one comch server each (-t/--threads).
+     * Set DMESH_BUSY_POLL=1 to run the busy-poll variant for comparison. */
+    run_dpu_workers(&gcfg);
+#else
+    /* one thread per connection; count set via -t/--threads */
+    run_host_workers(&gcfg);
+#endif
         
 //     result = init_comch_ctrl_path_server("DPUMesh", &objs, true);
 //     if (result != DOCA_SUCCESS) {

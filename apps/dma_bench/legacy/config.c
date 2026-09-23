@@ -121,7 +121,7 @@ init_argp(const char *program_name, void *config, int argc, char **argv)
 					"DOCA device representor PCI address (needed only on DPU)");
     doca_argp_param_set_callback(rep_pci_addr_param, rep_pci_addr_callback);
     doca_argp_param_set_type(rep_pci_addr_param, DOCA_ARGP_TYPE_STRING);
-#ifdef DOCA_ARCH_DPU
+#if DPUMESH_DPU_SIDE
     doca_argp_param_set_mandatory(rep_pci_addr_param);
 #endif
     result = doca_argp_register_param(rep_pci_addr_param);

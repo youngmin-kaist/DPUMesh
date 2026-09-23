@@ -19,7 +19,7 @@ nginx ◀─TCP─ host backend bridge ◀──push DMA─│  nghttp2 client s
              (DMESH_BACKEND_CONNECT)         └───────────────────────────┘
 ```
 
-No C-side changes are needed: the host bridges in `src/transport/legacy/host_worker.c` are
+No C-side changes are needed: the host bridges in `apps/dma_bench/host/host_worker.c` are
 the same ones the Rust router uses.
 
 ## How it maps onto the datapath
@@ -38,7 +38,7 @@ Each request is a `Stream` bridging one server-session stream to one
 client-session stream; response bodies stream back through an
 `NGHTTP2_ERR_DEFERRED` data provider that is resumed as backend DATA arrives.
 The event loop (`src/main.cpp`) mirrors `run_dpu_worker_event_driven()` in
-`src/transport/dpu/dpu_worker.c`: arm both progress engines, drain control, drain data
+`apps/dma_bench/dpu/dpu_worker.c`: arm both progress engines, drain control, drain data
 with a budget, advance the state machine, pump the sessions, sleep on the two
 notification fds with a 1 ms cap.
 
@@ -74,8 +74,8 @@ ninja -C build                 # -> build/dmesh-router-cpp
 ```
 
 The testbed has `libnghttp2.so.14` but no `-dev` package, so the build falls
-back to the headers vendored under `bench/hpack-h2-bench/c/nghttp2/` and links the
-versioned SONAME directly (same trick as `bench/hpack-h2-bench/c/build.sh` and
+back to the headers vendored under `apps/hpack-h2-bench/c/nghttp2/` and links the
+versioned SONAME directly (same trick as `apps/hpack-h2-bench/c/build.sh` and
 `linkerd/http/nghttp2/build.rs`). If a real `libnghttp2` pkg-config file ever
 appears, it is used instead.
 
@@ -90,9 +90,9 @@ the host-side commands. In short:
 
 # host, backend bridge first, then the h2load ingress
 DMESH_BACKEND_CONNECT=127.0.0.1:8086 DMESH_DST_IP=10.0.0.1 DMESH_DST_PORT=8086 \
-  ~/bf-workspace/build/dpumesh -p 94:00.1 -t 1 -d 1
+  ~/bf-workspace/apps/dma_bench/build/dpumesh_v0_host -p 94:00.1 -t 1 -d 1
 DMESH_BRIDGE_PORT=8080 DMESH_REV_PCI=94:00.1 DMESH_DST_IP=10.0.0.1 DMESH_DST_PORT=8086 \
-  ~/bf-workspace/build/dpumesh -p 94:00.1 -t 1 -d 1
+  ~/bf-workspace/apps/dma_bench/build/dpumesh_v0_host -p 94:00.1 -t 1 -d 1
 
 h2load -c1 -m100 -n20000 http://127.0.0.1:8080/
 ```

@@ -192,7 +192,7 @@ setup_reverse_dpa(struct objects *objs)
     };
 
     result = doca_dpa_rpc(conn->dpa_thread->dpa, thread_init_rpc, &rpc_ret,
-                          arg.dpa_consumer, (uint32_t)CC_DPA_MAX_MSG_NUM);
+                          arg.dpa_consumer, (uint32_t)CC_DPA_MAX_MSG_NUM, (uint64_t)0);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("reverse: init RPC failed: %s", doca_error_get_descr(result));
         return result;
@@ -1129,7 +1129,7 @@ run_host_dpa_bench(const struct global_config *gcfg)
         };
 
         result = doca_dpa_rpc(dpa_thread->dpa, thread_init_rpc, &rpc_ret,
-                              arg.dpa_consumer, (uint32_t)CC_DPA_MAX_MSG_NUM);
+                              arg.dpa_consumer, (uint32_t)CC_DPA_MAX_MSG_NUM, (uint64_t)0);
         if (result != DOCA_SUCCESS) {
             DOCA_LOG_ERR("host bench: init RPC failed for thread %u: %s", i, doca_error_get_descr(result));
             return;

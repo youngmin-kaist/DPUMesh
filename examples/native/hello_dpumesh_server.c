@@ -23,8 +23,6 @@ static int wait_eq(int fd)
     } while (rc < 0 && errno == EINTR);
     if (rc <= 0)
         return -1;
-    uint64_t count;
-    while (read(fd, &count, sizeof(count)) == sizeof(count)) { }
     return 0;
 }
 

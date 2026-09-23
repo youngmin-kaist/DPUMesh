@@ -21,9 +21,13 @@ static inline uint32_t bswap32(uint32_t x) {
            ((x & 0xFF000000) >> 24);
 }
 
-__dpa_rpc__ uint64_t thread_init_rpc(doca_dpa_dev_comch_consumer_t consumer, uint32_t num_msg)
+/* dpa_dev: extended DPA context handle whose device the consumer belongs to
+ * (0 = base context); an RPC runs outside the thread, so it must switch too. */
+__dpa_rpc__ uint64_t thread_init_rpc(doca_dpa_dev_comch_consumer_t consumer, uint32_t num_msg, uint64_t dpa_dev)
 {
     DOCA_DPA_DEV_LOG_INFO("recv thread init RPC, num_msg: %u\n", num_msg);
+    if (dpa_dev != 0)
+        doca_dpa_dev_device_set((doca_dpa_dev_t)dpa_dev);
 	doca_dpa_dev_comch_consumer_ack(consumer, num_msg);
 
 	return 0;
@@ -623,6 +627,10 @@ static void run_hpack_term_bench(struct dpa_thread_arg *a, int reencode)
 
 __dpa_global__ void run_dma_manager(uint64_t arg)
 {
+    /* extended DPA context: make its device current before any object access */
+    if (((struct dpa_thread_arg *)arg)->dpa_dev != 0)
+        doca_dpa_dev_device_set((doca_dpa_dev_t)((struct dpa_thread_arg *)arg)->dpa_dev);
+
     struct dpa_thread_arg *thread_arg = (struct dpa_thread_arg *)arg;
 
     DOCA_DPA_DEV_LOG_INFO("Starting DMA manager thread...\n");

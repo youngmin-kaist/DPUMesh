@@ -12,22 +12,24 @@ BINDIR := $(BUILD)/bin
 ABI_MAJOR := 5
 TRANSPORT := src/transport
 DOCA_INC := /opt/mellanox/doca/include
-DOCA_LIBS := $(shell pkg-config --libs doca-common doca-comch doca-dma doca-dpa)
+DOCA_LIBS := $(shell pkg-config --libs doca-common doca-comch doca-dma doca-dpa libflexio)
+DPACC := $(TRANSPORT)/build_dpacc.sh
+DPA_KERNEL := $(BUILD)/dpa/device/dpa_kernel.a
 HOST_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -D_GNU_SOURCE -DDOCA_ALLOW_EXPERIMENTAL_API \
     -Iinclude -I. -I$(TRANSPORT)/common -I$(TRANSPORT)/dpu -I$(TRANSPORT)/host -I$(DOCA_INC)
-# Transport sources the host library needs: the common set (no DPA) plus the
-# Comch client and the wire layer. Keep in step with src/transport/meson.build.
+# Transport sources the host library needs: the common set, the DPA
+# management the pull wire's host DPA thread uses, the Comch client and the
+# wire layer. Keep in step with src/transport/meson.build.
 TRANSPORT_SRCS := $(addprefix $(TRANSPORT)/common/,object.c buffer.c common.c comch_common.c \
-    comch_consumer.c comch_producer.c ring.c) \
+    comch_consumer.c comch_producer.c comch_msgq.c dpa.c ring.c) \
     $(addprefix $(TRANSPORT)/host/,comch_client.c wire_push.c wire_host_stubs.c)
 LIB_SRCS := src/core/dmesh_core.c src/core/carrier_push.c src/core/service_registry.c \
     src/facade/dmesh_api.c $(TRANSPORT_SRCS)
 HOST_TESTS := carrier_push_logic_test service_registry_test native_writable_test native_core_transport_test \
     topology_test native_api_contract_test preload_api_contract_test
 EXAMPLES := hello_dpumesh hello_dpumesh_server tcp_echo tcp_client
-BENCH_APPS := dma_bench
 
-.PHONY: all lib test test-native-headers test-abi examples bench clean
+.PHONY: all lib test test-native-headers test-abi examples clean
 all: lib
 
 lib: $(LIBDIR)/libdpumesh.so.$(ABI_MAJOR) $(LIBDIR)/libdpumesh_preload.so
@@ -35,9 +37,15 @@ lib: $(LIBDIR)/libdpumesh.so.$(ABI_MAJOR) $(LIBDIR)/libdpumesh_preload.so
 $(LIBDIR) $(TESTDIR) $(BINDIR):
 	mkdir -p $@
 
-$(LIBDIR)/libdpumesh.so.$(ABI_MAJOR): $(LIB_SRCS) include/dpumesh/*.h src/core/*.h $(TRANSPORT)/host/wire_push.h | $(LIBDIR)
+# The DPA kernel + its (PIC) host stub, compiled by dpacc: the pull wire runs
+# the same poll_desc_ring kernel on a host-owned DPA thread.
+$(DPA_KERNEL): $(TRANSPORT)/device/dpa_kernel.c $(TRANSPORT)/device/*.h $(TRANSPORT)/common/dpa_common.h $(DPACC)
+	$(DPACC) $(abspath $(BUILD)/dpa) $(abspath $(TRANSPORT)) $(abspath $<) dpa_kernel nv-dpa-bf3 \
+	    $$(pkg-config --variable=libdir doca-dpa)
+
+$(LIBDIR)/libdpumesh.so.$(ABI_MAJOR): $(LIB_SRCS) $(DPA_KERNEL) include/dpumesh/*.h src/core/*.h $(TRANSPORT)/host/wire_push.h | $(LIBDIR)
 	$(CC) $(HOST_CFLAGS) -fPIC -shared -Wl,-soname,libdpumesh.so.$(ABI_MAJOR) -Wl,--no-undefined \
-	    $(LIB_SRCS) -pthread $(DOCA_LIBS) -o $@
+	    $(LIB_SRCS) $(DPA_KERNEL) -pthread $(DOCA_LIBS) -o $@
 	ln -sfn libdpumesh.so.$(ABI_MAJOR) $(LIBDIR)/libdpumesh.so
 
 $(LIBDIR)/libdpumesh_preload.so: src/facade/dmesh_preload.c $(LIBDIR)/libdpumesh.so.$(ABI_MAJOR)
@@ -81,11 +89,8 @@ $(BINDIR)/hello_dpumesh $(BINDIR)/hello_dpumesh_server: $(BINDIR)/%: examples/na
 $(BINDIR)/tcp_echo $(BINDIR)/tcp_client: $(BINDIR)/%: examples/preload/%.c | $(BINDIR)
 	$(CC) $(HOST_CFLAGS) $< -lpthread -o $@
 
-# Benchmarks over the host library (bench/apps); the DPU peer is dpumesh-echo.
-bench: lib $(addprefix $(BINDIR)/,$(BENCH_APPS))
-
-$(BINDIR)/dma_bench: bench/apps/dma_bench.c include/dpumesh/*.h | $(BINDIR)
-	$(CC) $(HOST_CFLAGS) $< -L$(LIBDIR) -ldpumesh -Wl,-rpath,$(abspath $(LIBDIR)) -lpthread -o $@
+# The DMA benchmark (dpumesh_host over this library) is apps/dma_bench, a meson
+# project that links build/lib/libdpumesh.so: run `make lib` first.
 
 clean:
 	rm -rf $(BUILD)

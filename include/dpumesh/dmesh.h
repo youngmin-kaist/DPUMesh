@@ -107,7 +107,9 @@ dmesh_eq_t *dmesh_create_eq(dmesh_channel_t *ch);
 /* Destroy an idle EQ. Returns EBUSY while a QP remains. Safe on NULL. */
 int dmesh_destroy_eq(dmesh_eq_t *eq);
 
-/* Optional eventfd. Drain it on wake, then call dmesh_poll_eq() until empty. */
+/* Readiness fd (an epoll set, level-triggered): poll it, then call
+ * dmesh_poll_eq() until it returns 0, which settles the fd and arms the
+ * transport's doorbells for the next sleep. -1 when unavailable. */
 int dmesh_eq_fd(dmesh_eq_t *eq);
 
 /* Nanoseconds this EQ may wait before a QP's buffered transmit tail comes due,

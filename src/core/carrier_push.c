@@ -3,7 +3,12 @@
  * keeps a pool of BACKEND flows that the DPU claims one stream at a time.
  * The core keeps its custody, credit and accept semantics: forward
  * consumption is reported as custody ACKs and each push batch as one receive
- * event; releases advance the per-connection cursor in order. */
+ * event; releases advance the per-connection cursor in order.
+ *
+ * Each slot owns an epoll fd holding its connection's doorbells (the wire's
+ * progress-engine notification fds); the core nests it in the owning EQ's fd.
+ * Custody ACKs (the DPU's consumer_head) and push-wire batches have no
+ * doorbell, so stripe_arm asks for periodic polling while either is possible. */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -18,14 +23,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
+#include <sys/epoll.h>
+#include <unistd.h>
 
 #define SLOTS 32                       /* DPUMesh connections per worker */
 #define TICKETS 1024                   /* forward ring depth */
 #define UPORT_BASE 32768u
 #define BACKEND_POOL_DEFAULT 8        /* spare BACKEND flows kept open */
 #define BACKEND_MAX_DEFAULT 16         /* spare + claimed BACKEND flows */
-#define POLL_NAP_NS 100000L
 static int trace_enabled = -1;
 #define TRACE(...) do { if (trace_enabled < 0) trace_enabled = getenv("DPUMESH_CARRIER_TRACE") != NULL; \
     if (trace_enabled) { fprintf(stderr, "carrier: " __VA_ARGS__); fputc('\n', stderr); } } while (0)
@@ -34,6 +39,8 @@ enum { SLOT_FREE = 0, SLOT_OPEN, SLOT_CLOSED };
 struct ticket { uint16_t seq; uint64_t ticket; };
 struct slot {
     pthread_mutex_t lock;
+    int epfd;                          /* doorbells of the open connection */
+    int armed;                         /* doorbells requested, not yet acknowledged */
     int state, backend, claimed, service_id;
     uint16_t port, peer;
     struct wire_conn *conn;
@@ -52,12 +59,10 @@ struct dmesh_native_transport {
     int pod_id, service_id, backend_pool, backend_max;
     uint16_t next_uport;
     pthread_mutex_t lock;
-    atomic_int open_count;
     struct slot slots[SLOTS];
     uint16_t port_slot[65536];         /* port -> slot index + 1 */
 };
 
-static void nap(long ns) { struct timespec ts = {0, ns}; nanosleep(&ts, NULL); }
 static int env_int(const char *name, int fallback, int lo, int hi)
 {
     const char *s = getenv(name);
@@ -73,6 +78,9 @@ static int slot_open(struct dmesh_native_transport *t, struct slot *s, uint32_t 
 {
     const struct dmesh_service *svc = dmesh_registry_id(&t->registry, service_id);
     if (!svc) { errno = ENOENT; return -1; }
+    /* pull wire: the same roles on the export flow modes */
+    if (wire_dev_pull(t->dev))
+        mode = mode == WIRE_MODE_BACKEND ? WIRE_MODE_BACKEND_PULL : WIRE_MODE_CLIENT_PULL;
     struct wire_conn_config cfg = {
         .server = t->server, .workload = t->workload,
         .src_ip = t->pod_ip, .dst_ip = svc->ipv4, .src_port = port, .dst_port = svc->port,
@@ -81,8 +89,14 @@ static int slot_open(struct dmesh_native_transport *t, struct slot *s, uint32_t 
     };
     struct wire_conn *c = NULL;
     if (wire_conn_open(t->dev, &cfg, &c) != 0) return -1;
+    int fds[WIRE_CONN_FDS], nfd = wire_conn_fds(c, fds, WIRE_CONN_FDS);
+    for (int i = 0; i < nfd; ++i) {
+        struct epoll_event ev = { .events = EPOLLIN, .data.fd = fds[i] };
+        if (epoll_ctl(s->epfd, EPOLL_CTL_ADD, fds[i], &ev) != 0) TRACE("slot %d doorbell %d not registered (%s)", slot_index(t, s), fds[i], strerror(errno));
+    }
+    s->armed = 0;
     s->conn = c; s->port = port; s->service_id = service_id;
-    s->backend = mode == WIRE_MODE_BACKEND;
+    s->backend = mode == WIRE_MODE_BACKEND || mode == WIRE_MODE_BACKEND_PULL;
     s->peer = s->backend ? (uint16_t)(1 + slot_index(t, s)) : (uint16_t)(UPORT_BASE + slot_index(t, s));
     s->t_head = s->t_tail = 0; s->fin_pending = 0; s->peer_gone_reported = 0; s->claimed = 0;
     s->fin_seq = 0; s->rx_seq = 0;
@@ -90,12 +104,17 @@ static int slot_open(struct dmesh_native_transport *t, struct slot *s, uint32_t 
     s->state = SLOT_OPEN;
     t->port_slot[port] = (uint16_t)(slot_index(t, s) + 1);
     TRACE("slot %d open mode %u port %u peer %u service %d", slot_index(t, s), mode, port, s->peer, service_id);
-    atomic_fetch_add(&t->open_count, 1);
     return 0;
 }
 static void slot_close(struct dmesh_native_transport *t, struct slot *s)
 {
-    if (s->conn) { wire_conn_close(s->conn); s->conn = NULL; atomic_fetch_sub(&t->open_count, 1); }
+    (void)t;
+    if (s->conn) {
+        int fds[WIRE_CONN_FDS], nfd = wire_conn_fds(s->conn, fds, WIRE_CONN_FDS);
+        for (int i = 0; i < nfd; ++i) (void)epoll_ctl(s->epfd, EPOLL_CTL_DEL, fds[i], NULL);
+        wire_conn_close(s->conn); s->conn = NULL;
+    }
+    s->armed = 0;
     s->state = SLOT_CLOSED;
 }
 static void slot_free(struct dmesh_native_transport *t, struct slot *s)
@@ -148,7 +167,8 @@ int dmesh_native_open(struct dmesh_native_transport **out, struct dmesh_native_c
     struct dmesh_native_transport *t = calloc(1, sizeof(*t));
     if (!t) return -1;
     pthread_mutex_init(&t->lock, NULL);
-    for (int i = 0; i < SLOTS; ++i) pthread_mutex_init(&t->slots[i].lock, NULL);
+    for (int i = 0; i < SLOTS; ++i) { pthread_mutex_init(&t->slots[i].lock, NULL); t->slots[i].epfd = -1; }
+    for (int i = 0; i < SLOTS; ++i) if ((t->slots[i].epfd = epoll_create1(EPOLL_CLOEXEC)) < 0) goto fail;
     const char *registry = getenv("DPUMESH_CONFIG");
     if (!registry) registry = "/etc/dpumesh/registry";
     if (dmesh_registry_load(&t->registry, registry) != 0) goto fail;
@@ -190,6 +210,7 @@ int dmesh_native_close(struct dmesh_native_transport *t)
 {
     if (!t) return 0;
     for (int i = 0; i < SLOTS; ++i) if (t->slots[i].conn) slot_close(t, &t->slots[i]);
+    for (int i = 0; i < SLOTS; ++i) if (t->slots[i].epfd >= 0) close(t->slots[i].epfd);
     wire_mem_free(t->rx); wire_mem_free(t->tx);
     wire_dev_close(t->dev);
     free(t);
@@ -324,12 +345,52 @@ void dmesh_native_release(struct dmesh_native_transport *t, int pos)
     }
     pthread_mutex_unlock(&s->lock);
 }
-void dmesh_native_wait(struct dmesh_native_transport *t, int shard, int shards, int ms)
+int dmesh_native_stripe_fd(struct dmesh_native_transport *t, int stripe)
 {
-    (void)shard; (void)shards;
-    /* No doorbell exists on this transport: an open connection is polled. */
-    if (atomic_load(&t->open_count) > 0) nap(POLL_NAP_NS);
-    else nap((long)ms * 1000000L);
+    return stripe >= 0 && stripe < SLOTS ? t->slots[stripe].epfd : -1;
+}
+int dmesh_native_stripe_of(struct dmesh_native_transport *t, uint16_t port)
+{
+    uint16_t i = t->port_slot[port];
+    return i ? (int)i - 1 : -1;
+}
+/* An armed doorbell is one-shot: it fires on the next completion of any of the
+ * connection's engines and stays readable until cleared. Rearmed only after a
+ * clear, so a sleeping consumer costs one request per wake. */
+int dmesh_native_stripe_arm(struct dmesh_native_transport *t, int stripe)
+{
+    if (stripe < 0 || stripe >= SLOTS) return 0;
+    struct slot *s = &t->slots[stripe];
+    if (s->state == SLOT_FREE) return 0;
+    /* Still armed from an earlier sleep (the common case of a busy consumer
+     * that ran empty): only the polling question remains, answered from a
+     * racy read that a concurrent poll can at worst make conservative. */
+    if (s->state == SLOT_OPEN && s->armed)
+        return s->t_head != s->t_tail || !wire_dev_pull(t->dev);
+    pthread_mutex_lock(&s->lock);
+    int tick = 0;
+    if (s->state == SLOT_OPEN) {
+        if (!s->armed && wire_conn_arm(s->conn) == 0) s->armed = 1;
+        /* forward custody has no doorbell; neither do push-wire batches */
+        tick = s->t_head != s->t_tail || !wire_dev_pull(t->dev);
+    } else {
+        tick = s->t_head != s->t_tail || s->fin_pending;   /* retired by the next poll */
+    }
+    pthread_mutex_unlock(&s->lock);
+    return tick;
+}
+void dmesh_native_stripe_clear(struct dmesh_native_transport *t, int stripe)
+{
+    if (stripe < 0 || stripe >= SLOTS) return;
+    struct slot *s = &t->slots[stripe];
+    pthread_mutex_lock(&s->lock);
+    if (s->conn) {
+        struct epoll_event evs[WIRE_CONN_FDS];
+        int n = epoll_wait(s->epfd, evs, WIRE_CONN_FDS, 0);
+        for (int i = 0; i < n; ++i) wire_conn_clear(s->conn, evs[i].data.fd);
+        if (n > 0) s->armed = 0;
+    }
+    pthread_mutex_unlock(&s->lock);
 }
 int dmesh_native_resolve(struct dmesh_native_transport *t, const char *name, uint32_t addr, uint16_t port)
 {

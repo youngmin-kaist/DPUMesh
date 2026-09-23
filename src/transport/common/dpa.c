@@ -676,6 +676,30 @@ dmesh_doca_dpa_comch_create(struct dmesh_conn *conn)
 
     memset(comch, 0, sizeof(*comch));
 
+    /* The DPA completion goes first: on an extended DPA context (a host PF
+     * process extended to an SF) a thread whose first attached completion is
+     * the comch consumer completion fails to start it (DOCA_ERROR_DRIVER,
+     * reproduced 2026-09-24); with a doca_dpa_completion attached first both
+     * start. Order is irrelevant on a base context. */
+    result = doca_dpa_completion_create(dpa_thread->dpa, CC_DPA_MAX_MSG_NUM, &comch->producer_comp);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to create producer completion - %s",
+                doca_error_get_name(result));
+        return result;
+    }
+    result = doca_dpa_completion_set_thread(comch->producer_comp, dpa_thread->thread);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to set dpa thread to producer completion - %s",
+                doca_error_get_name(result));
+        return result;
+    }
+    result = doca_dpa_completion_start(comch->producer_comp);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to start producer completion - %s",
+                doca_error_get_name(result));
+        return result;
+    }
+
     result = doca_comch_consumer_completion_create(&(comch->consumer_comp));
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to create consumer completion - %s",
@@ -712,25 +736,6 @@ dmesh_doca_dpa_comch_create(struct dmesh_conn *conn)
 			     doca_error_get_name(result));
 		return result;
 	}
-
-    result = doca_dpa_completion_create(dpa_thread->dpa, CC_DPA_MAX_MSG_NUM, &comch->producer_comp);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to create producer completion - %s",
-                doca_error_get_name(result));
-        return result;
-    }
-    result = doca_dpa_completion_set_thread(comch->producer_comp, dpa_thread->thread);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to set dpa thread to producer completion - %s",
-                doca_error_get_name(result));
-        return result;
-    }
-    result = doca_dpa_completion_start(comch->producer_comp);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to start producer completion - %s",
-                doca_error_get_name(result));
-        return result;
-    }
 
     return DOCA_SUCCESS;
 }
@@ -1079,7 +1084,8 @@ dmesh_doca_run_dpa_thread(struct dmesh_conn *conn)
                         thread_init_rpc,
                         &rpc_ret,
                         arg.dpa_consumer,
-                        num_msg);
+                        num_msg,
+                        (uint64_t)0);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to issue init thread RPC - %s",
             doca_error_get_name(result));

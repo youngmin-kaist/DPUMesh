@@ -12,15 +12,20 @@ datapath (this repo, `DPU_MODE`). The two ends are the **same binary** —
 `#ifdef DOCA_ARCH_DPU` in `main.c` picks the mode at compile time.
 
 Three trees at the repo root:
-- `src/transport/` — the C DOCA transport (the `dpumesh` program, the DPA
-  kernel and the archives every other binary links). This is the main work.
-  It is the **only tree that includes DOCA headers**, split by side:
-  `common/` (buffers, rings, objects, Comch framing, DPA management),
-  `dpu/` (Comch server, DMA push engine, DPU worker), `host/` (Comch client,
-  the host library's wire layer), `device/` (DPA kernel), `legacy/` (host
-  TCP bridges, old Go host lib), `apps/` (`main.c`, `config.c`). Every
-  subdirectory is on the include path, so sources use bare `#include "x.h"`
-  and a header lives next to its `.c`.
+- `src/transport/` — the C DOCA transport: the DPA kernel and the static
+  archives every program links. This is the main work. It is the **only tree
+  that includes DOCA headers**, split by side: `common/` (buffers, rings,
+  objects, Comch framing, DPA management), `dpu/` (Comch server, DMA push
+  engine), `host/` (Comch client, the host library's wire layer), `device/`
+  (DPA kernel). Every subdirectory is on the include path, so sources use
+  bare `#include "x.h"` and a header lives next to its `.c`.
+- `apps/` — the programs over the transport, each its own meson project
+  linking the archives: `dma_bench/` (the DMA benchmark pair `dpumesh_host`
+  — `host/dpumesh_host.c` over the host library — and `dpumesh_dpu` —
+  `dpu/dpumesh_dpu.c` over the shim — plus `legacy/`, the original worker
+  pair `dpumesh_v0_{host,dpu}` kept for its h2load bridges),
+  `dmesh-router-cpp/`, `dmeshgo/` (old Go host lib, `libdmesh_hostlib.so`),
+  `hpack-h2-bench/`.
 - `src/core/`, `src/facade/`, `include/dpumesh/` — the DOCA-free host library
   (`libdpumesh.so.5`, root `Makefile`): core, carrier, native/preload façades.
   `src/core` sees the transport only through `src/transport/host/wire_push.h`.
@@ -36,16 +41,18 @@ Build system is **meson + ninja**; DPA device code is compiled by a separate
 ```bash
 cd src/transport
 meson setup build            # first time only
-ninja -C build               # rebuilds host code AND re-runs dpacc on device/dpa_kernel.c
-./build/dpumesh ...          # run
+ninja -C build               # transport archives; re-runs dpacc on device/dpa_kernel.c
+cd ../../apps/dma_bench
+meson setup build && ninja -C build    # DPU: build/dpumesh_dpu + dpumesh_v0_dpu; host: dpumesh_host (+ legacy; needs `make lib` first)
+./build/dpumesh_dpu ...      # run
 ```
 
-`ninja` also produces the static archives the other builds link:
-`libdmesh_common.a`, `libdmesh_dpu.a`, `libdmesh_host.a`, `libdmesh_wire.a`
-(+ `device/dpa_kernel.a` from dpacc) and the old Go host lib
-`libdmesh_hostlib.so` (`bench/dmeshgo`). `src/transport/meson.build` is the
-one list of transport sources; the root `Makefile` repeats only the host-side
-subset it needs (`TRANSPORT_SRCS`) so the host library builds with plain make.
+The transport build produces only archives: `libdmesh_common.a`,
+`libdmesh_dpu.a`, `libdmesh_host.a`, `libdmesh_wire.a` (+ `device/dpa_kernel.a`
+from dpacc). `src/transport/meson.build` is the one list of transport
+sources; the root `Makefile` (host library) and `apps/dmeshgo/hostlib/meson.build`
+(old Go lib) repeat only the DPA-free host subset they need. Every program in
+`apps/` must be rebuilt after a transport change (it links the archives).
 
 There is no test suite and no linter; correctness is validated by running the
 benchmark modes end-to-end on the testbed. Requires DOCA (installed at
@@ -63,9 +70,10 @@ reference each other). Consequences:
   (C or `device/dpa_kernel.c`) or the proxy links stale archives; a missing
   archive fails the build with a message saying so. `cargo` rebuilds the crate
   when the archives change (`rerun-if-changed`).
-- `apps/`, `dpu_worker.c` and `legacy/` are not linked into the proxy — it
+- The workers and CLI in `apps/dma_bench` are not linked into the proxy — it
   drives the same infra through `shim.c`, not `dpu_worker.c`. A new `.c` in
-  `meson.build` reaches the proxy automatically through the archives.
+  `src/transport/meson.build` reaches the proxy automatically through the
+  archives.
 
 ```bash
 cd linkerd2-proxy
@@ -77,20 +85,24 @@ Always benchmark `--release` (see gotchas). The proxy reads its DOCA PCI
 addresses from `LINKERD2_PROXY_DOCA_DEV_PCI_ADDR` (`03:00.1`) and
 `LINKERD2_PROXY_DOCA_REP_PCI_ADDR` (`94:00.1`) — see `linkerd2-proxy/src/main.rs`.
 
-### DMA benchmark pair — `dma_bench` (host API) + `dpumesh-echo` (DPU shim)
+### DMA benchmark pair — `dpumesh_host` (host API) + `dpumesh_dpu` (DPU shim)
 
-The port of the legacy `host_worker.c` / `dpu_worker.c` benchmark roles onto the
-current APIs: `bench/apps/dma_bench.c` streams fixed-size messages through
-`libdpumesh` (one channel, one EQ + QP per thread; `BENCH_MODE=sink|echo`,
-`BENCH_THREADS`, `BENCH_SIZE`, `BENCH_DURATION`, `BENCH_WINDOW`), and
-`src/transport/apps/dpu_echo.c` (`dpumesh-echo`, built by the transport meson
-when the submodule is present) serves the flows over the shim, counting every
-forward DMA completion and, in echo mode, pushing the bytes back. Both print a
-per-second line and a `*_BENCH_DONE` summary; the DPU's `recv … DMA/s` is the
-ground truth for "DMAs per second" (the host library coalesces small posts into
-8064-byte units, so the host's estimate only holds for >= 8 KiB messages).
-`make bench` builds the host side; run recipe and numbers in
-`bench-results/2026-09-22_dma-bench-api-port.md`.
+`apps/dma_bench`: the legacy `host_worker.c` / `dpu_worker.c` benchmark roles
+ported onto the current APIs. `dpumesh_host` (`host/dpumesh_host.c`) streams
+fixed-size messages through `libdpumesh` (one channel, one EQ + QP per thread;
+`BENCH_MODE=sink|echo`, `BENCH_THREADS`, `BENCH_SIZE`, `BENCH_DURATION`,
+`BENCH_WINDOW`); `dpumesh_dpu` (`dpu/dpumesh_dpu.c`, `DMESH_MODE=sink|echo`,
+`DMESH_BUSY_POLL`) serves the flows over the shim, counting every forward DMA
+completion and, in echo mode, pushing the bytes back. Both print a per-second
+line and a `*_BENCH_DONE` summary; the DPU's `recv … DMA/s` is the ground truth
+for "DMAs per second" (the host library coalesces small posts into 8064-byte
+units, so the host's estimate only holds for >= 8 KiB messages). Restart the
+DPU side per run. `DPUMESH_WIRE=pull DPUMESH_REV_PCI=0b:00.0` on the host
+switches the reverse path to the host-owned DPA (needs the vhca-0 EU
+partition); 4-connection 8 KiB echo goes from 17.8 to 31 Gbps each way.
+Recipe and numbers in `bench-results/2026-09-22_dma-bench-api-port.md`. The original pair lives on as
+`dpumesh_v0_{host,dpu}` (`legacy/`) because the proxy benchmark scripts
+use its host bridges (below).
 
 ### The two routers — no-tower baselines
 
@@ -102,8 +114,8 @@ only the HTTP engine differs. Measured with `h2load -c1 -m100 -n20000`, h2 on
 both legs, 1 core: **`dmesh-router-cpp` ~100k req/s (jemalloc + no-copy headers; ~68k before), `dmesh-router` ~31k,
 DMA linkerd2-proxy ~16.6k**.
 
-- `bench/dmesh-router-cpp/` — C++ + libnghttp2, standalone meson project that
-  links the same transport archives. See `bench/dmesh-router-cpp/README.md`.
+- `apps/dmesh-router-cpp/` — C++ + libnghttp2, standalone meson project that
+  links the same transport archives. See `apps/dmesh-router-cpp/README.md`.
   HTTP/2 backend leg only.
 - `linkerd2-proxy/dmesh-router/` — Rust + hyper, member of the proxy workspace
   (details below). HTTP/1.1 or HTTP/2 backend leg.
@@ -152,8 +164,8 @@ Host = `192.168.100.1` (rapids4, x86); DPU = `192.168.100.2` (BF-3, where
 sessions run). DOCA 3.1 both ends. The host keeps its own copy of this repo at
 `~/bf-workspace` (same git history — pull + `ninja` there after changing host code).
 
-- DPU (proxy side): `./build/dpumesh -p 03:00.1 -r 94:00.1 -t 1`
-- Host (shim): `~/bf-workspace/build/dpumesh -p 94:00.1 -t 1 -d 1`
+- DPU (legacy worker): `apps/dma_bench/build/dpumesh_v0_dpu -p 03:00.1 -r 94:00.1 -t 1`
+- Host (legacy worker / bridges): `~/bf-workspace/apps/dma_bench/build/dpumesh_v0_host -p 94:00.1 -t 1 -d 1`
 
 DPU DOCA devices are `03:00.0/03:00.1`; the host-side BlueField PF is
 `94:00.0/94:00.1`. The reverse (response) DPA path defaults to `94:00.0`
@@ -221,7 +233,7 @@ kept for benchmark comparison.
 
 ### Benchmark / bridge harnesses (host side, `host_worker.c`)
 These let standard tools drive the DMA path; each is selected by an env var and
-generally handles one connection then exits (**restart the host `dpumesh` per
+generally handles one connection then exits (**restart the host `dpumesh_v0_host` per
 run**):
 - `DMESH_BRIDGE_PORT` → `run_host_h2_bridge`: TCP↔DMA byte bridge so `h2load`
   can benchmark HTTP/2 over DMA (libnghttp2 headers aren't on the testbed, so

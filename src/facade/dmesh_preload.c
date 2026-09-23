@@ -554,8 +554,7 @@ static void *dispatcher_main(void *arg) {
             continue;
 
         if (pfds[0].revents & POLLIN) {
-            uint64_t v;
-            (void)real_read(eq_fd, &v, sizeof v);
+            /* The fd is level-triggered; draining the EQ to empty settles it. */
             pthread_mutex_lock(&g_poll_mu);
             (void)dispatcher_drain_eq(NULL, 0);
             pthread_mutex_unlock(&g_poll_mu);

@@ -79,9 +79,17 @@ struct dmesh_eq {
                                   * inbox never went empty, so the ready list holds no fresh
                                   * edge — this is the only path back to it). Owned by this
                                   * EQ's thread; dmesh_destroy_qp clears it on a matching conn. */
-    int                notify_efd;  /* this EQ's readiness fd, created live; eventfd writes
-                                     * begin when dmesh_eq_fd hands it out (wants_notify). */
-    /* Set when dmesh_eq_fd exposes notify_efd. Poll-only EQs skip eventfd writes. */
+    int                epfd;        /* this EQ's readiness fd (dmesh_eq_fd): an epoll set
+                                     * nesting notify_efd, tick_fd, the spare stripes'
+                                     * doorbells and the doorbells of the stripes it owns */
+    int                notify_efd;  /* eventfd other threads write on ready edges; writes
+                                     * begin when dmesh_eq_fd hands out epfd (wants_notify). */
+    int                tick_fd;     /* timerfd: fallback poll while doorbell-less traffic
+                                     * (custody ACKs, push batches) is outstanding */
+    int                tick_armed;
+    uint64_t           spin_since;  /* start of the current empty-poll spin window, 0 = none */
+    /* Set when dmesh_eq_fd exposes epfd. Poll-only EQs skip eventfd writes and
+     * never arm doorbells. */
     atomic_int         wants_notify;
     atomic_int         suppress_notify;
     int                reg_idx;     /* slot in ctx->eqs[], for destroy */
@@ -114,8 +122,8 @@ struct dmesh_eq {
     atomic_int           tx_due_hint;
     /* Ready list for this EQ's conns. The drain side pushes a conn's port when
      * its inbox goes empty->non-empty; the EQ thread drains it through
-     * dmesh_next_ready. MPSC: drain shards and assisting EQ threads produce
-     * (CAS on ready_tail), this EQ's thread is the sole consumer (ready_head).
+     * dmesh_next_ready. MPSC: draining EQ threads produce (CAS on
+     * ready_tail), this EQ's thread is the sole consumer (ready_head).
      * Sized to the port space; the on_ready flag admits each live conn at most
      * once. */
     char _rl_pad0[64];
@@ -232,9 +240,14 @@ void *dpumesh_next_tx_error(struct dmesh_eq *eq);
  * QP's owner. */
 void dpumesh_publish_due_tails(struct dmesh_eq *eq);
 
-/* In-line drain by an awake EQ thread: interprets already-published reverse
- * entries under the stripe locks instead of waiting for a drain shard. */
-int dpumesh_drain_assist(struct dmesh_eq *eq);
+/* The reverse path has no background thread. An awake EQ thread drains it:
+ * dpumesh_eq_drain acknowledges the doorbells that woke this EQ and interprets
+ * the published reverse entries of every stripe under the stripe locks;
+ * dpumesh_eq_arm, called when dmesh_poll_eq runs empty, arms the doorbells of
+ * the stripes this EQ owns (and the spares) and the fallback tick, so the EQ's
+ * fd wakes its thread. */
+int  dpumesh_eq_drain(struct dmesh_eq *eq);
+void dpumesh_eq_arm(struct dmesh_eq *eq);
 
 /* ====== Connection lifecycle — internal, shared by both surfaces ======
  *
