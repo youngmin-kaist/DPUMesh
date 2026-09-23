@@ -44,8 +44,6 @@ static int cleanup_ctx(dpumesh_ctx_t *ctx);
 static int drain_rev_rings_span(dpumesh_ctx_t *, uint32_t);
 static int dmesh_drain_tx_locked(dmesh_qp_t *, int);
 static int dmesh_drain_tx_upto_locked(dmesh_qp_t *, int, uint64_t);
-static int tx_timer_start(dpumesh_ctx_t *);
-static void tx_timer_stop(dpumesh_ctx_t *);
 /* ====================================================================
  * dpumesh_ctx — internal state
  * ==================================================================== */
@@ -75,8 +73,6 @@ static void tx_timer_stop(dpumesh_ctx_t *);
  * timer sleeps until the earliest deadline in the context, clamped to the wait
  * range below. */
 #define TX_TAIL_DELAY_NS        500000ull
-#define TX_TIMER_TICK_NS       1000000ull
-#define TX_TIMER_MIN_WAIT_NS     50000ull
 /* Close publishes FIN only after every submitted unit has left DPU proxy
  * custody, bounded by this deadline. */
 #define TX_CLOSE_DRAIN_DEADLINE_NS 5000000000ull
@@ -263,17 +259,6 @@ struct dpumesh_ctx {
     atomic_ullong st_rx_accept_drops;  /* accept queue full → NEW conn dropped */
     atomic_ullong st_rx_credit_drops;  /* landing offset outside the RX mapping */
 
-    /* One channel-level timer writes the readiness fd of each EQ holding a
-     * retained tail. It touches no port slot and publishes nothing. It parks
-     * while tx_armed_total is zero. */
-    pthread_t tx_timer_tid;
-    pthread_mutex_t tx_timer_lock;
-    pthread_cond_t tx_timer_cv;
-    int tx_timer_lock_initialized;
-    int tx_timer_cv_initialized;
-    int tx_timer_running;
-    int tx_timer_thread_started;
-    atomic_uint_fast32_t tx_armed_total;
 
     /* Accept queue — lock-free bounded MPMC ring. Producers are the draining
      * EQ threads (CAS on rx_enq); consumers are accepting EQ threads (CAS on
@@ -330,7 +315,9 @@ struct dpumesh_ctx {
  * A QP's transmit state is mutated only under its transmit gate: by the
  * owner's TX calls and by the EQ thread's deadline pass in dmesh_poll_eq. A
  * post leaving a fillable partial unit arms a bit on that QP's EQ and stamps a
- * deadline. The timer wakes an EQ that still holds armed bits.
+ * deadline. The EQ's tail timerfd (nested in its readiness fd) fires at the
+ * earliest deadline, so a sleeping EQ thread wakes to publish; an awake one
+ * checks the clock on every poll.
  * ==================================================================== */
 
 static void tx_error_publish(struct dmesh_port_slot *psl,
@@ -344,15 +331,34 @@ static uint64_t monotonic_ns(void)
     return (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec;
 }
 
+/* Program the EQ's tail timerfd to an absolute CLOCK_MONOTONIC deadline, or
+ * disarm it (0). Any thread may call it: timerfd_settime is atomic, and the
+ * EQ outlives every QP that can arm it. */
+static void eq_tail_timer_set(struct dmesh_eq *eq, uint64_t deadline_ns)
+{
+    if (eq->tail_fd < 0) return;
+    struct itimerspec its = {0};
+    if (deadline_ns) {
+        its.it_value.tv_sec = (time_t)(deadline_ns / 1000000000ull);
+        its.it_value.tv_nsec = (long)(deadline_ns % 1000000000ull);
+    }
+    (void)timerfd_settime(eq->tail_fd, deadline_ns ? TFD_TIMER_ABSTIME : 0, &its, NULL);
+}
+
 static inline void eq_tx_armed_set(struct dmesh_eq *eq, uint16_t port,
                                    uint64_t deadline)
 {
-    dpumesh_ctx_t *ctx = eq->ch->ctx;
+    /* Lower the cached earliest deadline; whoever lowers it programs the
+     * timer, so concurrent arms from several owners cannot leave it late. */
     uint64_t seen = atomic_load_explicit(&eq->tx_earliest_ns,
                                          memory_order_relaxed);
-    if (seen == 0 || deadline < seen)
-        atomic_store_explicit(&eq->tx_earliest_ns, deadline,
-                              memory_order_relaxed);
+    while (seen == 0 || deadline < seen) {
+        if (atomic_compare_exchange_weak_explicit(&eq->tx_earliest_ns, &seen, deadline,
+                                                  memory_order_relaxed, memory_order_relaxed)) {
+            eq_tail_timer_set(eq, deadline);
+            break;
+        }
+    }
     size_t word = (size_t)port >> 6;
     uint_fast64_t mask = (uint_fast64_t)1u << (port & 63u);
     uint_fast64_t old = atomic_fetch_or_explicit(&eq->tx_armed[word], mask,
@@ -360,15 +366,6 @@ static inline void eq_tx_armed_set(struct dmesh_eq *eq, uint16_t port,
     if ((old & mask) != 0)
         return;
     atomic_fetch_add_explicit(&eq->tx_armed_count, 1, memory_order_release);
-    uint_fast32_t before = atomic_fetch_add_explicit(&ctx->tx_armed_total, 1,
-                                                     memory_order_release);
-    /* Only a zero-to-one transition of the channel total wakes the timer. */
-    if (before == 0 && ctx->tx_timer_lock_initialized) {
-        pthread_mutex_lock(&ctx->tx_timer_lock);
-        if (ctx->tx_timer_cv_initialized)
-            pthread_cond_signal(&ctx->tx_timer_cv);
-        pthread_mutex_unlock(&ctx->tx_timer_lock);
-    }
 }
 
 static inline void eq_tx_armed_clear(struct dmesh_eq *eq, uint16_t port)
@@ -379,11 +376,11 @@ static inline void eq_tx_armed_clear(struct dmesh_eq *eq, uint16_t port)
                                                   memory_order_acq_rel);
     if (old & mask) {
         if (atomic_fetch_sub_explicit(&eq->tx_armed_count, 1,
-                                      memory_order_relaxed) == 1)
+                                      memory_order_relaxed) == 1) {
             atomic_store_explicit(&eq->tx_earliest_ns, 0,
                                   memory_order_relaxed);
-        atomic_fetch_sub_explicit(&eq->ch->ctx->tx_armed_total, 1,
-                                  memory_order_relaxed);
+            eq_tail_timer_set(eq, 0);
+        }
     }
 }
 
@@ -491,8 +488,6 @@ static int eq_tx_armed_pop_due(struct dmesh_eq *eq, uint64_t now, uint16_t *port
             }
             atomic_fetch_sub_explicit(&eq->tx_armed_count, 1,
                                       memory_order_relaxed);
-            atomic_fetch_sub_explicit(&ctx->tx_armed_total, 1,
-                                      memory_order_relaxed);
             atomic_store_explicit(&ctx->ports[candidate].tx_deadline_ns, 0,
                                   memory_order_relaxed);
             eq->tx_armed_cursor = word;
@@ -503,8 +498,9 @@ static int eq_tx_armed_pop_due(struct dmesh_eq *eq, uint64_t now, uint16_t *port
     return 0;
 }
 
-/* Recompute the cached earliest deadline from the armed bits. Bounded by the
- * armed count and run only after a publication pass. */
+/* Recompute the cached earliest deadline from the armed bits and reprogram
+ * the tail timer to it. Bounded by the armed count and run only after a
+ * publication pass. */
 static void eq_tx_armed_refresh(struct dmesh_eq *eq)
 {
     dpumesh_ctx_t *ctx = eq->ch->ctx;
@@ -512,6 +508,7 @@ static void eq_tx_armed_refresh(struct dmesh_eq *eq)
         atomic_load_explicit(&eq->tx_armed_count, memory_order_acquire);
     if (remaining == 0) {
         atomic_store_explicit(&eq->tx_earliest_ns, 0, memory_order_relaxed);
+        eq_tail_timer_set(eq, 0);
         return;
     }
     uint64_t earliest = UINT64_MAX;
@@ -531,6 +528,7 @@ static void eq_tx_armed_refresh(struct dmesh_eq *eq)
     atomic_store_explicit(&eq->tx_earliest_ns,
                           earliest == UINT64_MAX ? 0 : earliest,
                           memory_order_relaxed);
+    eq_tail_timer_set(eq, earliest == UINT64_MAX ? 0 : earliest);
 }
 
 /* Nanoseconds until this EQ's earliest retained tail must be published, or -1
@@ -549,111 +547,8 @@ static int64_t eq_tx_armed_wait_ns(struct dmesh_eq *eq, uint64_t now)
     return earliest <= now ? 0 : (int64_t)(earliest - now);
 }
 
-/* Nanoseconds until the earliest retained tail in the context comes due,
- * clamped to [TX_TIMER_MIN_WAIT_NS, TX_TIMER_TICK_NS]. */
-static uint64_t tx_timer_wait_ns(dpumesh_ctx_t *ctx, uint64_t now)
-{
-    uint64_t wait = TX_TIMER_TICK_NS;
-    pthread_mutex_lock(&ctx->eq_lock);
-    for (int i = 0; i < ctx->n_eqs; i++) {
-        struct dmesh_eq *eq = ctx->eqs[i];
-        if (!eq) continue;
-        int64_t due = eq_tx_armed_wait_ns(eq, now);
-        if (due >= 0 && (uint64_t)due < wait) wait = (uint64_t)due;
-    }
-    pthread_mutex_unlock(&ctx->eq_lock);
-    return wait < TX_TIMER_MIN_WAIT_NS ? TX_TIMER_MIN_WAIT_NS : wait;
-}
-
-/* Wake owners blocked in poll while holding a retained tail. Publishes nothing
- * and reads no port slot. */
-static void *tx_timer_fn(void *arg)
-{
-    dpumesh_ctx_t *ctx = arg;
-    for (;;) {
-        pthread_mutex_lock(&ctx->tx_timer_lock);
-        while (ctx->tx_timer_running &&
-               atomic_load_explicit(&ctx->tx_armed_total,
-                                    memory_order_acquire) == 0)
-            pthread_cond_wait(&ctx->tx_timer_cv, &ctx->tx_timer_lock);
-        int running = ctx->tx_timer_running;
-        pthread_mutex_unlock(&ctx->tx_timer_lock);
-        if (!running)
-            break;
-
-        uint64_t now = monotonic_ns();
-        uint64_t wake_ns = now + tx_timer_wait_ns(ctx, now);
-        struct timespec wake = {
-            .tv_sec = (time_t)(wake_ns / 1000000000ull),
-            .tv_nsec = (long)(wake_ns % 1000000000ull),
-        };
-        pthread_mutex_lock(&ctx->tx_timer_lock);
-        if (ctx->tx_timer_running)
-            pthread_cond_timedwait(&ctx->tx_timer_cv, &ctx->tx_timer_lock,
-                                   &wake);
-        running = ctx->tx_timer_running;
-        pthread_mutex_unlock(&ctx->tx_timer_lock);
-        if (!running)
-            break;
-
-        /* Wake only an EQ whose earliest tail has come due, once per EQ: its
-         * owner drains every expired tail in one pass. */
-        now = monotonic_ns();
-        pthread_mutex_lock(&ctx->eq_lock);
-        for (int i = 0; i < ctx->n_eqs; i++) {
-            struct dmesh_eq *eq = ctx->eqs[i];
-            if (eq && eq_tx_armed_wait_ns(eq, now) == 0) {
-                atomic_store_explicit(&eq->tx_due_hint, 1,
-                                      memory_order_release);
-                eq_notify(eq);
-            }
-        }
-        pthread_mutex_unlock(&ctx->eq_lock);
-    }
-    return NULL;
-}
-
-static int tx_timer_start(dpumesh_ctx_t *ctx)
-{
-    int rc = pthread_mutex_init(&ctx->tx_timer_lock, NULL);
-    if (rc != 0) { errno = rc; return -1; }
-    ctx->tx_timer_lock_initialized = 1;
-
-    pthread_condattr_t attr;
-    rc = pthread_condattr_init(&attr);
-    if (rc != 0) { errno = rc; return -1; }
-    rc = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
-    if (rc == 0) rc = pthread_cond_init(&ctx->tx_timer_cv, &attr);
-    pthread_condattr_destroy(&attr);
-    if (rc != 0) { errno = rc; return -1; }
-    ctx->tx_timer_cv_initialized = 1;
-
-    ctx->tx_timer_running = 1;
-    rc = pthread_create(&ctx->tx_timer_tid, NULL, tx_timer_fn, ctx);
-    if (rc != 0) {
-        ctx->tx_timer_running = 0;
-        errno = rc;
-        return -1;
-    }
-    ctx->tx_timer_thread_started = 1;
-    return 0;
-}
-
-static void tx_timer_stop(dpumesh_ctx_t *ctx)
-{
-    if (!ctx || !ctx->tx_timer_lock_initialized) return;
-    pthread_mutex_lock(&ctx->tx_timer_lock);
-    ctx->tx_timer_running = 0;
-    if (ctx->tx_timer_cv_initialized) pthread_cond_broadcast(&ctx->tx_timer_cv);
-    pthread_mutex_unlock(&ctx->tx_timer_lock);
-    if (ctx->tx_timer_thread_started) {
-        pthread_join(ctx->tx_timer_tid, NULL);
-        ctx->tx_timer_thread_started = 0;
-    }
-}
-
 /* ====================================================================
- * Completion drain threads
+ * Reverse completions
  * ==================================================================== */
 
 /* The carrier validates release tokens and publishes reverse admission credit. */
@@ -1234,7 +1129,7 @@ static int drain_rev_rings_span(dpumesh_ctx_t *ctx, uint32_t budget)
 }
 
 /* Tags of the fds nested in an EQ's epoll fd. */
-enum { EQ_TAG_EFD = 1, EQ_TAG_TICK, EQ_TAG_SPARE, EQ_TAG_STRIPE };
+enum { EQ_TAG_EFD = 1, EQ_TAG_TICK, EQ_TAG_TAIL, EQ_TAG_SPARE, EQ_TAG_STRIPE };
 #define EQ_TAG(tag, stripe) ((uint64_t)(tag) << 32 | (uint32_t)(stripe))
 
 static int epoll_nest(int epfd, int fd, uint64_t tag)
@@ -1266,6 +1161,9 @@ static void eq_ack_doorbells(struct dmesh_eq *eq)
             break;
         case EQ_TAG_TICK:
             if (read(eq->tick_fd, &v, sizeof(v)) < 0) {}
+            break;
+        case EQ_TAG_TAIL:
+            if (read(eq->tail_fd, &v, sizeof(v)) < 0) {}
             break;
         case EQ_TAG_SPARE: {
             struct epoll_event spare[DMESH_MAX_STRIPES];
@@ -1576,9 +1474,6 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *service_name,
     ctx->next_port = 1;
     ctx->port_span = DMESH_PORT_SPAN_MIN;
 
-    if (tx_timer_start(ctx) != 0)
-        goto fail;
-
     *out = ctx;
     return 0;
 
@@ -1594,9 +1489,8 @@ fail:
 static int cleanup_ctx(dpumesh_ctx_t *ctx)
 {
     if (!ctx) return 0;
-    tx_timer_stop(ctx);
     /* A failed quiesce retains exported memory and callback ownership. */
-    /* No EQ remains, and the timer thread has stopped. Reclaim deliveries
+    /* No EQ remains. Reclaim deliveries
      * the core has not handed to an application. Held public RX event leases
      * remain outside these queues and still prevent carrier destruction. */
     if (ctx->transport) {
@@ -2562,6 +2456,7 @@ dmesh_eq_t *dmesh_create_eq(dmesh_channel_t *ch) {
     eq->notify_efd = -1;
     eq->epfd       = -1;
     eq->tick_fd    = -1;
+    eq->tail_fd    = -1;
     for (uint32_t i = 0; i < DMESH_TX_READY_WORDS; i++)
         atomic_init(&eq->tx_ready[i], (uint_fast64_t)0);
     atomic_init(&eq->tx_ready_count, (uint_fast32_t)0);
@@ -2575,7 +2470,6 @@ dmesh_eq_t *dmesh_create_eq(dmesh_channel_t *ch) {
     atomic_init(&eq->tx_armed_count, (uint_fast32_t)0);
     eq->tx_armed_cursor = 0;
     atomic_init(&eq->tx_earliest_ns, (uint_fast64_t)0);
-    atomic_init(&eq->tx_due_hint, 0);
     atomic_init(&eq->ready_head, (uint_fast32_t)0);
     atomic_init(&eq->ready_tail, (uint_fast32_t)0);
     atomic_init(&eq->nqp, 0);
@@ -2597,14 +2491,16 @@ dmesh_eq_t *dmesh_create_eq(dmesh_channel_t *ch) {
     }
     eq->reg_idx = idx;
     /* The readiness fd is an epoll set: this EQ's eventfd (wakes from other
-     * threads: deliveries, accepts, the tail timer), its fallback tick, the
+     * threads: deliveries, accepts), its fallback tick, its tail deadline, the
      * spare stripes' doorbells and, once bound, its own stripes' doorbells. */
     eq->notify_efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     eq->tick_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    eq->tail_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
     eq->epfd = epoll_create1(EPOLL_CLOEXEC);
     if (eq->epfd >= 0 &&
         (epoll_nest(eq->epfd, eq->notify_efd, EQ_TAG(EQ_TAG_EFD, 0)) != 0 ||
          epoll_nest(eq->epfd, eq->tick_fd, EQ_TAG(EQ_TAG_TICK, 0)) != 0 ||
+         epoll_nest(eq->epfd, eq->tail_fd, EQ_TAG(EQ_TAG_TAIL, 0)) != 0 ||
          epoll_nest(eq->epfd, ctx->spare_epfd, EQ_TAG(EQ_TAG_SPARE, 0)) != 0)) {
         close(eq->epfd);
         eq->epfd = -1;
@@ -2630,6 +2526,7 @@ int dmesh_destroy_eq(dmesh_eq_t *eq) {
     pthread_mutex_unlock(&ctx->eq_lock);
     if (eq->epfd >= 0) close(eq->epfd);
     if (eq->tick_fd >= 0) close(eq->tick_fd);
+    if (eq->tail_fd >= 0) close(eq->tail_fd);
     if (eq->notify_efd >= 0) close(eq->notify_efd);
     free(eq->accept_spare);
     free(eq);
@@ -2983,11 +2880,9 @@ void dpumesh_publish_due_tails(struct dmesh_eq *eq) {
     dpumesh_ctx_t *ctx = eq->ch->ctx;
     if (atomic_load_explicit(&eq->tx_armed_count, memory_order_acquire) == 0)
         return;
-    /* The timer marks the EQ when a deadline may have passed. */
-    if (!atomic_load_explicit(&eq->tx_due_hint, memory_order_acquire))
-        return;
-    atomic_store_explicit(&eq->tx_due_hint, 0, memory_order_release);
     uint64_t now = monotonic_ns();
+    if (eq_tx_armed_wait_ns(eq, now) != 0)
+        return;                                   /* nothing due yet */
     uint16_t port;
     while (eq_tx_armed_pop_due(eq, now, &port)) {
         struct dmesh_port_slot *psl = &ctx->ports[port];

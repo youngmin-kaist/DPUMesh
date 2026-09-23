@@ -87,6 +87,8 @@ struct dmesh_eq {
     int                tick_fd;     /* timerfd: fallback poll while doorbell-less traffic
                                      * (custody ACKs, push batches) is outstanding */
     int                tick_armed;
+    int                tail_fd;     /* timerfd: fires at tx_earliest_ns so a sleeping EQ
+                                     * thread wakes to publish its retained tails */
     uint64_t           spin_since;  /* start of the current empty-poll spin window, 0 = none */
     /* Set when dmesh_eq_fd exposes epfd. Poll-only EQs skip eventfd writes and
      * never arm doorbells. */
@@ -110,16 +112,13 @@ struct dmesh_eq {
     atomic_uint_fast32_t tx_error_count;
     uint32_t             tx_error_cursor;
     /* QPs on this EQ holding a retained transmit tail. The owner arms a bit;
-     * this EQ's thread publishes it. The timer reads only the count. */
+     * this EQ's thread publishes it. */
     atomic_uint_fast64_t tx_armed[DMESH_TX_READY_WORDS];
     atomic_uint_fast32_t tx_armed_count;
     uint32_t             tx_armed_cursor;
     /* Earliest deadline among the armed bits; zero when nothing is
-     * retained. */
+     * retained. tail_fd is programmed to it. */
     atomic_uint_fast64_t tx_earliest_ns;
-    /* Set by the timer when a retained tail may have come due. dmesh_poll_eq
-     * consults the clock only after seeing it. */
-    atomic_int           tx_due_hint;
     /* Ready list for this EQ's conns. The drain side pushes a conn's port when
      * its inbox goes empty->non-empty; the EQ thread drains it through
      * dmesh_next_ready. MPSC: draining EQ threads produce (CAS on

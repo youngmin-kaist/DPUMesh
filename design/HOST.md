@@ -43,11 +43,13 @@ exports rcv_ring + tx_staging instead of pushing).
 
 ### Readiness: no background thread
 
-The library runs no drain thread. The EQ thread that calls `dmesh_poll_eq`
-drains every stripe in line (`dpumesh_eq_drain`), and `dmesh_eq_fd` hands out
-an epoll set that wakes it: its eventfd (deliveries from other EQ threads,
-accepts, the tail timer), the doorbells of the stripes it owns, the doorbells
-of the spare backend flows, and a fallback tick. A stripe's doorbell is the
+The library creates no thread of its own. The EQ thread that calls
+`dmesh_poll_eq` drains every stripe in line (`dpumesh_eq_drain`) and
+publishes its QPs' retained transmit tails, and `dmesh_eq_fd` hands out an
+epoll set that wakes it: its eventfd (deliveries from other EQ threads,
+accepts), a one-shot timerfd programmed to the earliest retained-tail
+deadline, the doorbells of the stripes it owns, the doorbells of the spare
+backend flows, and a fallback tick. A stripe's doorbell is the
 carrier's per-slot epoll of the wire's progress-engine notification fds
 (Comch control path, producer, and on the pull wire the reverse msgq
 completions); the core moves it from the spare set to the owning EQ at
