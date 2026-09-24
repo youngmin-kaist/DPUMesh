@@ -17,6 +17,7 @@
  *   PROBE_SKIP_COMP1=1                     first SF: thread but no doca_dpa_completion
  *   PROBE_NOSTART_THREAD1=1                first SF: thread created but not started
  *   PROBE_RELEASE_CC1=1                    destroy the first SF consumer completion before the second SF
+ *   PROBE_EU1=<id> / PROBE_EU2=<id>        pin the first / second SF thread to that EU (doca_dpa_thread_set_affinity)
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -68,6 +69,10 @@ int main(int argc, char **argv)
     STEP(doca_dpa_start(base));
     STEP(doca_dpa_device_extend(base, sfdev, &ext));
     if (!ext) { printf("no extended context, stopping\n"); return 1; }
+    { unsigned int nb = 0, ne = 0, pc = 0;
+      doca_dpa_get_total_num_eus_available(base, &nb); doca_dpa_get_total_num_eus_available(ext, &ne);
+      doca_dpa_get_num_eus_per_core(base, &pc);
+      printf("  EUs available: base %u, extended %u (eus/core %u)\n", nb, ne, pc); }
 
     int skip_thread1 = getenv("PROBE_SKIP_THREAD1") != NULL;
     int skip_msgq1 = skip_thread1 || getenv("PROBE_SKIP_MSGQ1") != NULL;
@@ -77,6 +82,13 @@ int main(int argc, char **argv)
     STEP(doca_dpa_mem_alloc(ext, 4096, &mem));
     STEP(doca_dpa_thread_create(ext, &th));
     if (th) STEP(doca_dpa_thread_set_func_arg(th, run_dma_manager, mem));
+    if (th && getenv("PROBE_EU1")) {
+        struct doca_dpa_eu_affinity *af = NULL;
+        printf("  pinning the first SF thread to EU %s\n", getenv("PROBE_EU1"));
+        STEP(doca_dpa_eu_affinity_create(ext, &af));
+        if (af) STEP(doca_dpa_eu_affinity_set(af, (unsigned)atoi(getenv("PROBE_EU1"))));
+        if (af) STEP(doca_dpa_thread_set_affinity(th, af));
+    }
     if (th && !getenv("PROBE_NOSTART_THREAD1")) STEP(doca_dpa_thread_start(th));
     else printf("  thread not started\n");
     if (getenv("PROBE_SKIP_COMP1")) printf("  doca_dpa_completion skipped\n");
@@ -138,6 +150,13 @@ int main(int argc, char **argv)
             STEP(doca_dpa_mem_alloc(ext2, 4096, &mem2));
             STEP(doca_dpa_thread_create(ext2, &th2));
             if (th2) STEP(doca_dpa_thread_set_func_arg(th2, run_dma_manager, mem2));
+            if (th2 && getenv("PROBE_EU2")) {
+                struct doca_dpa_eu_affinity *af2 = NULL;
+                printf("  pinning the second SF thread to EU %s\n", getenv("PROBE_EU2"));
+                STEP(doca_dpa_eu_affinity_create(ext2, &af2));
+                if (af2) STEP(doca_dpa_eu_affinity_set(af2, (unsigned)atoi(getenv("PROBE_EU2"))));
+                if (af2) STEP(doca_dpa_thread_set_affinity(th2, af2));
+            }
             if (th2) STEP(doca_dpa_thread_start(th2));
             STEP(doca_dpa_completion_create(ext2, 512, &comp2));
             if (comp2 && th2) STEP(doca_dpa_completion_set_thread(comp2, th2));
