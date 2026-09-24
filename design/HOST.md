@@ -92,11 +92,15 @@ init RPC; without the switch nothing activates). Verified 2026-09-24 at the
 PF's speed (1 flow 10.7 Gbps, 4 flows 32 Gbps, 64 B RTT 25 µs); the SF needs
 no EU partition of its own, only the PF's vhca does. Two firmware-level
 observations on this node: several host processes can each hold a DPA
-process on the same PF (and share one SF), but a second *distinct* SF
-extended at the same time fails its consumer-completion CQ (devx syndrome
-0x5ecb3) whatever the partition layout. So today a per-pod deployment is
-"SF for Comch, DPA on the PF" (or one shared SF); one SF per pod with its own
-DPA objects waits on that firmware limit.
+process on the same PF (and share one SF), but once a DPA thread is
+*started* on one extended SF, a comch consumer-completion CQ cannot be
+created on any other SF (devx syndrome 0x5ecb3), in the same process or
+another, whatever the partition layout; the second SF's extension, thread,
+doca_dpa_completion and msgqs still succeed, and a thread merely created
+(not started) on the first SF does not block (`scripts/probe/sf_ext_probe`,
+2026-09-24). So today a per-pod deployment is "SF for Comch, DPA on the PF"
+(or one shared SF); one SF per pod with its own DPA objects waits on that
+firmware limit.
 
 ## Limits
 
