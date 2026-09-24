@@ -7,8 +7,16 @@
  * consumer completion with the wire's parameters. HOLD=<s> keeps it all alive
  * to run a second copy against another SF.
  *
- *   sf_ext_probe [pf ibdev] [sf ibdev]     default mlx5_0 mlx5_2
+ *   sf_ext_probe [pf ibdev] [sf ibdev] [second sf ibdev]     default mlx5_0 mlx5_2
+ *   With a second SF the same process extends its one DPA process to both
+ *   SFs and builds a thread + consumer completion on each.
  *   PROBE_SDK_LOG=debug                    SDK trace (shows the devx syndrome)
+ *   PROBE_SKIP_CC1=1                       no consumer completion on the first SF
+ *   PROBE_SKIP_MSGQ1=1                     no msgqs (and no consumer completion) on the first SF
+ *   PROBE_SKIP_THREAD1=1                   first SF gets only the extension (no thread, completions, msgqs)
+ *   PROBE_SKIP_COMP1=1                     first SF: thread but no doca_dpa_completion
+ *   PROBE_NOSTART_THREAD1=1                first SF: thread created but not started
+ *   PROBE_RELEASE_CC1=1                    destroy the first SF consumer completion before the second SF
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,6 +38,10 @@ extern doca_dpa_func_t run_dma_manager;
 int main(int argc, char **argv)
 {
     const char *pf = argc > 1 ? argv[1] : "mlx5_0", *sf = argc > 2 ? argv[2] : "mlx5_2";
+    const char *sf2 = argc > 3 ? argv[3] : NULL;
+    struct doca_dev *sfdev2 = NULL; struct doca_dpa *ext2 = NULL; struct doca_dpa_thread *th2 = NULL;
+    struct doca_dpa_completion *comp2 = NULL; struct doca_comch_consumer_completion *cc2 = NULL;
+    struct doca_comch_msgq *q3 = NULL; doca_dpa_dev_uintptr_t mem2 = 0;
     struct doca_dev *pfdev = NULL, *sfdev = NULL;
     struct doca_dpa *base = NULL, *ext = NULL;
     struct doca_dpa_thread *th = NULL;
@@ -57,14 +69,23 @@ int main(int argc, char **argv)
     STEP(doca_dpa_device_extend(base, sfdev, &ext));
     if (!ext) { printf("no extended context, stopping\n"); return 1; }
 
-    printf("== thread and completions on the SF\n");
+    int skip_thread1 = getenv("PROBE_SKIP_THREAD1") != NULL;
+    int skip_msgq1 = skip_thread1 || getenv("PROBE_SKIP_MSGQ1") != NULL;
+    int skip_cc1 = skip_msgq1 || getenv("PROBE_SKIP_CC1") != NULL;
+    printf("== thread and completions on the SF%s\n", skip_thread1 ? " (skipped)" : "");
+    if (!skip_thread1) {
     STEP(doca_dpa_mem_alloc(ext, 4096, &mem));
     STEP(doca_dpa_thread_create(ext, &th));
     if (th) STEP(doca_dpa_thread_set_func_arg(th, run_dma_manager, mem));
-    if (th) STEP(doca_dpa_thread_start(th));
+    if (th && !getenv("PROBE_NOSTART_THREAD1")) STEP(doca_dpa_thread_start(th));
+    else printf("  thread not started\n");
+    if (getenv("PROBE_SKIP_COMP1")) printf("  doca_dpa_completion skipped\n");
+    else {
     STEP(doca_dpa_completion_create(ext, 512, &comp));
     if (comp && th) STEP(doca_dpa_completion_set_thread(comp, th));
     if (comp) STEP(doca_dpa_completion_start(comp));
+    }
+    }
 
     printf("== SF-registered host memory reachable from the DPA\n");
     buf = aligned_alloc(4096, 1 << 20); memset(buf, 0, 1 << 20);
@@ -80,7 +101,8 @@ int main(int argc, char **argv)
     if (ba) STEP(doca_buf_arr_start(ba));
     if (ba) STEP(doca_buf_arr_get_dpa_handle(ba, &bh));
 
-    printf("== DPA <-> CPU msgqs on the SF (one per direction, as dpa.c does)\n");
+    printf("== DPA <-> CPU msgqs on the SF (one per direction, as dpa.c does)%s\n", skip_msgq1 ? " (skipped)" : "");
+    if (!skip_msgq1) {
     STEP(doca_comch_msgq_create(sfdev, &q));
     if (q) STEP(doca_comch_msgq_set_max_num_consumers(q, 1));
     if (q) STEP(doca_comch_msgq_set_max_num_producers(q, 1));
@@ -91,17 +113,57 @@ int main(int argc, char **argv)
     if (q2) STEP(doca_comch_msgq_set_max_num_producers(q2, 1));
     if (q2) STEP(doca_comch_msgq_set_dpa_producer(q2, ext));
     if (q2) STEP(doca_comch_msgq_start(q2));
+    }
 
     printf("== consumer completion on the SF thread (wire parameters: 512 entries, %zu B imm)\n", sizeof(struct comch_msg));
-    STEP(doca_comch_consumer_completion_create(&cc));
-    if (cc) STEP(doca_comch_consumer_completion_set_max_num_recv(cc, 512));
+    if (skip_cc1) printf("  skipped\n");
+    else STEP(doca_comch_consumer_completion_create(&cc));
+    if (cc) STEP(doca_comch_consumer_completion_set_max_num_recv(cc, 64));
     if (cc) STEP(doca_comch_consumer_completion_set_imm_data_len(cc, sizeof(struct comch_msg)));
     if (cc && th) STEP(doca_comch_consumer_completion_set_dpa_thread(cc, th));
     if (cc) STEP(doca_comch_consumer_completion_start(cc));
 
+    if (sf2) {
+        if (cc && getenv("PROBE_RELEASE_CC1")) {
+            printf("== releasing the first SF consumer completion first (PROBE_RELEASE_CC1)\n");
+            doca_comch_consumer_completion_stop(cc); doca_comch_consumer_completion_destroy(cc); cc = NULL;
+        }
+        STEP(open_doca_device_with_ibdev_name((const uint8_t *)sf2, strlen(sf2), NULL, &sfdev2));
+        if (sfdev2) {
+            doca_devinfo_get_vhca_id(doca_dev_as_devinfo(sfdev2), &vhca);
+            printf("== same process: extend to a second SF %s (vhca %u)\n", sf2, vhca);
+            STEP(doca_dpa_device_extend(base, sfdev2, &ext2));
+        }
+        if (ext2) {
+            STEP(doca_dpa_mem_alloc(ext2, 4096, &mem2));
+            STEP(doca_dpa_thread_create(ext2, &th2));
+            if (th2) STEP(doca_dpa_thread_set_func_arg(th2, run_dma_manager, mem2));
+            if (th2) STEP(doca_dpa_thread_start(th2));
+            STEP(doca_dpa_completion_create(ext2, 512, &comp2));
+            if (comp2 && th2) STEP(doca_dpa_completion_set_thread(comp2, th2));
+            if (comp2) STEP(doca_dpa_completion_start(comp2));
+            STEP(doca_comch_msgq_create(sfdev2, &q3));
+            if (q3) STEP(doca_comch_msgq_set_max_num_consumers(q3, 1));
+            if (q3) STEP(doca_comch_msgq_set_max_num_producers(q3, 1));
+            if (q3) STEP(doca_comch_msgq_set_dpa_consumer(q3, ext2));
+            if (q3) STEP(doca_comch_msgq_start(q3));
+            STEP(doca_comch_consumer_completion_create(&cc2));
+            if (cc2) STEP(doca_comch_consumer_completion_set_max_num_recv(cc2, 512));
+            if (cc2) STEP(doca_comch_consumer_completion_set_imm_data_len(cc2, sizeof(struct comch_msg)));
+            if (cc2 && th2) STEP(doca_comch_consumer_completion_set_dpa_thread(cc2, th2));
+            if (cc2) STEP(doca_comch_consumer_completion_start(cc2));
+        }
+    }
+
     if (getenv("HOLD")) { printf("holding %s s\n", getenv("HOLD")); fflush(stdout); sleep(atoi(getenv("HOLD"))); }
 
     printf("== teardown\n");
+    if (cc2) { doca_comch_consumer_completion_stop(cc2); doca_comch_consumer_completion_destroy(cc2); }
+    if (q3) { doca_comch_msgq_stop(q3); doca_comch_msgq_destroy(q3); }
+    if (comp2) { doca_dpa_completion_stop(comp2); doca_dpa_completion_destroy(comp2); }
+    if (th2) doca_dpa_thread_destroy(th2);
+    if (mem2) doca_dpa_mem_free(ext2, mem2);
+    if (ext2) STEP(doca_dpa_destroy(ext2));
     if (cc) { doca_comch_consumer_completion_stop(cc); doca_comch_consumer_completion_destroy(cc); }
     if (q2) { doca_comch_msgq_stop(q2); doca_comch_msgq_destroy(q2); }
     if (q) { doca_comch_msgq_stop(q); doca_comch_msgq_destroy(q); }
