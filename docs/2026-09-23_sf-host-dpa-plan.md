@@ -158,9 +158,12 @@ Files: `src/core/carrier_push.c` (becomes wire-agnostic), `src/core/dmesh_core.c
 - Device plugin (sriov-network-device-plugin auxiliary/SF selector →
   `nvidia.com/sf`), pod spec `limits: nvidia.com/sf: 1` + `IPC_LOCK`,
   `DPUMESH_POD_IP` from the downward API; the library discovers the SF and
-  uses the fixed server name. Node prep: SF creation on the host PF, the
-  DPU worker for that PF, EU partition per SF vhca (both scriptable in the
-  DPU agent; partitions do not survive reboot).
+  uses the fixed server name. **Decided 2026-09-24 (model A):** the pod
+  also gets the host PF's rdma device and runs its DPA process there
+  (`DPUMESH_REV_PCI`); no `DPUMESH_REV_DEV`. Node prep: SF creation on the
+  host PF, the DPU worker for that PF, and one EU partition for the PF vhca
+  (per-SF partitions are unusable: an extended thread cannot run on them;
+  partitions do not survive reboot).
 - `design/HOST.md`, `.env.example`, `tests/` (slot table and quiesce logic
   host-only), `dpumesh_host` gains `--wire` so the same benchmark runs on both
   wires.

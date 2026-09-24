@@ -98,9 +98,26 @@ created on any other SF (devx syndrome 0x5ecb3), in the same process or
 another, whatever the partition layout; the second SF's extension, thread,
 doca_dpa_completion and msgqs still succeed, and a thread merely created
 (not started) on the first SF does not block (`scripts/probe/sf_ext_probe`,
-2026-09-24). So today a per-pod deployment is "SF for Comch, DPA on the PF"
-(or one shared SF); one SF per pod with its own DPA objects waits on that
-firmware limit.
+2026-09-24). One SF per pod with its own DPA objects waits on that firmware
+limit; the deployment model below is what runs today.
+
+### Deployment model: SF for Comch, DPA on the PF
+
+Each pod owns one SF of the node's host PF and uses it for Comch only
+(`DPUMESH_PCI_ADDR` = the SF; the DPU serves the same server name on every
+SF representor). Every pod creates its own DPA process on the host PF
+(`DPUMESH_REV_PCI`, `DPUMESH_WIRE=pull`, no `DPUMESH_REV_DEV`): several
+processes on one PF are verified side by side, and the SF-extended path
+brings no benefit on this firmware. Node prep is one EU partition for the PF
+vhca (`dpaeumgmt partition create --vhca_list 0 --range_eus 0-63`); SF vhcas
+need no partition and an extended thread cannot use one anyway. What a pod
+needs: its SF's uverbs device, the PF's uverbs device (the DPA process, the
+descriptor-ring window and the reverse completions live there), `IPC_LOCK`,
+and `DPUMESH_POD_IP`. All pods share the PF vhca and its EUs, so this model
+trades isolation for the host DPA; a pod that may not see the PF runs
+`DPUMESH_WIRE=push` instead (no host DPA, 14.4 vs 20.4 Gbit/s at two flows).
+Once the firmware allows a running thread per SF, `DPUMESH_REV_DEV=<own SF>`
+moves the DPA objects onto the pod's SF without a code change.
 
 ## Limits
 
