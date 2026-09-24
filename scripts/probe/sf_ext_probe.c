@@ -31,6 +31,10 @@ int main(int argc, char **argv)
     doca_log_backend_create_standard();
     struct doca_log_backend *sdk = NULL;
     if (doca_log_backend_create_with_file_sdk(stderr, &sdk) == DOCA_SUCCESS) doca_log_backend_set_sdk_level(sdk, DOCA_LOG_LEVEL_WARNING);
+    /* PROBE_SDK_LOG=debug shows the SDK's own trace (and the devx syndrome) around
+     * the completion-queue steps; quiet otherwise */
+    const char *lvl = getenv("PROBE_SDK_LOG");
+    enum doca_log_level verbose = lvl && strcmp(lvl, "debug") == 0 ? DOCA_LOG_LEVEL_DEBUG : DOCA_LOG_LEVEL_WARNING;
 
     STEP(open_doca_device_with_ibdev_name((const uint8_t *)pf, strlen(pf), NULL, &pfdev));
     STEP(open_doca_device_with_ibdev_name((const uint8_t *)sf, strlen(sf), NULL, &sfdev));
@@ -81,7 +85,7 @@ int main(int argc, char **argv)
     {
         struct doca_comch_consumer_completion *cc = NULL;
         struct doca_dpa_thread *bth = NULL; doca_dpa_dev_uintptr_t bmem = 0;
-        doca_log_backend_set_sdk_level(sdk, DOCA_LOG_LEVEL_DEBUG);
+        doca_log_backend_set_sdk_level(sdk, verbose);
         STEP(doca_comch_consumer_completion_create(&cc));
         if (cc) STEP(doca_comch_consumer_completion_set_max_num_recv(cc, 64));
         if (cc) STEP(doca_comch_consumer_completion_set_imm_data_len(cc, 16));
@@ -122,7 +126,7 @@ int main(int argc, char **argv)
     {
         struct doca_dpa_thread *t2 = NULL; doca_dpa_dev_uintptr_t m2 = 0;
         struct doca_comch_consumer_completion *cc2 = NULL; struct doca_dpa_completion *pc2 = NULL;
-        doca_log_backend_set_sdk_level(sdk, DOCA_LOG_LEVEL_DEBUG);
+        doca_log_backend_set_sdk_level(sdk, verbose);
         printf("== fresh ext thread, consumer completion first\n");
         STEP(doca_dpa_mem_alloc(ext, 4096, &m2));
         STEP(doca_dpa_thread_create(ext, &t2));
