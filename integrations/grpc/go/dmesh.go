@@ -13,14 +13,20 @@ package dmeshgo
 #include <poll.h>
 #include <time.h>
 #include <unistd.h>
+// The EQ fd is a level-triggered epoll set: dmesh_poll_eq running to empty
+// settles it, so the wake needs no read.
+#define DMESH_GO_EVENTS 64
+static dmesh_event_t *dmesh_go_events_alloc(void) { return calloc(DMESH_GO_EVENTS, sizeof(dmesh_event_t)); }
+// Release by token so no Go pointer crosses into C on the receive path.
+static void dmesh_go_release(dmesh_channel_t *s, int32_t token) {
+    dmesh_event_t e = { ._rx_token = token };
+    dmesh_release_rx_buffer(s, &e);
+}
 static void dmesh_go_wait_fd(int fd, int64_t timeout_ns) {
     if (timeout_ns < 0 || timeout_ns > 1000000) timeout_ns = 1000000;
     struct timespec timeout = {0, timeout_ns};
     struct pollfd event = {.fd = fd, .events = POLLIN};
-    if (ppoll(&event, 1, &timeout, NULL) > 0 && (event.revents & POLLIN)) {
-        uint64_t count;
-        while (read(fd, &count, sizeof(count)) == sizeof(count)) {}
-    }
+    (void)ppoll(&event, 1, &timeout, NULL);
 }
 */
 import "C"
@@ -70,12 +76,39 @@ type transport struct {
 	mu       sync.Mutex
 	ch       *C.dmesh_channel_t
 	eq       *C.dmesh_eq_t
+	events   *C.dmesh_event_t // C-allocated poll buffer (no Go pointer crosses into C)
 	conns    map[*C.dmesh_qp_t]*Conn
 	listener *Listener
-	changed  chan struct{}
+	changed  chan struct{} // transport-wide edges: accepts, errors, close
 	stop     chan struct{}
 	done     chan struct{}
 	err      error
+	parked   int           // goroutines waiting on an edge (under mu)
+	parkedCh chan struct{} // signalled when parked goes 0 -> 1
+}
+
+// park registers the caller as a waiter so the sleeper polls on its behalf,
+// then waits for ch or the deadline. Called with t.mu held; returns with it
+// released.
+func (t *transport) park(ch <-chan struct{}, deadline time.Time) {
+	t.parked++
+	if t.parked == 1 {
+		select {
+		case t.parkedCh <- struct{}{}:
+		default:
+		}
+	}
+	t.mu.Unlock()
+	_ = waitChange(ch, deadline)
+	t.mu.Lock()
+	t.parked--
+	t.mu.Unlock()
+}
+
+// rxEvent is the Go copy of one RECV lease.
+type rxEvent struct {
+	buf   []byte
+	token C.int32_t
 }
 
 var process struct {
@@ -99,17 +132,95 @@ func openTransport() (*transport, error) {
 		C.dmesh_destroy_channel(ch)
 		return nil, fmt.Errorf("dmesh: create EQ: %w", err)
 	}
-	t := &transport{ch: ch, eq: eq, conns: make(map[*C.dmesh_qp_t]*Conn),
-		changed: make(chan struct{}), stop: make(chan struct{}), done: make(chan struct{})}
+	t := &transport{ch: ch, eq: eq, events: C.dmesh_go_events_alloc(), conns: make(map[*C.dmesh_qp_t]*Conn),
+		changed: make(chan struct{}), stop: make(chan struct{}), done: make(chan struct{}),
+		parkedCh: make(chan struct{}, 1)}
 	process.t = t
 	go t.poll()
 	return t, nil
 }
 
+// pollLocked drains one EQ batch into the connections' inboxes and wakes
+// only the connections (and the listener) that received something. Called
+// under t.mu by whichever goroutine needs progress: a reader with an empty
+// inbox, a writer out of TX credit, or the background sleeper. Returns the
+// number of events, or -1 once the transport has failed.
+func (t *transport) pollLocked() int {
+	if t.eq == nil || t.err != nil {
+		return -1
+	}
+	count, err := C.dmesh_poll_eq(t.eq, t.events, C.DMESH_GO_EVENTS)
+	if count < 0 {
+		t.err = err
+		t.notify()
+		for _, c := range t.conns {
+			c.notify()
+		}
+		return -1
+	}
+	events := unsafe.Slice(t.events, int(count))
+	var reject map[*C.dmesh_qp_t]bool
+	accepted := false
+	for i := range events {
+		ev := &events[i]
+		c := t.conns[ev.qp]
+		if ev._type == C.DMESH_EVENT_CONN_REQ && c == nil {
+			if t.listener == nil || t.listener.closed {
+				if reject == nil {
+					reject = make(map[*C.dmesh_qp_t]bool)
+				}
+				reject[ev.qp] = true
+				continue
+			}
+			c = newConn(t, ev.qp, t.listener.addr, &net.TCPAddr{Port: int(ev.qp.remote_port)})
+			t.conns[ev.qp] = c
+			t.listener.pending = append(t.listener.pending, c)
+			accepted = true
+		}
+		if c == nil {
+			if ev._rx_token >= 0 {
+				C.dmesh_go_release(t.ch, ev._rx_token)
+			}
+			continue
+		}
+		switch ev._type {
+		case C.DMESH_EVENT_RECV:
+			c.rx = append(c.rx, rxEvent{buf: unsafe.Slice((*byte)(unsafe.Pointer(ev.buf)), int(ev.len)), token: ev._rx_token})
+			c.wake = true
+		case C.DMESH_EVENT_RECV_FIN:
+			c.eof = true
+			c.wake = true
+		case C.DMESH_EVENT_TX_ERROR:
+			c.err = syscall.EIO
+			c.wake = true
+		case C.DMESH_EVENT_TX_READY:
+			c.wake = true
+		}
+	}
+	for qp := range reject {
+		C.dmesh_abort_qp(qp)
+	}
+	for _, c := range t.conns {
+		if c.wake {
+			c.wake = false
+			c.notify()
+		}
+	}
+	if accepted {
+		t.notify()
+	}
+	return int(count)
+}
+
+// poll is the background sleeper. The data path polls in line from Read and
+// Write, so this goroutine only works while some goroutine is parked on an
+// edge (a reader with nothing to read, a writer out of credit, an Accept):
+// it then blocks on the EQ fd and runs one batch per wake. With nobody
+// parked it stays off the EQ, which keeps it from contending with the active
+// goroutines during the library's spin window.
 func (t *transport) poll() {
 	defer close(t.done)
 	fd := C.dmesh_eq_fd(t.eq)
-	var events [64]C.dmesh_event_t
 	for {
 		select {
 		case <-t.stop:
@@ -117,57 +228,27 @@ func (t *transport) poll() {
 		default:
 		}
 		t.mu.Lock()
-		count, err := C.dmesh_poll_eq(t.eq, &events[0], C.int(len(events)))
-		if count < 0 {
-			t.err = err
-			t.notify()
+		if t.parked == 0 {
 			t.mu.Unlock()
-			return
-		}
-		// A QP pointer can occur more than once in this batch. Destruction is
-		// deferred until every event has been dispatched.
-		var reject map[*C.dmesh_qp_t]bool
-		for i := 0; i < int(count); i++ {
-			ev := events[i]
-			c := t.conns[ev.qp]
-			if ev._type == C.DMESH_EVENT_CONN_REQ && c == nil {
-				if t.listener == nil || t.listener.closed {
-					if reject == nil {
-						reject = make(map[*C.dmesh_qp_t]bool)
-					}
-					reject[ev.qp] = true
-					continue
-				}
-				c = newConn(t, ev.qp, t.listener.addr, &net.TCPAddr{Port: int(ev.qp.remote_port)})
-				t.conns[ev.qp] = c
-				t.listener.pending = append(t.listener.pending, c)
+			select {
+			case <-t.parkedCh:
+			case <-t.stop:
+				return
 			}
-			if c == nil {
-				C.dmesh_release_rx_buffer(t.ch, &ev)
-				continue
-			}
-			switch ev._type {
-			case C.DMESH_EVENT_RECV:
-				c.rx = append(c.rx, ev)
-			case C.DMESH_EVENT_RECV_FIN:
-				c.eof = true
-			case C.DMESH_EVENT_TX_ERROR:
-				c.err = syscall.EIO
-			}
-		}
-		for qp := range reject {
-			C.dmesh_abort_qp(qp)
-		}
-		if count != 0 {
-			t.notify()
-		}
-		deadline := C.dmesh_eq_next_deadline_ns(t.eq)
-		t.mu.Unlock()
-		if count == C.int(len(events)) {
 			continue
 		}
-		// EQ readiness wakes immediately; the bounded timeout also observes stop
-		// and supports poll-only EQs when eventfd creation was unavailable.
+		count := t.pollLocked()
+		var deadline C.int64_t = -1
+		if count >= 0 {
+			deadline = C.dmesh_eq_next_deadline_ns(t.eq)
+		}
+		t.mu.Unlock()
+		if count < 0 {
+			return
+		}
+		if count == C.DMESH_GO_EVENTS {
+			continue
+		}
 		C.dmesh_go_wait_fd(fd, deadline)
 	}
 }
@@ -192,6 +273,9 @@ func CloseTransport() error {
 	// this state until CloseTransport can retry successfully.
 	t.err = net.ErrClosed
 	t.notify()
+	for _, c := range t.conns {
+		c.notify()
+	}
 	t.mu.Unlock()
 	select {
 	case <-t.stop:
@@ -211,6 +295,8 @@ func CloseTransport() error {
 		return err
 	}
 	t.ch = nil
+	C.free(unsafe.Pointer(t.events))
+	t.events = nil
 	process.t = nil
 	return nil
 }
@@ -220,15 +306,29 @@ type Conn struct {
 	qp              *C.dmesh_qp_t
 	local, remote   net.Addr
 	readMu, writeMu sync.Mutex
-	rx              []C.dmesh_event_t
+	rx              []rxEvent
 	pos             int
 	rd, wd          time.Time
 	closed, eof     bool
 	err             error
+	changed         chan struct{} // this connection's edges (under t.mu)
+	wake            bool          // set by pollLocked, consumed before it returns
 }
 
 func newConn(t *transport, qp *C.dmesh_qp_t, local, remote net.Addr) *Conn {
-	return &Conn{t: t, qp: qp, local: local, remote: remote}
+	return &Conn{t: t, qp: qp, local: local, remote: remote, changed: make(chan struct{})}
+}
+func (c *Conn) edge() chan struct{} {
+	if c.changed == nil {
+		c.changed = make(chan struct{})
+	}
+	return c.changed
+}
+func (c *Conn) notify() {
+	if c.changed != nil {
+		close(c.changed)
+	}
+	c.changed = make(chan struct{})
 }
 func waitChange(ch <-chan struct{}, deadline time.Time) error {
 	if deadline.IsZero() {
@@ -266,14 +366,16 @@ func (c *Conn) Read(p []byte) (int, error) {
 			t.mu.Unlock()
 			return 0, timeoutError{}
 		}
+		if len(c.rx) == 0 && c.err == nil && !c.eof {
+			t.pollLocked() // in line: no hand-off from a poller goroutine
+		}
 		if len(c.rx) != 0 {
 			ev := &c.rx[0]
-			src := unsafe.Slice((*byte)(unsafe.Pointer(ev.buf)), int(ev.len))
-			n := copy(p, src[c.pos:])
+			n := copy(p, ev.buf[c.pos:])
 			c.pos += n
-			if c.pos == len(src) {
-				C.dmesh_release_rx_buffer(t.ch, ev)
-				c.rx[0] = C.dmesh_event_t{}
+			if c.pos == len(ev.buf) {
+				C.dmesh_go_release(t.ch, ev.token)
+				c.rx[0] = rxEvent{}
 				c.rx = c.rx[1:]
 				c.pos = 0
 			}
@@ -291,11 +393,9 @@ func (c *Conn) Read(p []byte) (int, error) {
 			t.mu.Unlock()
 			return 0, err
 		}
-		ch, deadline := t.changed, c.rd
-		t.mu.Unlock()
 		// Re-read state under the lock: a deadline extension can race the
 		// previous timer firing, and close/error takes precedence on wake.
-		_ = waitChange(ch, deadline)
+		t.park(c.edge(), c.rd)
 	}
 }
 func (c *Conn) Write(p []byte) (int, error) {
@@ -329,12 +429,15 @@ func (c *Conn) Write(p []byte) (int, error) {
 				t.mu.Unlock()
 				return written, err
 			}
-			ch, deadline := t.changed, c.wd
-			t.mu.Unlock()
-			_ = waitChange(ch, deadline)
+			// Out of TX credit: reclaim custody ACKs in line before parking.
+			if t.pollLocked() > 0 {
+				t.mu.Unlock()
+				continue
+			}
+			t.park(c.edge(), c.wd)
 			continue
 		}
-		C.memcpy(dst, unsafe.Pointer(&p[written]), C.size_t(n))
+		copy(unsafe.Slice((*byte)(dst), n), p[written:written+n])
 		rc, err := C.dmesh_post_send(c.qp, dst, C.uint32_t(n))
 		if rc != 0 {
 			t.mu.Unlock()
@@ -351,9 +454,10 @@ func (c *Conn) closeLocked(abort bool) error {
 	}
 	c.closed = true
 	for i := range c.rx {
-		C.dmesh_release_rx_buffer(c.t.ch, &c.rx[i])
+		C.dmesh_go_release(c.t.ch, c.rx[i].token)
 	}
 	c.rx = nil
+	c.notify()
 	delete(c.t.conns, c.qp)
 	var rc C.int
 	var err error
@@ -379,7 +483,7 @@ func (c *Conn) SetDeadline(d time.Time) error {
 		return net.ErrClosed
 	}
 	c.rd, c.wd = d, d
-	c.t.notify()
+	c.notify()
 	return nil
 }
 func (c *Conn) SetReadDeadline(d time.Time) error {
@@ -389,7 +493,7 @@ func (c *Conn) SetReadDeadline(d time.Time) error {
 		return net.ErrClosed
 	}
 	c.rd = d
-	c.t.notify()
+	c.notify()
 	return nil
 }
 func (c *Conn) SetWriteDeadline(d time.Time) error {
@@ -399,7 +503,7 @@ func (c *Conn) SetWriteDeadline(d time.Time) error {
 		return net.ErrClosed
 	}
 	c.wd = d
-	c.t.notify()
+	c.notify()
 	return nil
 }
 
@@ -516,9 +620,7 @@ func (l *Listener) Accept() (net.Conn, error) {
 			l.t.mu.Unlock()
 			return nil, err
 		}
-		ch := l.t.changed
-		l.t.mu.Unlock()
-		<-ch
+		l.t.park(l.t.changed, time.Time{})
 	}
 }
 func (l *Listener) Close() error {
