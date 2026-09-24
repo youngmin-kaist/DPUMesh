@@ -1,4 +1,4 @@
-#include "src/core/carrier_push_logic.h"
+#include "src/core/carrier_logic.h"
 #include <assert.h>
 #include <stdio.h>
 int main(void)
@@ -25,7 +25,7 @@ int main(void)
     assert(carrier_window_release(&w, 999) == -1);
     assert(carrier_window_release(&w, 384) == 0);
     assert(carrier_window_advance(&w, &seq, &bytes) && seq == 3 && bytes == 600);
-    assert(carrier_window_add(&w, 1 + WIRE_PUSH_DESC_N, 0, 8) == 0);  /* slot reuse after retirement */
+    assert(carrier_window_add(&w, 1 + CHANNEL_DESC_N, 0, 8) == 0);  /* slot reuse after retirement */
     puts("carrier push logic: chunking and release window: PASS");
     return 0;
 }

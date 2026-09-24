@@ -10,8 +10,8 @@
  * Modes (DMESH_MODE):
  *   sink   count every forward DMA completion (host -> DPU) and drop the bytes
  *   echo   ...and send the same bytes back (DPU -> host). How they go back is
- *          the wire's business: a push batch (push wire) or a descriptor the
- *          host's DPA pulls (pull wire, CLIENT / BACKEND_PULL flows).
+ *          the channel layer's business: a push batch (dpu-dma reverse path) or a descriptor the
+ *          host's DPA pulls (host-dpa reverse path, CLIENT / BACKEND_PULL flows).
  *
  * Output, once a second:
  *   TOTAL(N conns): recv: <DMA/s> (<Gbps>), sent: <push/s> (<Gbps>), ...
@@ -152,7 +152,7 @@ struct slot {
     size_t rx_len;
     uint32_t rx_wm;             /* bytes consumed up to here; published to the DPA gate */
     int rx_wm_dirty;
-    struct tx_ring tx;          /* reverse staging (we write, the wire sends) */
+    struct tx_ring tx;          /* reverse staging (we write, the channel layer sends) */
     uint64_t segs, bytes;       /* forward completions consumed by this slot */
     uint64_t pushes, push_bytes;/* reverse batches published (echo) */
 };

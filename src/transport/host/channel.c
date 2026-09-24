@@ -1,4 +1,4 @@
-#include "wire_push.h"
+#include "channel.h"
 
 #include <errno.h>
 #include <stddef.h>
@@ -7,6 +7,8 @@
 #include <time.h>
 
 #include <doca_buf_array.h>
+#include <doca_comch_consumer.h>
+#include <doca_comch_producer.h>
 #include <doca_error.h>
 #include <doca_log.h>
 #include <doca_pe.h>
@@ -28,11 +30,11 @@
  * client and producer setup, the forward descriptor ring, buffer registration
  * and the export messages.
  *
- * Push wire: the DPU's DMA engine lands reverse batches in the window's slot
+ * Dpu-dma reverse path: the DPU's DMA engine lands reverse batches in the window's slot
  * ring + data ring; the host polls the slots and publishes a consumption
  * cursor the DPU pulls.
  *
- * Pull wire (DPUMESH_WIRE=pull): the reverse path mirrors the forward one. Per
+ * Host-dpa reverse path (DPUMESH_REVERSE=host-dpa): the reverse path mirrors the forward one. Per
  * connection the DPU exports its descriptor ring (rcv_ring) and tx_staging
  * (EXPORT_RCV_RING); the host imports both on the DPA device, runs one DPA
  * thread with the same poll_desc_ring kernel the DPU uses, and that thread
@@ -42,36 +44,36 @@
  * never overwrites bytes the host still holds.
  */
 
-DOCA_LOG_REGISTER(WIRE);
+DOCA_LOG_REGISTER(CHANNEL);
 
 /* dpacc host stubs (dpa_kernel.a) */
 extern doca_dpa_func_t thread_init_rpc;
 extern struct doca_dpa_app *DPU_mesh_dpa_app;
 
-_Static_assert(WIRE_PUSH_DESC_N == DMESH_PUSH_DESC_N, "push slot count");
-_Static_assert(WIRE_PUSH_DATA_OFF == DMESH_PUSH_DATA_OFF, "push data offset");
-_Static_assert(WIRE_PUSH_WINDOW == BUFFER_SIZE, "push window");
-_Static_assert(WIRE_MODE_CLIENT_PULL == DMESH_FLOW_MODE_CLIENT, "client mode");
-_Static_assert(WIRE_MODE_BACKEND == DMESH_FLOW_MODE_BACKEND, "backend mode");
-_Static_assert(WIRE_MODE_INGRESS_PUSH == DMESH_FLOW_MODE_INGRESS_PUSH, "ingress push mode");
-_Static_assert(WIRE_MODE_BACKEND_PULL == DMESH_FLOW_MODE_BACKEND_PULL, "backend pull mode");
+_Static_assert(CHANNEL_DESC_N == DMESH_PUSH_DESC_N, "push slot count");
+_Static_assert(CHANNEL_DATA_OFF == DMESH_PUSH_DATA_OFF, "push data offset");
+_Static_assert(CHANNEL_WINDOW == BUFFER_SIZE, "push window");
+_Static_assert(CHANNEL_MODE_CLIENT_HOST_DPA == DMESH_FLOW_MODE_CLIENT, "client host-dpa mode");
+_Static_assert(CHANNEL_MODE_BACKEND_DPU_DMA == DMESH_FLOW_MODE_BACKEND, "backend mode");
+_Static_assert(CHANNEL_MODE_CLIENT_DPU_DMA == DMESH_FLOW_MODE_INGRESS_PUSH, "ingress push mode");
+_Static_assert(CHANNEL_MODE_BACKEND_HOST_DPA == DMESH_FLOW_MODE_BACKEND_PULL, "backend host-dpa mode");
 
-#define WIRE_RING_SIZE 1024u            /* Forward ring depth of the host library */
-#define WIRE_REV_READY_MS 5000          /* Wait for the DPU's EXPORT_RCV_RING */
-#define WIRE_RD_POS_BATCH (64u * 1024u) /* Pull: bytes released between rd_pos publications */
-#define WIRE_DEFAULT_REV_PCI "0b:00.0"  /* Pull: the host PF that runs the DPA process */
-#define WIRE_CTX_STOP_SPINS 100000      /* Bound on progressing a stopping ctx to IDLE */
+#define CHANNEL_RING_SIZE 1024u            /* Forward ring depth of the host library */
+#define CHANNEL_REV_READY_MS 5000          /* Wait for the DPU's EXPORT_RCV_RING */
+#define CHANNEL_RD_POS_BATCH (64u * 1024u) /* Pull: bytes released between rd_pos publications */
+#define CHANNEL_DEFAULT_REV_PCI "0b:00.0"  /* Pull: the host PF that runs the DPA process */
+#define CHANNEL_CTX_STOP_SPINS 100000      /* Bound on progressing a stopping ctx to IDLE */
 
-struct wire_dev {
+struct channel_dev {
 	struct doca_dev *dev;               /* Comch / forward device */
-	int pull;                           /* Nonzero: the pull wire */
+	int host_dpa;                       /* Nonzero: the host-dpa reverse path */
 	struct objects *rev;                /* Pull: the DPA device (rev->dev, rev->dpa_pool->dpa) */
 	struct dmesh_dpa_thread_pool *rev_pool;
 	struct doca_dev *base_dev;          /* Pull: the PF that hosts the DPA process */
 	struct doca_dpa *base_dpa;          /* == rev_pool->dpa unless extended to an SF */
 };
 
-struct wire_mem {
+struct channel_mem {
 	struct doca_mmap *mmap;
 	void *buf;
 	size_t bytes;
@@ -79,16 +81,16 @@ struct wire_mem {
 	doca_dpa_dev_mmap_t dpa_rev;        /* Pull: handle on the DPA device (the host DPA writes the RX region) */
 };
 
-struct wire_conn {
+struct channel_conn {
 	struct objects *objs;
-	struct wire_dev *dev;
+	struct channel_dev *dev;
 	doca_dpa_dev_mmap_t tx_dpa;
 	volatile struct dmesh_push_desc *descs;
 	volatile struct dmesh_push_cursor *cursor;
 	size_t data_size;
 	uint64_t expected;                  /* Push: next batch sequence */
 	int closed;
-	/* pull */
+	/* host-dpa reverse path */
 	struct dmesh_conn *rc;              /* The reverse connection on the DPA device */
 	struct objects *ro;                 /* rc's objects: the shared DPA device + this connection's own PE
 	                                     * (a progress engine is single-owner; each slot polls its own) */
@@ -96,7 +98,7 @@ struct wire_conn {
 	struct doca_mmap *ring_mmap;        /* Imported DPU rcv_ring */
 	uint64_t rx_seq;                    /* Segments delivered to the carrier */
 	uint64_t consumed_seq;              /* Segments the carrier released */
-	uint32_t seg_end[WIRE_PUSH_DESC_N]; /* End offset of delivered segment seq % N */
+	uint32_t seg_end[CHANNEL_DESC_N]; /* End offset of delivered segment seq % N */
 	uint32_t rd_pos;                    /* Kernel read watermark last published */
 	uint64_t rd_published_bytes;
 	uint64_t rd_published_seq;
@@ -166,15 +168,15 @@ static void wait_ctx_idle(struct doca_ctx *ctx, struct doca_pe *pe)
 	enum doca_ctx_states state;
 	int spins = 0;
 
-	while (spins++ < WIRE_CTX_STOP_SPINS &&
+	while (spins++ < CHANNEL_CTX_STOP_SPINS &&
 	       doca_ctx_get_state(ctx, &state) == DOCA_SUCCESS &&
 	       state != DOCA_CTX_STATE_IDLE)
 		(void)doca_pe_progress(pe);
 }
 
-int wire_dev_pull(const struct wire_dev *dev)
+int channel_dev_host_dpa(const struct channel_dev *dev)
 {
-	return dev != NULL && dev->pull;
+	return dev != NULL && dev->host_dpa;
 }
 
 /*
@@ -184,13 +186,13 @@ int wire_dev_pull(const struct wire_dev *dev)
  */
 
 /**
- * Bring up the DPA process for the pull wire
+ * Bring up the DPA process for the host-dpa reverse path
  *
  * The DPA runs on a different host function than Comch (the DPU worker's DPA
  * counts against the Comch function); that PF's vhca must be in a DPA EU
  * partition. Several processes may each create their own DPA process on it.
  *
- * With DPUMESH_REV_DEV the process is extended to an SF (doca_dpa_device_extend);
+ * With DPUMESH_HOST_DPA_DEV the process is extended to an SF (doca_dpa_device_extend);
  * the SF then owns every DPA object and the kernel switches to it with
  * doca_dpa_dev_device_set (thread arg dpa_dev, also in the init RPC). On this
  * node's firmware processes may share one SF, but a second distinct SF extended
@@ -200,14 +202,14 @@ int wire_dev_pull(const struct wire_dev *dev)
  * @pci [in]: Comch PCI address (for the log line)
  * @return: DOCA_SUCCESS on success and DOCA_ERROR otherwise
  */
-static doca_error_t open_pull_dpa(struct wire_dev *dev, const char *pci)
+static doca_error_t open_pull_dpa(struct channel_dev *dev, const char *pci)
 {
-	const char *rev_pci = getenv("DPUMESH_REV_PCI");
-	const char *rev_dev = getenv("DPUMESH_REV_DEV");
+	const char *rev_pci = getenv("DPUMESH_HOST_DPA_PCI");
+	const char *rev_dev = getenv("DPUMESH_HOST_DPA_DEV");
 	doca_error_t result;
 
 	if (rev_pci == NULL || *rev_pci == '\0')
-		rev_pci = WIRE_DEFAULT_REV_PCI;
+		rev_pci = CHANNEL_DEFAULT_REV_PCI;
 
 	dev->rev = calloc(1, sizeof(*dev->rev));
 	dev->rev_pool = calloc(1, sizeof(*dev->rev_pool));
@@ -226,7 +228,7 @@ static doca_error_t open_pull_dpa(struct wire_dev *dev, const char *pci)
 	if (result == DOCA_SUCCESS)
 		result = doca_dpa_start(dev->base_dpa);
 	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to start the DPA process on %s with error = %s (EU partition for its vhca? DPUMESH_REV_PCI?)",
+		DOCA_LOG_ERR("Failed to start the DPA process on %s with error = %s (EU partition for its vhca? DPUMESH_HOST_DPA_PCI?)",
 			     rev_pci, doca_error_get_name(result));
 		return result;
 	}
@@ -234,7 +236,7 @@ static doca_error_t open_pull_dpa(struct wire_dev *dev, const char *pci)
 	if (rev_dev == NULL || *rev_dev == '\0') {
 		dev->rev->dev = dev->base_dev;
 		dev->rev_pool->dpa = dev->base_dpa;
-		DOCA_LOG_INFO("pull wire: host DPA on %s, Comch on %s", rev_pci, pci);
+		DOCA_LOG_INFO("host-dpa reverse path: host DPA on %s, Comch on %s", rev_pci, pci);
 		return DOCA_SUCCESS;
 	}
 
@@ -246,14 +248,14 @@ static doca_error_t open_pull_dpa(struct wire_dev *dev, const char *pci)
 			     doca_error_get_name(result));
 		return result;
 	}
-	DOCA_LOG_INFO("pull wire: DPA process on %s extended to %s, Comch on %s", rev_pci, rev_dev, pci);
+	DOCA_LOG_INFO("host-dpa reverse path: DPA process on %s extended to %s, Comch on %s", rev_pci, rev_dev, pci);
 	return DOCA_SUCCESS;
 }
 
-int wire_dev_open(const char *pci, struct wire_dev **out)
+int channel_dev_open(const char *pci, struct channel_dev **out)
 {
-	struct wire_dev *dev;
-	const char *wire;
+	struct channel_dev *dev;
+	const char *reverse;
 	doca_error_t result;
 	int saved;
 
@@ -269,9 +271,9 @@ int wire_dev_open(const char *pci, struct wire_dev **out)
 		goto fail;
 	}
 
-	wire = getenv("DPUMESH_WIRE");
-	dev->pull = wire != NULL && strcmp(wire, "pull") == 0;
-	if (dev->pull) {
+	reverse = getenv("DPUMESH_REVERSE");
+	dev->host_dpa = reverse != NULL && strcmp(reverse, "host-dpa") == 0;
+	if (dev->host_dpa) {
 		result = open_pull_dpa(dev, pci);
 		if (result != DOCA_SUCCESS)
 			goto fail;
@@ -282,12 +284,12 @@ int wire_dev_open(const char *pci, struct wire_dev **out)
 
 fail:
 	saved = error_number(result);
-	wire_dev_close(dev);
+	channel_dev_close(dev);
 	errno = saved;
 	return -1;
 }
 
-void wire_dev_close(struct wire_dev *dev)
+void channel_dev_close(struct channel_dev *dev)
 {
 	if (dev == NULL)
 		return;
@@ -321,7 +323,7 @@ void wire_dev_close(struct wire_dev *dev)
  * Allocate a buffer and register it with one or two devices
  *
  * Like alloc_buffer_and_set_mmap, with the DPA device added as a second device
- * on the pull wire (the host DPA writes the RX region; the TX pool stays on
+ * on the host-dpa reverse path (the host DPA writes the RX region; the TX pool stays on
  * the forward device only).
  *
  * @mmap [out]: Created mmap
@@ -392,10 +394,10 @@ out:
 	return result;
 }
 
-int wire_mem_alloc(struct wire_dev *dev, size_t bytes, struct wire_mem **out)
+int channel_mem_alloc(struct channel_dev *dev, size_t bytes, struct channel_mem **out)
 {
-	struct wire_mem *mem;
-	struct doca_dev *dev2 = dev->pull ? dev->rev->dev : NULL;
+	struct channel_mem *mem;
+	struct doca_dev *dev2 = dev->host_dpa ? dev->rev->dev : NULL;
 	doca_error_t result;
 
 	mem = calloc(1, sizeof(*mem));
@@ -427,12 +429,12 @@ free_mem:
 	return -1;
 }
 
-void *wire_mem_base(const struct wire_mem *mem)
+void *channel_mem_base(const struct channel_mem *mem)
 {
 	return mem != NULL ? mem->buf : NULL;
 }
 
-void wire_mem_free(struct wire_mem *mem)
+void channel_mem_free(struct channel_mem *mem)
 {
 	if (mem == NULL)
 		return;
@@ -443,7 +445,7 @@ void wire_mem_free(struct wire_mem *mem)
 
 /*
  * ---------------------------------------------------------------------------
- * Pull wire: the reverse DPA thread of one connection
+ * Host-dpa reverse path: the reverse DPA thread of one connection
  * ---------------------------------------------------------------------------
  */
 
@@ -457,7 +459,7 @@ void wire_mem_free(struct wire_mem *mem)
  *
  * @conn [in]: Connection being torn down
  */
-static void pull_teardown(struct wire_conn *conn)
+static void host_dpa_teardown(struct channel_conn *conn)
 {
 	struct dmesh_conn *rc = conn->rc;
 
@@ -501,7 +503,7 @@ static void pull_teardown(struct wire_conn *conn)
  * @mode [in]: Flow mode (for the log line)
  * @return: DOCA_SUCCESS on success and DOCA_ERROR otherwise
  */
-static doca_error_t pull_wait_export(struct wire_conn *conn, uint32_t mode)
+static doca_error_t host_dpa_wait_export(struct channel_conn *conn, uint32_t mode)
 {
 	struct objects *objs = conn->objs;
 	struct timespec start, now;
@@ -514,9 +516,9 @@ static doca_error_t pull_wait_export(struct wire_conn *conn, uint32_t mode)
 			return DOCA_ERROR_CONNECTION_ABORTED;
 		clock_gettime(CLOCK_MONOTONIC, &now);
 		elapsed_ms = (now.tv_sec - start.tv_sec) * 1000 + (now.tv_nsec - start.tv_nsec) / 1000000;
-		if (elapsed_ms > WIRE_REV_READY_MS) {
+		if (elapsed_ms > CHANNEL_REV_READY_MS) {
 			DOCA_LOG_ERR("No EXPORT_RCV_RING from the DPU within %d ms (does the DPU serve mode %u as an export flow?)",
-				     WIRE_REV_READY_MS, mode);
+				     CHANNEL_REV_READY_MS, mode);
 			return DOCA_ERROR_TIME_OUT;
 		}
 	}
@@ -534,10 +536,10 @@ static doca_error_t pull_wait_export(struct wire_conn *conn, uint32_t mode)
  * @conn [in]: Connection
  * @return: DOCA_SUCCESS on success and DOCA_ERROR otherwise
  */
-static doca_error_t pull_import_exports(struct wire_conn *conn)
+static doca_error_t host_dpa_import_exports(struct channel_conn *conn)
 {
 	struct objects *objs = conn->objs;
-	struct wire_dev *dev = conn->dev;
+	struct channel_dev *dev = conn->dev;
 	doca_error_t result;
 
 	result = doca_mmap_create_from_export(NULL, objs->rev_msg.tx_desc, objs->rev_msg.tx_desc_len,
@@ -558,9 +560,9 @@ static doca_error_t pull_import_exports(struct wire_conn *conn)
  * @conn [in]: Connection
  * @return: DOCA_SUCCESS on success and DOCA_ERROR otherwise
  */
-static doca_error_t pull_create_thread(struct wire_conn *conn)
+static doca_error_t host_dpa_create_thread(struct channel_conn *conn)
 {
-	struct wire_dev *dev = conn->dev;
+	struct channel_dev *dev = conn->dev;
 	struct dmesh_conn *rc;
 	doca_error_t result;
 
@@ -611,7 +613,7 @@ static doca_error_t pull_create_thread(struct wire_conn *conn)
 		return result;
 	}
 
-	/* completed-segment ring the recv callback fills; drained by wire_conn_rx_next */
+	/* completed-segment ring the recv callback fills; drained by channel_conn_rx_next */
 	rc->recv_segs = calloc(DMESH_RECV_SEG_MAX, sizeof(struct dmesh_recv_seg));
 	if (rc->recv_segs == NULL)
 		return DOCA_ERROR_NO_MEMORY;
@@ -626,9 +628,9 @@ static doca_error_t pull_create_thread(struct wire_conn *conn)
  * @cfg [in]: Connection configuration (RX window)
  * @return: DOCA_SUCCESS on success and DOCA_ERROR otherwise
  */
-static doca_error_t pull_run_thread(struct wire_conn *conn, const struct wire_conn_config *cfg)
+static doca_error_t host_dpa_run_thread(struct channel_conn *conn, const struct channel_conn_config *cfg)
 {
-	struct wire_dev *dev = conn->dev;
+	struct channel_dev *dev = conn->dev;
 	struct dmesh_conn *rc = conn->rc;
 	struct dpa_thread_arg arg;
 	doca_dpa_dev_comch_consumer_completion_t consumer_comp;
@@ -663,7 +665,7 @@ static doca_error_t pull_run_thread(struct wire_conn *conn, const struct wire_co
 	}
 
 	/* destination: this connection's window data area, same layout as push */
-	dst = (uint8_t *)cfg->rx->buf + cfg->rx_offset + WIRE_PUSH_DATA_OFF;
+	dst = (uint8_t *)cfg->rx->buf + cfg->rx_offset + CHANNEL_DATA_OFF;
 	arg = (struct dpa_thread_arg) {
 		.dpa_consumer_comp = consumer_comp,
 		.dpa_producer_comp = producer_comp,
@@ -695,7 +697,7 @@ static doca_error_t pull_run_thread(struct wire_conn *conn, const struct wire_co
 }
 
 /**
- * Set up the reverse path of one connection on the pull wire
+ * Set up the reverse path of one connection on the host-dpa reverse path
  *
  * Mirror of the DPU's per-connection setup (and of the legacy host worker's
  * setup_reverse_dpa): import the DPU's exports, bind a DPA thread + msgq to
@@ -705,20 +707,20 @@ static doca_error_t pull_run_thread(struct wire_conn *conn, const struct wire_co
  * @cfg [in]: Connection configuration
  * @return: DOCA_SUCCESS on success and DOCA_ERROR otherwise
  */
-static doca_error_t pull_setup(struct wire_conn *conn, const struct wire_conn_config *cfg)
+static doca_error_t host_dpa_setup(struct channel_conn *conn, const struct channel_conn_config *cfg)
 {
 	doca_error_t result;
 
-	result = pull_wait_export(conn, cfg->mode);
+	result = host_dpa_wait_export(conn, cfg->mode);
 	if (result != DOCA_SUCCESS)
 		return result;
-	result = pull_import_exports(conn);
+	result = host_dpa_import_exports(conn);
 	if (result != DOCA_SUCCESS)
 		return result;
-	result = pull_create_thread(conn);
+	result = host_dpa_create_thread(conn);
 	if (result != DOCA_SUCCESS)
 		return result;
-	return pull_run_thread(conn, cfg);
+	return host_dpa_run_thread(conn, cfg);
 }
 
 /*
@@ -737,12 +739,12 @@ static doca_error_t pull_setup(struct wire_conn *conn, const struct wire_conn_co
  *
  * @conn [in]: Connection
  */
-static void conn_teardown(struct wire_conn *conn)
+static void conn_teardown(struct channel_conn *conn)
 {
 	struct objects *objs = conn->objs;
 
-	if (conn->dev != NULL && conn->dev->pull)
-		pull_teardown(conn);
+	if (conn->dev != NULL && conn->dev->host_dpa)
+		host_dpa_teardown(conn);
 
 	if (objs->producer != NULL) {
 		(void)doca_ctx_stop(doca_comch_producer_as_ctx(objs->producer));
@@ -784,9 +786,9 @@ static void conn_teardown(struct wire_conn *conn)
 	free(conn);
 }
 
-int wire_conn_open(struct wire_dev *dev, const struct wire_conn_config *cfg, struct wire_conn **out)
+int channel_conn_open(struct channel_dev *dev, const struct channel_conn_config *cfg, struct channel_conn **out)
 {
-	struct wire_conn *conn;
+	struct channel_conn *conn;
 	struct objects *objs;
 	doca_error_t result;
 
@@ -820,7 +822,7 @@ int wire_conn_open(struct wire_dev *dev, const struct wire_conn_config *cfg, str
 		goto fail;
 
 	/* forward ring and the shared regions as this connection's sndbuf/rcvbuf */
-	if (setup_dma_ring(objs, WIRE_RING_SIZE) != 0) {
+	if (setup_dma_ring(objs, CHANNEL_RING_SIZE) != 0) {
 		result = DOCA_ERROR_NO_MEMORY;
 		goto fail;
 	}
@@ -829,7 +831,7 @@ int wire_conn_open(struct wire_dev *dev, const struct wire_conn_config *cfg, str
 	objs->sndbuf.size = cfg->tx->bytes;
 	objs->rcvbuf.mmap = cfg->rx->mmap;
 	objs->rcvbuf.buf = (char *)cfg->rx->buf + cfg->rx_offset;
-	objs->rcvbuf.size = WIRE_PUSH_WINDOW;
+	objs->rcvbuf.size = CHANNEL_WINDOW;
 
 	/* push layout of the window: slot ring, cursor, data ring */
 	memset(objs->rcvbuf.buf, 0, DMESH_PUSH_DATA_OFF);
@@ -838,7 +840,7 @@ int wire_conn_open(struct wire_dev *dev, const struct wire_conn_config *cfg, str
 	conn->cursor->consumed_seq = 0;
 	conn->cursor->consumed_bytes = 0;
 	conn->cursor->magic = DMESH_PUSH_FC_MAGIC;
-	conn->data_size = WIRE_PUSH_WINDOW - DMESH_PUSH_DATA_OFF;
+	conn->data_size = CHANNEL_WINDOW - DMESH_PUSH_DATA_OFF;
 	conn->expected = 1;
 	conn->tx_dpa = cfg->tx->dpa;
 
@@ -847,8 +849,8 @@ int wire_conn_open(struct wire_dev *dev, const struct wire_conn_config *cfg, str
 	if (result != DOCA_SUCCESS)
 		goto fail;
 
-	if (dev->pull) {
-		result = pull_setup(conn, cfg);
+	if (dev->host_dpa) {
+		result = host_dpa_setup(conn, cfg);
 		if (result != DOCA_SUCCESS)
 			goto fail;
 	}
@@ -862,7 +864,7 @@ fail:
 	return -1;
 }
 
-void wire_conn_close(struct wire_conn *conn)
+void channel_conn_close(struct channel_conn *conn)
 {
 	if (conn == NULL || conn->closed)
 		return;
@@ -870,7 +872,7 @@ void wire_conn_close(struct wire_conn *conn)
 	conn_teardown(conn);
 }
 
-int wire_conn_progress(struct wire_conn *conn)
+int channel_conn_progress(struct channel_conn *conn)
 {
 	(void)doca_pe_progress(conn->objs->pe);
 	if (conn->objs->producer_pe != NULL)
@@ -890,10 +892,10 @@ int wire_conn_progress(struct wire_conn *conn)
  * Collect the progress engines of a connection
  *
  * @conn [in]: Connection
- * @pes [out]: Engines (WIRE_CONN_FDS at most)
+ * @pes [out]: Engines (CHANNEL_CONN_FDS at most)
  * @return: Number of engines
  */
-static int conn_engines(struct wire_conn *conn, struct doca_pe **pes)
+static int conn_engines(struct channel_conn *conn, struct doca_pe **pes)
 {
 	int n = 0;
 
@@ -905,9 +907,9 @@ static int conn_engines(struct wire_conn *conn, struct doca_pe **pes)
 	return n;
 }
 
-int wire_conn_fds(struct wire_conn *conn, int *fds, int max)
+int channel_conn_fds(struct channel_conn *conn, int *fds, int max)
 {
-	struct doca_pe *pes[WIRE_CONN_FDS];
+	struct doca_pe *pes[CHANNEL_CONN_FDS];
 	doca_notification_handle_t handle;
 	int n = conn_engines(conn, pes);
 	int i, count = 0;
@@ -920,9 +922,9 @@ int wire_conn_fds(struct wire_conn *conn, int *fds, int max)
 	return count;
 }
 
-int wire_conn_arm(struct wire_conn *conn)
+int channel_conn_arm(struct channel_conn *conn)
 {
-	struct doca_pe *pes[WIRE_CONN_FDS];
+	struct doca_pe *pes[CHANNEL_CONN_FDS];
 	int n = conn_engines(conn, pes);
 	int i;
 	doca_error_t result;
@@ -938,9 +940,9 @@ int wire_conn_arm(struct wire_conn *conn)
 	return 0;
 }
 
-void wire_conn_clear(struct wire_conn *conn, int fd)
+void channel_conn_clear(struct channel_conn *conn, int fd)
 {
-	struct doca_pe *pes[WIRE_CONN_FDS];
+	struct doca_pe *pes[CHANNEL_CONN_FDS];
 	doca_notification_handle_t handle;
 	int n = conn_engines(conn, pes);
 	int i;
@@ -959,7 +961,7 @@ void wire_conn_clear(struct wire_conn *conn, int fd)
  * ---------------------------------------------------------------------------
  */
 
-uint32_t wire_conn_ring_free(const struct wire_conn *conn)
+uint32_t channel_conn_ring_free(const struct channel_conn *conn)
 {
 	struct dma_ring *ring = conn->objs->dma_ring;
 	uint64_t used = ring->head - ring->ctrl->consumer_head;
@@ -967,7 +969,7 @@ uint32_t wire_conn_ring_free(const struct wire_conn *conn)
 	return used >= ring->size ? 0 : (uint32_t)(ring->size - used);
 }
 
-uint64_t wire_conn_post(struct wire_conn *conn, uint64_t addr, uint32_t bytes)
+uint64_t channel_conn_post(struct channel_conn *conn, uint64_t addr, uint32_t bytes)
 {
 	struct dma_ring *ring = conn->objs->dma_ring;
 	struct dma_desc *desc = get_next_dma_desc(ring); /* the caller checked ring_free */
@@ -979,7 +981,7 @@ uint64_t wire_conn_post(struct wire_conn *conn, uint64_t addr, uint32_t bytes)
 	return ring->head;
 }
 
-uint64_t wire_conn_consumed(const struct wire_conn *conn)
+uint64_t channel_conn_consumed(const struct channel_conn *conn)
 {
 	return conn->objs->dma_ring->ctrl->consumer_head;
 }
@@ -991,9 +993,9 @@ uint64_t wire_conn_consumed(const struct wire_conn *conn)
  */
 
 /**
- * Pull wire: next completed DPA copy, delivered in order
+ * Host-dpa reverse path: next completed DPA copy, delivered in order
  *
- * The carrier tracks at most WIRE_PUSH_DESC_N live batches, so a segment is
+ * The carrier tracks at most CHANNEL_DESC_N live batches, so a segment is
  * handed out only while that many are outstanding.
  *
  * @conn [in]: Connection
@@ -1002,13 +1004,13 @@ uint64_t wire_conn_consumed(const struct wire_conn *conn)
  * @len [out]: Length
  * @return: 1 with a batch, 0 when none, -1 on a malformed segment
  */
-static int pull_rx_next(struct wire_conn *conn, uint64_t *seq, uint32_t *pos, uint32_t *len)
+static int host_dpa_rx_next(struct channel_conn *conn, uint64_t *seq, uint32_t *pos, uint32_t *len)
 {
 	struct dmesh_conn *rc = conn->rc;
 	struct dmesh_recv_seg *seg;
 	uint32_t p, n;
 
-	if (rc->recv_seg_cnt == 0 || conn->rx_seq - conn->consumed_seq >= WIRE_PUSH_DESC_N)
+	if (rc->recv_seg_cnt == 0 || conn->rx_seq - conn->consumed_seq >= CHANNEL_DESC_N)
 		return 0;
 
 	seg = &rc->recv_segs[rc->recv_seg_head];
@@ -1020,20 +1022,20 @@ static int pull_rx_next(struct wire_conn *conn, uint64_t *seq, uint32_t *pos, ui
 		return -1;
 
 	conn->rx_seq++;
-	conn->seg_end[conn->rx_seq % WIRE_PUSH_DESC_N] = p + n;
+	conn->seg_end[conn->rx_seq % CHANNEL_DESC_N] = p + n;
 	*seq = conn->rx_seq;
 	*pos = p;
 	*len = n;
 	return 1;
 }
 
-int wire_conn_rx_next(struct wire_conn *conn, uint64_t *seq, uint32_t *pos, uint32_t *len)
+int channel_conn_rx_next(struct channel_conn *conn, uint64_t *seq, uint32_t *pos, uint32_t *len)
 {
 	volatile struct dmesh_push_desc *desc;
 	uint32_t p, n;
 
 	if (conn->rc != NULL)
-		return pull_rx_next(conn, seq, pos, len);
+		return host_dpa_rx_next(conn, seq, pos, len);
 
 	/* push: the next slot the DPU's DMA engine filled */
 	desc = &conn->descs[conn->expected % DMESH_PUSH_DESC_N];
@@ -1052,27 +1054,27 @@ int wire_conn_rx_next(struct wire_conn *conn, uint64_t *seq, uint32_t *pos, uint
 }
 
 /**
- * Pull wire: publish the kernel's read watermark
+ * Host-dpa reverse path: publish the kernel's read watermark
  *
  * The watermark is the end of the newest released segment (copies land in
  * order; the kernel wraps a copy that would cross the end, so bytes do not map
  * linearly to offsets). The device-side write is coalesced: the kernel gates
  * only when fewer than 3 x 8064 B of the 1 MiB ring look free, so publishing
- * every WIRE_RD_POS_BATCH bytes keeps it far from the gate.
+ * every CHANNEL_RD_POS_BATCH bytes keeps it far from the gate.
  *
  * @conn [in]: Connection
  * @seq [in]: Newest released batch
  * @bytes [in]: Bytes released so far
  */
-static void pull_rx_consumed(struct wire_conn *conn, uint64_t seq, uint64_t bytes)
+static void host_dpa_rx_consumed(struct channel_conn *conn, uint64_t seq, uint64_t bytes)
 {
 	if (seq <= conn->consumed_seq)
 		return;
 	conn->consumed_seq = seq;
-	conn->rd_pos = conn->seg_end[seq % WIRE_PUSH_DESC_N] % (uint32_t)conn->data_size;
+	conn->rd_pos = conn->seg_end[seq % CHANNEL_DESC_N] % (uint32_t)conn->data_size;
 
-	if (bytes - conn->rd_published_bytes < WIRE_RD_POS_BATCH &&
-	    seq - conn->rd_published_seq < WIRE_PUSH_DESC_N / 2)
+	if (bytes - conn->rd_published_bytes < CHANNEL_RD_POS_BATCH &&
+	    seq - conn->rd_published_seq < CHANNEL_DESC_N / 2)
 		return;
 	conn->rd_published_bytes = bytes;
 	conn->rd_published_seq = seq;
@@ -1081,10 +1083,10 @@ static void pull_rx_consumed(struct wire_conn *conn, uint64_t seq, uint64_t byte
 				  &conn->rd_pos, sizeof(conn->rd_pos));
 }
 
-void wire_conn_rx_consumed(struct wire_conn *conn, uint64_t seq, uint64_t bytes)
+void channel_conn_rx_consumed(struct channel_conn *conn, uint64_t seq, uint64_t bytes)
 {
 	if (conn->rc != NULL) {
-		pull_rx_consumed(conn, seq, bytes);
+		host_dpa_rx_consumed(conn, seq, bytes);
 		return;
 	}
 	/* push: the DPU pulls this cursor for its flow control */

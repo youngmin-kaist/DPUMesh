@@ -4,8 +4,8 @@ The host library (`libdpumesh.so.5`) is the DPUmesh native API and core; the
 DPU is the unmodified DPUMesh data plane and its embedded Linkerd proxy. The two
 meet at DPUMesh's host wire: one Comch connection per stream, a forward
 descriptor ring per connection and, back to the host, either the DPA-free push
-channel (`DPUMESH_WIRE=push`, the default) or the pull wire
-(`DPUMESH_WIRE=pull`): a host-owned DPA thread per connection that mirrors the
+channel (`DPUMESH_REVERSE=dpu-dma`, the default) or the host-dpa reverse path
+(`DPUMESH_REVERSE=host-dpa`): a host-owned DPA thread per connection that mirrors the
 forward path, polling the DPU's descriptor ring and copying its tx_staging
 into the connection's window (flow modes CLIENT / BACKEND_PULL, so the DPU
 exports rcv_ring + tx_staging instead of pushing).
@@ -18,17 +18,17 @@ exports rcv_ring + tx_staging instead of pushing).
   the EQ readiness fd (doorbells, fallback tick, spin window).
 - `src/core/native_transport.h`: the private carrier contract
   (open, connect, submit, poll, release, wait, resolve, disconnect, close).
-- `src/core/carrier_push.c`: the carrier over the DPUMesh wire.
-- `src/transport/host/wire_push.[ch]`: the wire layer, the only host-library
+- `src/core/carrier.c`: the carrier over the channel layer.
+- `src/transport/host/channel.[ch]`: the channel layer, the only host-library
   files that include DOCA headers; they call the transport's host sources
   (`src/transport/{common,host}/*.c`) for device open, Comch client and
   producer setup, ring setup and the export message. `src/core` includes only
-  `wire_push.h`, which exposes no DOCA types.
-- `src/transport/host/wire_host_stubs.c`: two server-only symbols the shared
+  `channel.h`, which exposes no DOCA types.
+- `src/transport/host/host_stubs.c`: two server-only symbols the shared
   transport sources reference but a host never executes.
 - `src/facade`: the native API and the POSIX preload shim.
 
-## Mapping onto the wire
+## Mapping onto the channel layer
 
 | API | Carrier |
 |---|---|
@@ -50,8 +50,8 @@ epoll set that wakes it: its eventfd (deliveries from other EQ threads,
 accepts), a one-shot timerfd programmed to the earliest retained-tail
 deadline, the doorbells of the stripes it owns, the doorbells of the spare
 backend flows, and a fallback tick. A stripe's doorbell is the
-carrier's per-slot epoll of the wire's progress-engine notification fds
-(Comch control path, producer, and on the pull wire the reverse msgq
+carrier's per-slot epoll of the channel layer's progress-engine notification fds
+(Comch control path, producer, and on the host-dpa reverse path the reverse msgq
 completions); the core moves it from the spare set to the owning EQ at
 connect/accept and back at free.
 
@@ -70,9 +70,9 @@ doorbells and arms them before the real sleep. With the window at 50 us the
 threads (20.4 vs 18.9 Gbps, 64 B RTT 26.4 vs 27.0 us) with fewer threads and
 less host CPU (4 flows: 197% vs 255%).
 
-### Pull wire
+### Host-dpa reverse path
 
-`DPUMESH_REV_PCI` names the host function whose DPA runs the reverse threads
+`DPUMESH_HOST_DPA_PCI` names the host function whose DPA runs the reverse threads
 (default `0b:00.0`); it must differ from the Comch function (flexio allows one
 process per function) and its vhca needs a DPA EU partition on the DPU
 (`dpaeumgmt partition create --vhca_list 0 --range_eus 0-63`, or
@@ -83,8 +83,8 @@ as msgq messages and the application's releases feed the kernel's staging gate
 (`rd_pos`, published every 64 KiB). The dpacc host stub is compiled with
 `-fPIC` so `dpa_kernel.a` links into the shared library (root `Makefile`).
 A host SF cannot create the DPA process itself (refused by the firmware), but
-`DPUMESH_REV_DEV=<ibdev of the SF>` runs the official extended-context flow:
-the process is created on the PF (`DPUMESH_REV_PCI`), `doca_dpa_device_extend`
+`DPUMESH_HOST_DPA_DEV=<ibdev of the SF>` runs the official extended-context flow:
+the process is created on the PF (`DPUMESH_HOST_DPA_PCI`), `doca_dpa_device_extend`
 extends it to the SF, every DPA object (thread, completions, msgqs, mmap
 handles, buf_arr) is created on the SF, and the kernel switches to it with
 `doca_dpa_dev_device_set` (the thread argument's `dpa_dev`, also passed to the
@@ -106,7 +106,7 @@ limit; the deployment model below is what runs today.
 Each pod owns one SF of the node's host PF and uses it for Comch only
 (`DPUMESH_PCI_ADDR` = the SF; the DPU serves the same server name on every
 SF representor). Every pod creates its own DPA process on the host PF
-(`DPUMESH_REV_PCI`, `DPUMESH_WIRE=pull`, no `DPUMESH_REV_DEV`): several
+(`DPUMESH_HOST_DPA_PCI`, `DPUMESH_REVERSE=host-dpa`, no `DPUMESH_HOST_DPA_DEV`): several
 processes on one PF are verified side by side, and the SF-extended path
 brings no benefit on this firmware. Node prep is one EU partition for the PF
 vhca (`dpaeumgmt partition create --vhca_list 0 --range_eus 0-63`); SF vhcas
@@ -115,8 +115,8 @@ needs: its SF's uverbs device, the PF's uverbs device (the DPA process, the
 descriptor-ring window and the reverse completions live there), `IPC_LOCK`,
 and `DPUMESH_POD_IP`. All pods share the PF vhca and its EUs, so this model
 trades isolation for the host DPA; a pod that may not see the PF runs
-`DPUMESH_WIRE=push` instead (no host DPA, 14.4 vs 20.4 Gbit/s at two flows).
-Once the firmware allows a running thread per SF, `DPUMESH_REV_DEV=<own SF>`
+`DPUMESH_REVERSE=dpu-dma` instead (no host DPA, 14.4 vs 20.4 Gbit/s at two flows).
+Once the firmware allows a running thread per SF, `DPUMESH_HOST_DPA_DEV=<own SF>`
 moves the DPA objects onto the pod's SF without a code change.
 
 ## Limits
@@ -124,7 +124,7 @@ moves the DPA objects onto the pod's SF without a code change.
 A DPU worker serves 32 flows (one DPA thread each), shared by client QPs and
 the backend pool. Opening a QP performs a Comch handshake and takes
 milliseconds. `dmesh_msg_max` is 8192; a descriptor larger than 8064 bytes is
-split on the wire and reassembled by the stream.
+split by the channel layer and reassembled by the stream.
 
 ## DPU worker mode
 

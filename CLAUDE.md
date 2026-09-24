@@ -16,7 +16,7 @@ Three trees at the repo root:
   archives every program links. This is the main work. It is the **only tree
   that includes DOCA headers**, split by side: `common/` (buffers, rings,
   objects, Comch framing, DPA management), `dpu/` (Comch server, DMA push
-  engine), `host/` (Comch client, the host library's wire layer), `device/`
+  engine), `host/` (Comch client, the host library's channel layer), `device/`
   (DPA kernel). Every subdirectory is on the include path, so sources use
   bare `#include "x.h"` and a header lives next to its `.c`.
 - `apps/` — the programs over the transport, each its own meson project
@@ -28,7 +28,7 @@ Three trees at the repo root:
   `hpack-h2-bench/`.
 - `src/core/`, `src/facade/`, `include/dpumesh/` — the DOCA-free host library
   (`libdpumesh.so.5`, root `Makefile`): core, carrier, native/preload façades.
-  `src/core` sees the transport only through `src/transport/host/wire_push.h`.
+  `src/core` sees the transport only through `src/transport/host/channel.h`.
 - `linkerd2-proxy/` — a git submodule (Rust), a fork carrying a `dmesh_doca`
   transport crate + `doca` cargo features that plug the DMA path into
   Linkerd's outbound stack. Built and run separately on the DPU.
@@ -48,7 +48,7 @@ meson setup build && ninja -C build    # DPU: build/dpumesh_dpu + dpumesh_v0_dpu
 ```
 
 The transport build produces only archives: `libdmesh_common.a`,
-`libdmesh_dpu.a`, `libdmesh_host.a`, `libdmesh_wire.a` (+ `device/dpa_kernel.a`
+`libdmesh_dpu.a`, `libdmesh_host.a`, `libdmesh_channel.a` (+ `device/dpa_kernel.a`
 from dpacc). `src/transport/meson.build` is the one list of transport
 sources; the root `Makefile` (host library) and `apps/dmeshgo/hostlib/meson.build`
 (old Go lib) repeat only the DPA-free host subset they need. Every program in
@@ -97,7 +97,7 @@ completion and, in echo mode, pushing the bytes back. Both print a per-second
 line and a `*_BENCH_DONE` summary; the DPU's `recv … DMA/s` is the ground truth
 for "DMAs per second" (the host library coalesces small posts into 8064-byte
 units, so the host's estimate only holds for >= 8 KiB messages). Restart the
-DPU side per run. `DPUMESH_WIRE=pull DPUMESH_REV_PCI=0b:00.0` on the host
+DPU side per run. `DPUMESH_REVERSE=host-dpa DPUMESH_HOST_DPA_PCI=0b:00.0` on the host
 switches the reverse path to the host-owned DPA (needs the vhca-0 EU
 partition); 4-connection 8 KiB echo goes from 17.8 to 31 Gbps each way.
 Recipe and numbers in `bench-results/2026-09-22_dma-bench-api-port.md`. The original pair lives on as

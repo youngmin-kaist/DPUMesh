@@ -5,7 +5,7 @@
  * consumption is reported as custody ACKs and each push batch as one receive
  * event; releases advance the per-connection cursor in order.
  *
- * Each slot owns an epoll fd holding its connection's doorbells (the wire's
+ * Each slot owns an epoll fd holding its connection's doorbells (the channel layer's
  * progress-engine notification fds); the core nests it in the owning EQ's fd.
  * Custody ACKs (the DPU's consumer_head) and push-wire batches have no
  * doorbell, so stripe_arm asks for periodic polling while either is possible. */
@@ -14,8 +14,8 @@
 #endif
 #include "native_transport.h"
 #include "service_registry.h"
-#include "wire_push.h"
-#include "carrier_push_logic.h"
+#include "channel.h"
+#include "carrier_logic.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <pthread.h>
@@ -43,7 +43,7 @@ struct slot {
     int armed;                         /* doorbells requested, not yet acknowledged */
     int state, backend, claimed, service_id;
     uint16_t port, peer;
-    struct wire_conn *conn;
+    struct channel_conn *conn;
     struct ticket tickets[TICKETS];
     uint32_t t_head, t_tail;
     int fin_pending, peer_gone_reported;
@@ -51,8 +51,8 @@ struct slot {
     struct carrier_rx_window window;
 };
 struct dmesh_native_transport {
-    struct wire_dev *dev;
-    struct wire_mem *tx, *rx;
+    struct channel_dev *dev;
+    struct channel_mem *tx, *rx;
     struct dmesh_service_registry registry;
     char server[64], workload[64];
     uint32_t pod_ip;
@@ -78,25 +78,25 @@ static int slot_open(struct dmesh_native_transport *t, struct slot *s, uint32_t 
 {
     const struct dmesh_service *svc = dmesh_registry_id(&t->registry, service_id);
     if (!svc) { errno = ENOENT; return -1; }
-    /* pull wire: the same roles on the export flow modes */
-    if (wire_dev_pull(t->dev))
-        mode = mode == WIRE_MODE_BACKEND ? WIRE_MODE_BACKEND_PULL : WIRE_MODE_CLIENT_PULL;
-    struct wire_conn_config cfg = {
+    /* host-dpa reverse path: the same roles on the export flow modes */
+    if (channel_dev_host_dpa(t->dev))
+        mode = mode == CHANNEL_MODE_BACKEND_DPU_DMA ? CHANNEL_MODE_BACKEND_HOST_DPA : CHANNEL_MODE_CLIENT_HOST_DPA;
+    struct channel_conn_config cfg = {
         .server = t->server, .workload = t->workload,
         .src_ip = t->pod_ip, .dst_ip = svc->ipv4, .src_port = port, .dst_port = svc->port,
         .mode = mode, .tx = t->tx, .rx = t->rx,
-        .rx_offset = (size_t)slot_index(t, s) * WIRE_PUSH_WINDOW,
+        .rx_offset = (size_t)slot_index(t, s) * CHANNEL_WINDOW,
     };
-    struct wire_conn *c = NULL;
-    if (wire_conn_open(t->dev, &cfg, &c) != 0) return -1;
-    int fds[WIRE_CONN_FDS], nfd = wire_conn_fds(c, fds, WIRE_CONN_FDS);
+    struct channel_conn *c = NULL;
+    if (channel_conn_open(t->dev, &cfg, &c) != 0) return -1;
+    int fds[CHANNEL_CONN_FDS], nfd = channel_conn_fds(c, fds, CHANNEL_CONN_FDS);
     for (int i = 0; i < nfd; ++i) {
         struct epoll_event ev = { .events = EPOLLIN, .data.fd = fds[i] };
         if (epoll_ctl(s->epfd, EPOLL_CTL_ADD, fds[i], &ev) != 0) TRACE("slot %d doorbell %d not registered (%s)", slot_index(t, s), fds[i], strerror(errno));
     }
     s->armed = 0;
     s->conn = c; s->port = port; s->service_id = service_id;
-    s->backend = mode == WIRE_MODE_BACKEND || mode == WIRE_MODE_BACKEND_PULL;
+    s->backend = mode == CHANNEL_MODE_BACKEND_DPU_DMA || mode == CHANNEL_MODE_BACKEND_HOST_DPA;
     s->peer = s->backend ? (uint16_t)(1 + slot_index(t, s)) : (uint16_t)(UPORT_BASE + slot_index(t, s));
     s->t_head = s->t_tail = 0; s->fin_pending = 0; s->peer_gone_reported = 0; s->claimed = 0;
     s->fin_seq = 0; s->rx_seq = 0;
@@ -110,9 +110,9 @@ static void slot_close(struct dmesh_native_transport *t, struct slot *s)
 {
     (void)t;
     if (s->conn) {
-        int fds[WIRE_CONN_FDS], nfd = wire_conn_fds(s->conn, fds, WIRE_CONN_FDS);
+        int fds[CHANNEL_CONN_FDS], nfd = channel_conn_fds(s->conn, fds, CHANNEL_CONN_FDS);
         for (int i = 0; i < nfd; ++i) (void)epoll_ctl(s->epfd, EPOLL_CTL_DEL, fds[i], NULL);
-        wire_conn_close(s->conn); s->conn = NULL;
+        channel_conn_close(s->conn); s->conn = NULL;
     }
     s->armed = 0;
     s->state = SLOT_CLOSED;
@@ -147,7 +147,7 @@ static void backend_maintain(struct dmesh_native_transport *t)
         }
         if (spare >= t->backend_pool || total >= t->backend_max || !free_slot) break;
         uint16_t up = next_uport(t);
-        if (!up || slot_open(t, free_slot, WIRE_MODE_BACKEND, up, t->service_id) != 0) {
+        if (!up || slot_open(t, free_slot, CHANNEL_MODE_BACKEND_DPU_DMA, up, t->service_id) != 0) {
             fprintf(stderr, "dpumesh: backend flow not opened (%s)\n", strerror(errno));
             break;
         }
@@ -187,17 +187,17 @@ int dmesh_native_open(struct dmesh_native_transport **out, struct dmesh_native_c
         if (!svc) { errno = ENOENT; goto fail; }
         t->service_id = svc->id;
     }
-    if (wire_dev_open(pci, &t->dev) != 0) goto fail;
-    if (wire_mem_alloc(t->dev, cfg->bytes, &t->tx) != 0) goto fail;
-    if (wire_mem_alloc(t->dev, (size_t)SLOTS * WIRE_PUSH_WINDOW, &t->rx) != 0) goto fail;
+    if (channel_dev_open(pci, &t->dev) != 0) goto fail;
+    if (channel_mem_alloc(t->dev, cfg->bytes, &t->tx) != 0) goto fail;
+    if (channel_mem_alloc(t->dev, (size_t)SLOTS * CHANNEL_WINDOW, &t->rx) != 0) goto fail;
     if (t->service_id != DMESH_SVC_NONE) {
         backend_maintain(t);
         int opened = 0;
         for (int i = 0; i < SLOTS; ++i) opened += t->slots[i].state == SLOT_OPEN;
         if (!opened) { errno = EIO; goto fail; }
     }
-    cfg->tx = wire_mem_base(t->tx); cfg->rx = wire_mem_base(t->rx);
-    cfg->rx_bytes = (size_t)SLOTS * WIRE_PUSH_WINDOW;
+    cfg->tx = channel_mem_base(t->tx); cfg->rx = channel_mem_base(t->rx);
+    cfg->rx_bytes = (size_t)SLOTS * CHANNEL_WINDOW;
     cfg->pod_id = t->pod_id; cfg->service_id = t->service_id; cfg->stripes = SLOTS;
     *out = t;
     return 0;
@@ -211,8 +211,8 @@ int dmesh_native_close(struct dmesh_native_transport *t)
     if (!t) return 0;
     for (int i = 0; i < SLOTS; ++i) if (t->slots[i].conn) slot_close(t, &t->slots[i]);
     for (int i = 0; i < SLOTS; ++i) if (t->slots[i].epfd >= 0) close(t->slots[i].epfd);
-    wire_mem_free(t->rx); wire_mem_free(t->tx);
-    wire_dev_close(t->dev);
+    channel_mem_free(t->rx); channel_mem_free(t->tx);
+    channel_dev_close(t->dev);
     free(t);
     return 0;
 }
@@ -223,7 +223,7 @@ int dmesh_native_connect(struct dmesh_native_transport *t, uint16_t port, int se
     struct slot *s = NULL;
     for (int i = 0; i < SLOTS; ++i) if (t->slots[i].state == SLOT_FREE) { s = &t->slots[i]; break; }
     if (!s) { pthread_mutex_unlock(&t->lock); errno = ENOSPC; return -1; }
-    int rc = slot_open(t, s, WIRE_MODE_INGRESS_PUSH, port, service_id);
+    int rc = slot_open(t, s, CHANNEL_MODE_CLIENT_DPU_DMA, port, service_id);
     pthread_mutex_unlock(&t->lock);
     return rc;
 }
@@ -256,10 +256,10 @@ int dmesh_native_submit(struct dmesh_native_transport *t, const sw_descriptor_t 
         uint32_t piece[2];
         unsigned n = carrier_chunks(d->body_len, piece);
         uint32_t queued = (s->t_tail - s->t_head);
-        if (wire_conn_ring_free(s->conn) < n || queued >= TICKETS) { errno = EAGAIN; rc = -1; }
+        if (channel_conn_ring_free(s->conn) < n || queued >= TICKETS) { errno = EAGAIN; rc = -1; }
         else {
-            uint64_t addr = (uint64_t)(uintptr_t)wire_mem_base(t->tx) + (uint64_t)d->body_buf_slot, last = 0;
-            for (unsigned i = 0; i < n; ++i) { last = wire_conn_post(s->conn, addr, piece[i]); addr += piece[i]; }
+            uint64_t addr = (uint64_t)(uintptr_t)channel_mem_base(t->tx) + (uint64_t)d->body_buf_slot, last = 0;
+            for (unsigned i = 0; i < n; ++i) { last = channel_conn_post(s->conn, addr, piece[i]); addr += piece[i]; }
             s->tickets[s->t_tail % TICKETS] = (struct ticket){d->seq, last};
             s->t_tail++;
         }
@@ -272,7 +272,7 @@ static void fill_rx(struct dmesh_native_transport *t, struct slot *s, struct dme
 {
     memset(e, 0, sizeof(*e));
     e->kind = DMESH_NATIVE_RX;
-    e->desc.body_buf_slot = (int32_t)((size_t)slot_index(t, s) * WIRE_PUSH_WINDOW + WIRE_PUSH_DATA_OFF + pos);
+    e->desc.body_buf_slot = (int32_t)((size_t)slot_index(t, s) * CHANNEL_WINDOW + CHANNEL_DATA_OFF + pos);
     e->desc.body_len = len;
     e->desc.src_port = s->peer; e->desc.dst_port = s->port;
     e->desc.src_pod = 0; e->desc.dst_pod = t->pod_id;
@@ -294,8 +294,8 @@ int dmesh_native_poll(struct dmesh_native_transport *t, int stripe, struct dmesh
     pthread_mutex_lock(&s->lock);
     int n = 0;
     if (s->state == SLOT_OPEN) {
-        int gone = wire_conn_progress(s->conn);
-        uint64_t consumed = wire_conn_consumed(s->conn);
+        int gone = channel_conn_progress(s->conn);
+        uint64_t consumed = channel_conn_consumed(s->conn);
         if (s->t_head != s->t_tail && s->tickets[s->t_head % TICKETS].ticket <= consumed) {
             fill_ack(s, e, s->tickets[s->t_head % TICKETS].seq); s->t_head++; n = 1;
         } else if (gone && !s->peer_gone_reported) {
@@ -303,7 +303,7 @@ int dmesh_native_poll(struct dmesh_native_transport *t, int stripe, struct dmesh
             fill_rx(t, s, e, 0, 0); n = 1;                 /* zero-length: peer closed */
         } else {
             uint64_t seq; uint32_t pos, len;
-            int r = wire_conn_rx_next(s->conn, &seq, &pos, &len);
+            int r = channel_conn_rx_next(s->conn, &seq, &pos, &len);
             if (r > 0 && carrier_window_add(&s->window, seq, pos, len) == 0) {
                 fill_rx(t, s, e, pos, len); n = 1;
                 if (s->backend && !s->claimed) {
@@ -335,13 +335,13 @@ int dmesh_native_poll(struct dmesh_native_transport *t, int stripe, struct dmesh
 void dmesh_native_release(struct dmesh_native_transport *t, int pos)
 {
     if (pos < 0) return;
-    size_t idx = (size_t)pos / WIRE_PUSH_WINDOW, local = (size_t)pos % WIRE_PUSH_WINDOW;
-    if (idx >= SLOTS || local < WIRE_PUSH_DATA_OFF) return;
+    size_t idx = (size_t)pos / CHANNEL_WINDOW, local = (size_t)pos % CHANNEL_WINDOW;
+    if (idx >= SLOTS || local < CHANNEL_DATA_OFF) return;
     struct slot *s = &t->slots[idx];
     pthread_mutex_lock(&s->lock);
-    if (carrier_window_release(&s->window, (uint32_t)(local - WIRE_PUSH_DATA_OFF)) == 0) {
+    if (carrier_window_release(&s->window, (uint32_t)(local - CHANNEL_DATA_OFF)) == 0) {
         uint64_t seq, bytes;
-        if (carrier_window_advance(&s->window, &seq, &bytes) && s->conn) { wire_conn_rx_consumed(s->conn, seq, bytes); TRACE("release slot %zu cursor seq %lu bytes %lu", idx, (unsigned long)seq, (unsigned long)bytes); }
+        if (carrier_window_advance(&s->window, &seq, &bytes) && s->conn) { channel_conn_rx_consumed(s->conn, seq, bytes); TRACE("release slot %zu cursor seq %lu bytes %lu", idx, (unsigned long)seq, (unsigned long)bytes); }
     }
     pthread_mutex_unlock(&s->lock);
 }
@@ -366,13 +366,13 @@ int dmesh_native_stripe_arm(struct dmesh_native_transport *t, int stripe)
      * that ran empty): only the polling question remains, answered from a
      * racy read that a concurrent poll can at worst make conservative. */
     if (s->state == SLOT_OPEN && s->armed)
-        return s->t_head != s->t_tail || !wire_dev_pull(t->dev);
+        return s->t_head != s->t_tail || !channel_dev_host_dpa(t->dev);
     pthread_mutex_lock(&s->lock);
     int tick = 0;
     if (s->state == SLOT_OPEN) {
-        if (!s->armed && wire_conn_arm(s->conn) == 0) s->armed = 1;
+        if (!s->armed && channel_conn_arm(s->conn) == 0) s->armed = 1;
         /* forward custody has no doorbell; neither do push-wire batches */
-        tick = s->t_head != s->t_tail || !wire_dev_pull(t->dev);
+        tick = s->t_head != s->t_tail || !channel_dev_host_dpa(t->dev);
     } else {
         tick = s->t_head != s->t_tail || s->fin_pending;   /* retired by the next poll */
     }
@@ -385,9 +385,9 @@ void dmesh_native_stripe_clear(struct dmesh_native_transport *t, int stripe)
     struct slot *s = &t->slots[stripe];
     pthread_mutex_lock(&s->lock);
     if (s->conn) {
-        struct epoll_event evs[WIRE_CONN_FDS];
-        int n = epoll_wait(s->epfd, evs, WIRE_CONN_FDS, 0);
-        for (int i = 0; i < n; ++i) wire_conn_clear(s->conn, evs[i].data.fd);
+        struct epoll_event evs[CHANNEL_CONN_FDS];
+        int n = epoll_wait(s->epfd, evs, CHANNEL_CONN_FDS, 0);
+        for (int i = 0; i < n; ++i) channel_conn_clear(s->conn, evs[i].data.fd);
         if (n > 0) s->armed = 0;
     }
     pthread_mutex_unlock(&s->lock);

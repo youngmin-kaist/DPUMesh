@@ -22,7 +22,7 @@ extern "C" {
  * (TX byte-ring occupancy; RX slot admission). The default is normalized down
  * to a whole number of K-ring receive-credit quanta. */
 #define DPUMESH_NUM_SLOTS_DEFAULT       8192
-/* The host→DPU descriptor ring depth is not configurable: it is the wire-ABI
+/* The host→DPU descriptor ring depth is not configurable: it is the channel layer-ABI
  * constant DMA_RING_SIZE (dpumesh/dmesh_common.h), which the host and the DPA
  * kernel must agree on at build time. */
 

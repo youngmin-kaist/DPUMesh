@@ -23,7 +23,7 @@ export stay as they are.
 Partition state left on the DPU: the 1-EU partition for vhca 37 was replaced by
 EUs 64-71; vhca 38-43 keep their 1-EU partitions.
 
-## Phase 0 — resolved 2026-09-24 (see design/HOST.md, pull wire)
+## Phase 0 — resolved 2026-09-24 (see design/HOST.md, host-dpa reverse path)
 
 - SF as DPA device: the process must be created on the PF, then
   `doca_dpa_device_extend` to the SF works end to end once the kernel and the
@@ -35,7 +35,7 @@ EUs 64-71; vhca 38-43 keep their 1-EU partitions.
   process on the same PF** (two verified side by side), so the per-pod model
   is SF for Comch + PF (or one shared SF) for the DPA, one EU partition for
   the PF vhca.
-- The pull wire (host-owned DPA thread per connection, `DPUMESH_WIRE=pull`)
+- The host-dpa reverse path (host-owned DPA thread per connection, `DPUMESH_REVERSE=host-dpa`)
   is implemented and measured; Phases 2-4 below shrink to: per-pod thread
   with a slot table (optional, EU saving), blocking on the PE fd, and the
   forward-ACK notification.
@@ -63,7 +63,7 @@ That is exactly what fails today. Order of work:
    context; an SF context should be one, but this is the second unknown.
 4. Decide the fallback if the SF cannot host a DPA process: DPU-owned DPA
    doing the reverse copy with `doca_dpa_dev_post_memcpy` (no host DPA, host
-   stays on the push wire, no host doorbell), as written up on 2026-09-22.
+   stays on the dpu-dma reverse path, no host doorbell), as written up on 2026-09-22.
 
 Exit criterion: a host process on the SF runs a DPA thread that copies a
 buffer from a DPU export into host memory and delivers the msgq completion
@@ -118,21 +118,21 @@ Files: `src/transport/device/rev_kernel.c` (new), `common/dpa_common.h`,
 - One thread = one EU per pod; the partition per SF vhca needs ≥1 EU (plus
   what flexio needs to create the process, to be learned in Phase 0).
 
-## Phase 3 — host wire layer
+## Phase 3 — host channel layer
 
-Files: `src/transport/host/wire_pull.c` (new, same `wire_push.h` contract
-plus `wire_dev_fd()`), `wire_push.c` kept behind `DPUMESH_WIRE=push`.
+Files: `src/transport/host/channel.c` (host-dpa path, same `channel.h` contract
+plus `channel_dev_fd()`), `channel.c` kept behind `DPUMESH_REVERSE=dpu-dma`.
 
-- `wire_dev_open`: device by `DPUMESH_DEV` (ibdev name) or auto-discovery
+- `channel_dev_open`: device by `DPUMESH_DEV` (ibdev name) or auto-discovery
   (the single SF-type device whose uverbs node the pod owns), falling back
   to `DPUMESH_PCI_ADDR`. Then DPA ctx + app, one thread, its msgq
   (consumer/producer completions bound to the thread), a pod PE, the thread
   arg with all slots inactive, `thread_run`.
-- `wire_conn_open`: comch client (`init_comch_ctrl_path_client`), forward
+- `channel_conn_open`: comch client (`init_comch_ctrl_path_client`), forward
   export as today, then wait for `EXPORT_RCV_RING`, import the two mmaps on
   the SF device, `setup_dpa_buf_array` over the ring, fill the slot, activate.
 - RX: the msgq recv callback turns each imm into a per-slot `{pos,len}` entry
-  that `wire_conn_rx_next` returns; `wire_conn_rx_consumed` batches
+  that `channel_conn_rx_next` returns; `channel_conn_rx_consumed` batches
   `rd_pos` writes (one `h2d_memcpy` per tick, like `rx_watermark` in shim.c).
 - Close: deactivate → wait `quiesced` → drain the slot's completions → destroy
   buf_arr and mmaps → comch disconnect. The DPU frees tx_staging only after
@@ -142,13 +142,13 @@ plus `wire_dev_fd()`), `wire_push.c` kept behind `DPUMESH_WIRE=push`.
 
 ## Phase 4 — carrier and core: blocking
 
-Files: `src/core/carrier_push.c` (becomes wire-agnostic), `src/core/dmesh_core.c`.
+Files: `src/core/carrier.c` (becomes wire-agnostic), `src/core/dmesh_core.c`.
 
 - `dmesh_native_wait` = `epoll_wait` on {msgq PE fd, comch client PE fd}
   after `doca_pe_request_notification`; on wake clear + progress until empty,
   re-arm before the final progress (the lost-wakeup rule).
 - ACK imm → `DMESH_NATIVE_ACK` events; RX imm → `DMESH_NATIVE_RX`.
-- Pull wire forces one drain shard (the PE is single-owner) and drops the
+- Host-dpa reverse path forces one drain shard (the PE is single-owner) and drops the
   adaptive nap; with one EQ, `dmesh_eq_fd` can hand out the PE fd directly
   (the "drain 0" option), which is the configuration Go runtimes want.
 - `dmesh_eq_next_deadline_ns` and the tail timer stay as they are.
@@ -160,18 +160,18 @@ Files: `src/core/carrier_push.c` (becomes wire-agnostic), `src/core/dmesh_core.c
   `DPUMESH_POD_IP` from the downward API; the library discovers the SF and
   uses the fixed server name. **Decided 2026-09-24 (model A):** the pod
   also gets the host PF's rdma device and runs its DPA process there
-  (`DPUMESH_REV_PCI`); no `DPUMESH_REV_DEV`. Node prep: SF creation on the
+  (`DPUMESH_HOST_DPA_PCI`); no `DPUMESH_HOST_DPA_DEV`. Node prep: SF creation on the
   host PF, the DPU worker for that PF, and one EU partition for the PF vhca
   (per-SF partitions are unusable: an extended thread cannot run on them;
   partitions do not survive reboot).
 - `design/HOST.md`, `.env.example`, `tests/` (slot table and quiesce logic
   host-only), `dpumesh_host` gains `--wire` so the same benchmark runs on both
-  wires.
+  reverse paths.
 
 ## Phase 6 — evaluation (same harness as 2026-09-22)
 
-- `dpumesh_host` sink/echo on the pull wire vs the push wire: DMA/s, Gbps, RTT,
-  and above all **host CPU at idle and under load** (the push wire costs up to
+- `dpumesh_host` sink/echo on the host-dpa reverse path vs the dpu-dma reverse path: DMA/s, Gbps, RTT,
+  and above all **host CPU at idle and under load** (the dpu-dma reverse path costs up to
   ~9 cores of polling at 16 echo threads today).
 - Blocking wake latency: 64 B echo RTT with the host asleep between messages.
 - Lifecycle: 1000× QP open/close per pod, pod restart, EU release, fd count.

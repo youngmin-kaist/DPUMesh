@@ -14,7 +14,7 @@ project('dpumesh', 'c', 'cpp',
 #   common/  buffers, rings, per-worker objects, Comch control-path framing,
 #            DPA thread/msgq management (both sides)
 #   dpu/     Comch server, forward DPA pool + DMA push engine
-#   host/    Comch client, and the wire layer the host library builds on
+#   host/    Comch client, and the channel layer the host library builds on
 #   device/  the DPA kernel (compiled by dpacc, see build_dpacc.sh)
 #
 # The programs live elsewhere and link these archives: apps/dma_bench
@@ -57,12 +57,12 @@ dpu_srcs = files(
 host_srcs = files(
   'host/comch_client.c',
 )
-# The host library's wire layer. wire_host_stubs.c stubs the two server-side
+# The host library's channel layer. host_stubs.c stubs the two server-side
 # symbols the shared sources reference, so this archive must never be linked
 # together with dmesh_dpu.
-wire_srcs = files(
-  'host/wire_push.c',
-  'host/wire_host_stubs.c',
+channel_srcs = files(
+  'host/channel.c',
+  'host/host_stubs.c',
 )
 
 # DPA device code: dpacc produces device/dpa_kernel.a (plus the host stub that
@@ -92,7 +92,7 @@ dmesh_host = static_library('dmesh_host', host_srcs,
   dependencies : deps,
   include_directories : inc_dirs,
 )
-dmesh_wire = static_library('dmesh_wire', wire_srcs,
+dmesh_channel = static_library('dmesh_channel', channel_srcs,
   dependencies : deps,
   include_directories : inc_dirs,
 )

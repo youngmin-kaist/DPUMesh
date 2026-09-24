@@ -48,7 +48,7 @@
 #define MAX_THREADS    32
 #define EVENT_BATCH    64
 #define POST_BUDGET    64          /* posts per loop pass before polling events */
-#define WIRE_DESC_MAX  8064u       /* forward descriptor size the wire splits at */
+#define CHANNEL_DESC_MAX  8064u       /* forward descriptor size the channel layer splits at */
 #define STAMP_LEN      8           /* echo: send timestamp at the front of each message */
 #define HIST_BUCKETS   (1u << 20)  /* RTT histogram, 1 us per bucket */
 #define DRAIN_GRACE_S  1.0         /* echo: time given to replies still in flight at the end */
@@ -82,7 +82,7 @@ static const char *env_or(const char *name, const char *fallback)
 static double gbps(uint64_t bytes, double seconds) { return (double)bytes * 8.0 / seconds / 1e9; }
 
 /* Forward descriptors one post of `size` bytes becomes (>= 8 KiB messages only). */
-static double descs_per_post(uint32_t size) { return (double)((size + WIRE_DESC_MAX - 1) / WIRE_DESC_MAX); }
+static double descs_per_post(uint32_t size) { return (double)((size + CHANNEL_DESC_MAX - 1) / CHANNEL_DESC_MAX); }
 
 /* Waits for the EQ readiness fd (bounded). Returns poll()'s result. The fd is
  * level-triggered: the next dmesh_poll_eq run to empty settles it. */

@@ -25,7 +25,7 @@
 /* Reverse stripes a carrier may expose; each has a lock and a doorbell. */
 #define DMESH_MAX_STRIPES 32
 /* Period of the fallback poll an EQ arms while it sleeps on a stripe whose
- * traffic has no doorbell (custody ACKs, push-wire batches). */
+ * traffic has no doorbell (custody ACKs, dpu-dma batches). */
 #define DMESH_TICK_US_DEFAULT 50
 /* An EQ that runs empty keeps its fd readable for this long before arming the
  * doorbells: an armed completion queue raises a hardware event per completion,

@@ -1,10 +1,10 @@
 /* Host DPA on an SF: the firmware refuses a DPA process created on the SF
  * itself (see sf_dpa_probe), so the process is created on the PF and extended
- * to the SF with doca_dpa_device_extend. Everything the pull wire needs is
+ * to the SF with doca_dpa_device_extend. Everything the host-dpa reverse path needs is
  * then created on the SF's extended context: a thread, its doca_dpa_completion
- * (attached before the comch consumer completion, as the wire does), a
+ * (attached before the comch consumer completion, as the channel layer does), a
  * DPA-reachable mmap and buf array, the two DPA <-> CPU msgqs and the
- * consumer completion with the wire's parameters. HOLD=<s> keeps it all alive
+ * consumer completion with the channel layer's parameters. HOLD=<s> keeps it all alive
  * to run a second copy against another SF.
  *
  *   sf_ext_probe [pf ibdev] [sf ibdev] [second sf ibdev]     default mlx5_0 mlx5_2

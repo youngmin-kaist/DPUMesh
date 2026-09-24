@@ -1,0 +1,96 @@
+#ifndef CHANNEL_H
+#define CHANNEL_H
+
+/*
+ * Host view of the DPUMesh transport. This is the only header that both the
+ * carrier (src/core) and the DPUMesh transport sources are visible from; it
+ * exposes no DOCA or DPUMesh types, so the carrier compiles against the public
+ * core alone.
+ *
+ * Two reverse paths share this interface, selected per device by DPUMESH_REVERSE:
+ *   push (default)  DPU -> host bytes are pushed by the DPU's DMA engine into
+ *                   the connection's window (slot ring + data ring); no host DPA
+ *                   and no doorbell for the data, so the consumer polls the window
+ *   pull            the mirror of the forward path: a host-owned DPA thread per
+ *                   connection polls the DPU's descriptor ring and copies
+ *                   tx_staging into the window's data area. DPUMESH_HOST_DPA_PCI names
+ *                   the host PF that runs the DPA process (its vhca needs a DPA
+ *                   EU partition); DPUMESH_HOST_DPA_DEV optionally extends that
+ *                   process to an SF (ibdev name) that then owns the DPA objects
+ */
+
+#include <stddef.h>
+#include <stdint.h>
+
+struct channel_dev;  /* Forward declaration: one Comch device (+ DPA device on the host-dpa reverse path) */
+struct channel_mem;  /* Forward declaration: one registered, PCI-exported memory region */
+struct channel_conn; /* Forward declaration: one Comch connection with its rings */
+
+#define CHANNEL_DESC_N   128u             /* Reverse batches a window can hold */
+#define CHANNEL_DATA_OFF 4096u            /* Data ring offset inside a window */
+#define CHANNEL_WINDOW   (1024u * 1024u)  /* One connection's receive window */
+#define CHANNEL_DESC_MAX      8064u            /* Forward descriptor bytes */
+#define CHANNEL_DESC_ALIGN    128u             /* Forward descriptor alignment */
+
+#define CHANNEL_MODE_CLIENT_HOST_DPA  0u /* DPUMesh CLIENT: client flow, reverse by the host DPA */
+#define CHANNEL_MODE_BACKEND_DPU_DMA      1u /* DPUMesh BACKEND: server flow, reverse pushed by the DPU */
+#define CHANNEL_MODE_CLIENT_DPU_DMA 2u /* DPUMesh INGRESS_PUSH: client flow, reverse pushed by the DPU */
+#define CHANNEL_MODE_BACKEND_HOST_DPA 3u /* DPUMesh BACKEND_PULL: server flow, reverse by the host DPA */
+
+struct channel_conn_config {
+	const char *server;     /* Comch server name */
+	const char *workload;   /* Workload label carried in the flow identity */
+	uint32_t src_ip;        /* Network byte order */
+	uint32_t dst_ip;        /* Network byte order */
+	uint16_t src_port;      /* Host order, as the DPU expects */
+	uint16_t dst_port;      /* Host order, as the DPU expects */
+	uint32_t mode;          /* CHANNEL_MODE_* */
+	struct channel_mem *tx;    /* Shared registered TX pool */
+	struct channel_mem *rx;    /* Registered RX region */
+	size_t rx_offset;       /* This connection's window inside rx */
+};
+
+/* Device: opens the Comch device (and, on the host-dpa reverse path, the DPA process) */
+int channel_dev_open(const char *pci, struct channel_dev **out);
+void channel_dev_close(struct channel_dev *dev);
+/* Nonzero when the device runs the host-dpa reverse path (host DPA reverse path) */
+int channel_dev_host_dpa(const struct channel_dev *dev);
+
+/* Memory: allocates, registers and PCI-exports `bytes`; the buffer is owned by mem */
+int channel_mem_alloc(struct channel_dev *dev, size_t bytes, struct channel_mem **out);
+void *channel_mem_base(const struct channel_mem *mem);
+void channel_mem_free(struct channel_mem *mem);
+
+/* Connection: Comch handshake, forward ring, reverse path setup */
+int channel_conn_open(struct channel_dev *dev, const struct channel_conn_config *cfg, struct channel_conn **out);
+/* Graceful Comch disconnect; safe after the peer is gone */
+void channel_conn_close(struct channel_conn *conn);
+/* Progresses the control path (and the reverse completions on the host-dpa reverse path).
+ * Returns nonzero once the DPU dropped the connection */
+int channel_conn_progress(struct channel_conn *conn);
+
+/* Doorbells: one notification fd per progress engine of the connection (control
+ * path, producer, and on the host-dpa reverse path the reverse completions). Returns the
+ * count written to fds. The fds stay valid until channel_conn_close */
+#define CHANNEL_CONN_FDS 3
+int channel_conn_fds(struct channel_conn *conn, int *fds, int max);
+/* Arms every engine so its fd signals the next completion (one-shot) */
+int channel_conn_arm(struct channel_conn *conn);
+/* Acknowledges a signalled fd; mandatory before that engine signals again.
+ * The fd must be readable: the call blocks otherwise */
+void channel_conn_clear(struct channel_conn *conn, int fd);
+
+/* Forward path: descriptors over the TX pool */
+uint32_t channel_conn_ring_free(const struct channel_conn *conn);
+/* Posts one forward descriptor; returns its ticket (the ring head after it) */
+uint64_t channel_conn_post(struct channel_conn *conn, uint64_t addr, uint32_t bytes);
+/* Tickets consumed so far by the DPU's DPA (custody ACK) */
+uint64_t channel_conn_consumed(const struct channel_conn *conn);
+
+/* Reverse path: next landed batch, pos/len relative to the window's data ring.
+ * Returns 1 with a batch, 0 when none, -1 on a malformed batch */
+int channel_conn_rx_next(struct channel_conn *conn, uint64_t *seq, uint32_t *pos, uint32_t *len);
+/* Publishes the consumption cursor: every batch up to `seq` is released */
+void channel_conn_rx_consumed(struct channel_conn *conn, uint64_t seq, uint64_t bytes);
+
+#endif // CHANNEL_H

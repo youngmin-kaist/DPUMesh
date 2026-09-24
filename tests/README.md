@@ -9,11 +9,11 @@
 | `native_api_contract_test`, `preload_api_contract_test` | Façade argument validation without a transport |
 | `native_core_transport_test` | Channel, EQ, QP, reservation, custody ACK, held RX buffers, FIN and teardown over the memory carrier in `support/` |
 | `native_writable_test` | Writable-buffer accounting of the core |
-| `carrier_push_logic_test` | Forward chunking to the DPUMesh copy rule and the in-order release window of the push carrier |
+| `carrier_logic_test` | Forward chunking to the DPUMesh copy rule and the in-order release window of the carrier |
 | `service_registry_test` | Registry validation and transactional reload |
 | `topology_test` | Topology header |
 
 `support/native_memory_transport.c` is a deterministic loopback carrier for the
 core: it implements the private carrier contract in memory, can hold custody
 ACKs and is never linked into the library. The device-backed carrier
-(`src/core/carrier_push.c`) is validated on hardware.
+(`src/core/carrier.c`) is validated on hardware.

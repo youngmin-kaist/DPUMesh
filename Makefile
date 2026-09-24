@@ -18,14 +18,14 @@ DPA_KERNEL := $(BUILD)/dpa/device/dpa_kernel.a
 HOST_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -D_GNU_SOURCE -DDOCA_ALLOW_EXPERIMENTAL_API \
     -Iinclude -I. -I$(TRANSPORT)/common -I$(TRANSPORT)/dpu -I$(TRANSPORT)/host -I$(DOCA_INC)
 # Transport sources the host library needs: the common set, the DPA
-# management the pull wire's host DPA thread uses, the Comch client and the
-# wire layer. Keep in step with src/transport/meson.build.
+# management the host-dpa reverse path's host DPA thread uses, the Comch client and the
+# channel layer. Keep in step with src/transport/meson.build.
 TRANSPORT_SRCS := $(addprefix $(TRANSPORT)/common/,object.c buffer.c common.c comch_common.c \
     comch_consumer.c comch_producer.c comch_msgq.c dpa.c ring.c) \
-    $(addprefix $(TRANSPORT)/host/,comch_client.c wire_push.c wire_host_stubs.c)
-LIB_SRCS := src/core/dmesh_core.c src/core/carrier_push.c src/core/service_registry.c \
+    $(addprefix $(TRANSPORT)/host/,comch_client.c channel.c host_stubs.c)
+LIB_SRCS := src/core/dmesh_core.c src/core/carrier.c src/core/service_registry.c \
     src/facade/dmesh_api.c $(TRANSPORT_SRCS)
-HOST_TESTS := carrier_push_logic_test service_registry_test native_writable_test native_core_transport_test \
+HOST_TESTS := carrier_logic_test service_registry_test native_writable_test native_core_transport_test \
     topology_test native_api_contract_test preload_api_contract_test
 EXAMPLES := hello_dpumesh hello_dpumesh_server tcp_echo tcp_client
 
@@ -37,13 +37,13 @@ lib: $(LIBDIR)/libdpumesh.so.$(ABI_MAJOR) $(LIBDIR)/libdpumesh_preload.so
 $(LIBDIR) $(TESTDIR) $(BINDIR):
 	mkdir -p $@
 
-# The DPA kernel + its (PIC) host stub, compiled by dpacc: the pull wire runs
+# The DPA kernel + its (PIC) host stub, compiled by dpacc: the host-dpa reverse path runs
 # the same poll_desc_ring kernel on a host-owned DPA thread.
 $(DPA_KERNEL): $(TRANSPORT)/device/dpa_kernel.c $(TRANSPORT)/device/*.h $(TRANSPORT)/common/dpa_common.h $(DPACC)
 	$(DPACC) $(abspath $(BUILD)/dpa) $(abspath $(TRANSPORT)) $(abspath $<) dpa_kernel nv-dpa-bf3 \
 	    $$(pkg-config --variable=libdir doca-dpa)
 
-$(LIBDIR)/libdpumesh.so.$(ABI_MAJOR): $(LIB_SRCS) $(DPA_KERNEL) include/dpumesh/*.h src/core/*.h $(TRANSPORT)/host/wire_push.h | $(LIBDIR)
+$(LIBDIR)/libdpumesh.so.$(ABI_MAJOR): $(LIB_SRCS) $(DPA_KERNEL) include/dpumesh/*.h src/core/*.h $(TRANSPORT)/host/channel.h | $(LIBDIR)
 	$(CC) $(HOST_CFLAGS) -fPIC -shared -Wl,-soname,libdpumesh.so.$(ABI_MAJOR) -Wl,--no-undefined \
 	    $(LIB_SRCS) $(DPA_KERNEL) -pthread $(DOCA_LIBS) -o $@
 	ln -sfn libdpumesh.so.$(ABI_MAJOR) $(LIBDIR)/libdpumesh.so
@@ -60,7 +60,7 @@ test-native-headers:
 test-abi: lib
 	sh tests/abi_contract_test.sh $(LIBDIR)/libdpumesh.so.$(ABI_MAJOR) $(LIBDIR)/libdpumesh_preload.so $(ABI_MAJOR)
 
-$(TESTDIR)/carrier_push_logic_test: tests/carrier_push_logic_test.c src/core/carrier_push_logic.h $(TRANSPORT)/host/wire_push.h | $(TESTDIR)
+$(TESTDIR)/carrier_logic_test: tests/carrier_logic_test.c src/core/carrier_logic.h $(TRANSPORT)/host/channel.h | $(TESTDIR)
 	$(CC) $(HOST_CFLAGS) $< -o $@
 
 $(TESTDIR)/topology_test: tests/topology_test.c include/dpumesh/dmesh_topology.h | $(TESTDIR)

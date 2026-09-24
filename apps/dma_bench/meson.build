@@ -19,7 +19,7 @@ project('dma-bench', 'c',
 #                  in echo mode, pushes the bytes back.
 #
 #   dpumesh_v0_{host,dpu}   legacy/: the original worker pair on the old
-#                  CLIENT-mode wire (fused completions, host DPA reverse). Kept
+#                  CLIENT-mode reverse path (fused completions, host DPA reverse). Kept
 #                  for the h2load bridges (DMESH_BRIDGE_PORT, DMESH_PUSH_BRIDGE_
 #                  PORT, DMESH_BACKEND_CONNECT) the proxy benchmark scripts use
 #                  and for the host DPA microbench (DMESH_DPA_BENCH_MODE).

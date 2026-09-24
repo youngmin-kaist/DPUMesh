@@ -36,7 +36,7 @@ enum dmesh_msg_type {
  * so ingress host processes scale past the flexio one-per-function limit. */
 #define DMESH_FLOW_MODE_INGRESS_PUSH 2u
 /* BACKEND with the reverse path served like CLIENT: rcv_ring + tx_staging
- * exported, the host's DPA pulls (the host library's pull wire). */
+ * exported, the host's DPA pulls (the host library's host-dpa reverse path). */
 #define DMESH_FLOW_MODE_BACKEND_PULL 3u
 /* True for modes whose reverse (DPU->host) path uses the push engine. */
 #define DMESH_FLOW_USES_PUSH(m) ((m) == DMESH_FLOW_MODE_BACKEND || (m) == DMESH_FLOW_MODE_INGRESS_PUSH)
