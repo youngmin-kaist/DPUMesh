@@ -1,0 +1,222 @@
+{
+  "scope": "One local PF base -> existing DPU-local SF extended context; 64B heap allocation/free; no application DPA thread or datapath test",
+  "run": {
+    "argv": [
+      "sudo",
+      "-n",
+      "/tmp/dmesh-dpu-local-sf-extended-20260926/probe"
+    ],
+    "started_utc": "2026-09-26T07:14:46.322519+00:00",
+    "snapshots": [
+      {
+        "stage": "base_only",
+        "argv": [
+          "sudo",
+          "-n",
+          "/opt/mellanox/doca/tools/dpaeumgmt",
+          "info",
+          "status",
+          "-d",
+          "mlx5_0"
+        ],
+        "exit_code": 0,
+        "stderr": ""
+      },
+      {
+        "stage": "base_plus_extended",
+        "argv": [
+          "sudo",
+          "-n",
+          "/opt/mellanox/doca/tools/dpaeumgmt",
+          "info",
+          "status",
+          "-d",
+          "mlx5_0"
+        ],
+        "exit_code": 0,
+        "stderr": ""
+      }
+    ],
+    "exit_code": 0,
+    "finished_utc": "2026-09-26T07:14:54.203424+00:00"
+  },
+  "devices": [
+    {
+      "event": "device",
+      "ibdev": "mlx5_0",
+      "function_type": 0,
+      "vhca": 3
+    },
+    {
+      "event": "device",
+      "ibdev": "mlx5_2",
+      "function_type": 2,
+      "vhca": 273
+    }
+  ],
+  "api_results": [
+    {
+      "event": "result",
+      "stage": "devinfo_create_list",
+      "code": 0,
+      "name": "DOCA_SUCCESS"
+    },
+    {
+      "event": "result",
+      "stage": "open_pf",
+      "code": 0,
+      "name": "DOCA_SUCCESS"
+    },
+    {
+      "event": "result",
+      "stage": "open_sf",
+      "code": 0,
+      "name": "DOCA_SUCCESS"
+    },
+    {
+      "event": "result",
+      "stage": "devinfo_destroy_list",
+      "code": 0,
+      "name": "DOCA_SUCCESS"
+    },
+    {
+      "event": "result",
+      "stage": "base_create",
+      "code": 0,
+      "name": "DOCA_SUCCESS"
+    },
+    {
+      "event": "result",
+      "stage": "base_set_app",
+      "code": 0,
+      "name": "DOCA_SUCCESS"
+    },
+    {
+      "event": "result",
+      "stage": "base_start",
+      "code": 0,
+      "name": "DOCA_SUCCESS"
+    },
+    {
+      "event": "result",
+      "stage": "extend_to_sf",
+      "code": 0,
+      "name": "DOCA_SUCCESS"
+    },
+    {
+      "event": "result",
+      "stage": "extended_get_handle",
+      "code": 0,
+      "name": "DOCA_SUCCESS"
+    },
+    {
+      "event": "result",
+      "stage": "extended_alloc_64",
+      "code": 0,
+      "name": "DOCA_SUCCESS"
+    },
+    {
+      "event": "result",
+      "stage": "extended_mem_free",
+      "code": 0,
+      "name": "DOCA_SUCCESS"
+    },
+    {
+      "event": "result",
+      "stage": "extended_destroy",
+      "code": 0,
+      "name": "DOCA_SUCCESS"
+    },
+    {
+      "event": "result",
+      "stage": "base_stop",
+      "code": 0,
+      "name": "DOCA_SUCCESS"
+    },
+    {
+      "event": "result",
+      "stage": "base_destroy",
+      "code": 0,
+      "name": "DOCA_SUCCESS"
+    },
+    {
+      "event": "result",
+      "stage": "sf_close",
+      "code": 0,
+      "name": "DOCA_SUCCESS"
+    },
+    {
+      "event": "result",
+      "stage": "pf_close",
+      "code": 0,
+      "name": "DOCA_SUCCESS"
+    }
+  ],
+  "done": {
+    "event": "done",
+    "passed": true,
+    "cleanup_ok": true
+  },
+  "pf_mlx5_0_reported_processes": {
+    "before": 0,
+    "base_only": 1,
+    "base_plus_extended": 1,
+    "after": 0
+  },
+  "process_count_scope": "mlx5_0 status only; not a global physical process-slot boundary test",
+  "ports_unchanged": true,
+  "boot_id_unchanged": true,
+  "boot_id": "7ad2a82d-5327-4f94-8092-2bf9fdfe4035",
+  "links": {
+    "representor": {
+      "stable_fields": {
+        "ifindex": true,
+        "ifname": true,
+        "flags": true,
+        "master": true,
+        "address": true,
+        "mtu": true,
+        "operstate": true,
+        "linkinfo": true
+      },
+      "flags_after": [
+        "BROADCAST",
+        "MULTICAST",
+        "UP",
+        "LOWER_UP"
+      ],
+      "operstate_after": "UP"
+    },
+    "sf-link": {
+      "stable_fields": {
+        "ifindex": true,
+        "ifname": true,
+        "flags": true,
+        "master": true,
+        "address": true,
+        "mtu": true,
+        "operstate": true,
+        "linkinfo": true
+      },
+      "flags_after": [
+        "BROADCAST",
+        "MULTICAST",
+        "UP",
+        "LOWER_UP"
+      ],
+      "operstate_after": "UP"
+    }
+  },
+  "partition_before": "In total there are 0 EU partitions configured.\n",
+  "partition_after": "In total there are 0 EU partitions configured.\n",
+  "partition_mutations": [],
+  "network_sf_firmware_mutations": [],
+  "probe_sha256": "ee949d56a9b3b193cb2a8b2631727657ad34ee5a56b418a3224b9a83ffc9a8db",
+  "probe_source_sha256": "b6ea992512fbb63fe8cbc98109caf8b36a71204e1c66119970bbb7d0c65818ab",
+  "kernel_archive_sha256": "4c5b84fdd524dfee19d2e3b671bbac9518320ec377b5438382d603ad5a8b5e2f",
+  "limitations": [
+    "No SF datapath/EU scheduling test",
+    "No 28-process limit retest",
+    "No diagnosis of earlier disconnect"
+  ]
+}

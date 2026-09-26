@@ -5,6 +5,31 @@
 bench-results/*
 !bench-results/README.md
 
+# Selected, reviewed reports; raw archives and logs remain local.
+!bench-results/2026-09-25_grpc-go-64b-1core.csv
+!bench-results/2026-09-25_grpc-go-64b-1core.json
+!bench-results/2026-09-25_grpc-go-64b-1core.md
+!bench-results/2026-09-26_dpa-process-limit.md
+!bench-results/2026-09-26_dpu-local-sf-dpa-test.json
+!bench-results/2026-09-26_dpu-local-sf-dpa-test.md
+!bench-results/2026-09-26_dpu-local-sf-extended-test.json
+!bench-results/2026-09-26_dpu-local-sf-extended-test.md
+!bench-results/2026-09-26_grpc-go-64b-1core-p4-c256.csv
+!bench-results/2026-09-26_grpc-go-64b-1core-p4-c256.json
+!bench-results/2026-09-26_grpc-go-64b-1core-p4-c256.md
+!bench-results/2026-09-26_grpc-go-64b-arm-scaling-throughput.png
+!bench-results/2026-09-26_grpc-go-64b-arm-scaling-worker-cpu-k4.png
+!bench-results/2026-09-26_grpc-go-64b-arm-scaling.csv
+!bench-results/2026-09-26_grpc-go-64b-arm-scaling.md
+!bench-results/2026-09-26_grpc-go-64b-host-dpa-arm-scaling-throughput.png
+!bench-results/2026-09-26_grpc-go-64b-host-dpa-arm-scaling-worker-cpu-k4.png
+!bench-results/2026-09-26_grpc-go-64b-host-dpa-arm-scaling.csv
+!bench-results/2026-09-26_grpc-go-64b-host-dpa-arm-scaling.md
+!bench-results/2026-09-26_grpc-go-64b-host-dpa-pf01.csv
+!bench-results/2026-09-26_grpc-go-64b-host-dpa-pf01.md
+!bench-results/2026-09-26_grpc-go-64b-w16-k4-no-eu-partitions.csv
+!bench-results/2026-09-26_grpc-go-64b-w16-k4-no-eu-partitions.md
+
 # local test binary
 apps/dmesh-router-cpp/test/test_transcode
 

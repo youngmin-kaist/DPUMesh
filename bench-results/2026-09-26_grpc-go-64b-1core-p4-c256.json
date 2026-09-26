@@ -1,0 +1,137 @@
+[
+  {
+    "event": "result",
+    "ok": true,
+    "connections": 4,
+    "concurrency": 256,
+    "concurrency_per_conn": [
+      64,
+      64,
+      64,
+      64
+    ],
+    "payload_bytes": 64,
+    "warmup_seconds": 3,
+    "duration_seconds": 10,
+    "elapsed_secs": 10,
+    "client_process_cpu_pct": 150.69091720391464,
+    "client_cpu_sample_seconds": 9.999764604,
+    "measurement_start": "2026-09-26T09:53:32.108089162+09:00",
+    "measurement_end": "2026-09-26T09:53:42.108089162+09:00",
+    "completed": 194982,
+    "total_completed_including_warmup_and_drain": 253339,
+    "rpc_errors": 0,
+    "native_dials": [
+      1,
+      1,
+      1,
+      1
+    ],
+    "reconnects": 0,
+    "qps": 19498.2,
+    "latency_mean_us": 13126.181533813378,
+    "latency_p50_us": 13310.684,
+    "latency_p99_us": 17319.2,
+    "reverse_mode": "dpu-dma",
+    "repeat": 1,
+    "proxy_cpu_pct": 99.9021106708749,
+    "proxy_cpu_interval_seconds": 9.999788726097904,
+    "mock_cpu_pct": 0.0,
+    "host_cpu": {
+      "event": "host_cpu",
+      "seconds": 9.999826802057214,
+      "client_cpu_pct": 150.70261013820485,
+      "server_cpu_pct": 164.00284049545849
+    }
+  },
+  {
+    "event": "result",
+    "ok": true,
+    "connections": 4,
+    "concurrency": 256,
+    "concurrency_per_conn": [
+      64,
+      64,
+      64,
+      64
+    ],
+    "payload_bytes": 64,
+    "warmup_seconds": 3,
+    "duration_seconds": 10,
+    "elapsed_secs": 10,
+    "client_process_cpu_pct": 152.14542907232084,
+    "client_cpu_sample_seconds": 9.998801208,
+    "measurement_start": "2026-09-26T09:53:46.40457003+09:00",
+    "measurement_end": "2026-09-26T09:53:56.40457003+09:00",
+    "completed": 195433,
+    "total_completed_including_warmup_and_drain": 254153,
+    "rpc_errors": 0,
+    "native_dials": [
+      1,
+      1,
+      1,
+      1
+    ],
+    "reconnects": 0,
+    "qps": 19543.3,
+    "latency_mean_us": 13098.294353103109,
+    "latency_p50_us": 13262.336,
+    "latency_p99_us": 17097.298,
+    "reverse_mode": "dpu-dma",
+    "repeat": 2,
+    "proxy_cpu_pct": 100.00991980450621,
+    "proxy_cpu_interval_seconds": 9.99900811794214,
+    "mock_cpu_pct": 0.0,
+    "host_cpu": {
+      "event": "host_cpu",
+      "seconds": 9.998794568004087,
+      "client_cpu_pct": 152.11833683103814,
+      "server_cpu_pct": 165.01989202578102
+    }
+  },
+  {
+    "event": "result",
+    "ok": true,
+    "connections": 4,
+    "concurrency": 256,
+    "concurrency_per_conn": [
+      64,
+      64,
+      64,
+      64
+    ],
+    "payload_bytes": 64,
+    "warmup_seconds": 3,
+    "duration_seconds": 10,
+    "elapsed_secs": 10,
+    "client_process_cpu_pct": 151.04038820605408,
+    "client_cpu_sample_seconds": 10.000304011,
+    "measurement_start": "2026-09-26T09:54:00.710713366+09:00",
+    "measurement_end": "2026-09-26T09:54:10.710713366+09:00",
+    "completed": 194952,
+    "total_completed_including_warmup_and_drain": 254088,
+    "rpc_errors": 0,
+    "native_dials": [
+      1,
+      1,
+      1,
+      1
+    ],
+    "reconnects": 0,
+    "qps": 19495.2,
+    "latency_mean_us": 13132.995038891624,
+    "latency_p50_us": 13315.664,
+    "latency_p99_us": 17029.216,
+    "reverse_mode": "dpu-dma",
+    "repeat": 3,
+    "proxy_cpu_pct": 99.89486526481612,
+    "proxy_cpu_interval_seconds": 10.000514013925567,
+    "mock_cpu_pct": 0.0,
+    "host_cpu": {
+      "event": "host_cpu",
+      "seconds": 10.000307615031488,
+      "client_cpu_pct": 150.9953551559069,
+      "server_cpu_pct": 164.79493066022158
+    }
+  }
+]

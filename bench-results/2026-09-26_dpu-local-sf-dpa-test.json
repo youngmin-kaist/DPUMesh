@@ -1,0 +1,111 @@
+{
+  "at": "2026-09-26T07:03:40.444675+00:00",
+  "sf": {
+    "representor": "en3f0pf0sf0",
+    "ibdev": "mlx5_2",
+    "netdev": "enp3s0f0s0",
+    "auxiliary": "/sys/devices/pci0000:00/0000:00:00.0/0000:01:00.0/0000:02:00.0/0000:03:00.0/mlx5_core.sf.2",
+    "controller": 0,
+    "sfnum": 0,
+    "vhca": 273
+  },
+  "temporary_eus": "0-7",
+  "outcome": "doca_dpa_start failed DOCA_ERROR_DRIVER; firmware status0x3 syndrome0x775dd0",
+  "probe_exit": 1,
+  "cleanup_ok": true,
+  "partitions_restored": 0,
+  "device_processes_after": 0,
+  "sf_ports_unchanged": true,
+  "boot_id_unchanged": true,
+  "links": {
+    "representor": {
+      "ifname": "en3f0pf0sf0",
+      "flags": [
+        "BROADCAST",
+        "MULTICAST",
+        "UP",
+        "LOWER_UP"
+      ],
+      "operstate": "UP"
+    },
+    "sf-link": {
+      "ifname": "enp3s0f0s0",
+      "flags": [
+        "BROADCAST",
+        "MULTICAST",
+        "UP",
+        "LOWER_UP"
+      ],
+      "operstate": "UP"
+    }
+  },
+  "events": [
+    {
+      "event": "device",
+      "ibdev": "mlx5_2",
+      "vhca": 273,
+      "function_type": 2,
+      "dpa_supported": "DOCA_SUCCESS"
+    },
+    {
+      "event": "call",
+      "stage": "dpa_create",
+      "pid": 11522
+    },
+    {
+      "event": "call",
+      "stage": "dpa_set_app",
+      "pid": 11522
+    },
+    {
+      "event": "call",
+      "stage": "dpa_start",
+      "pid": 11522
+    },
+    {
+      "event": "failure",
+      "pid": 11522,
+      "ibdev": "mlx5_2",
+      "stage": "dpa_start",
+      "code": 21,
+      "name": "DOCA_ERROR_DRIVER"
+    },
+    {
+      "event": "stopping",
+      "pid": 11522,
+      "reason": "no_signal"
+    },
+    {
+      "event": "cleanup",
+      "pid": 11522,
+      "stage": "dpa_stop",
+      "attempted": false,
+      "code": null,
+      "name": "not_started"
+    },
+    {
+      "event": "cleanup",
+      "pid": 11522,
+      "stage": "dpa_destroy",
+      "attempted": true,
+      "code": 0,
+      "name": "DOCA_SUCCESS"
+    },
+    {
+      "event": "cleanup",
+      "pid": 11522,
+      "stage": "dev_close",
+      "attempted": true,
+      "code": 0,
+      "name": "DOCA_SUCCESS"
+    },
+    {
+      "event": "exited",
+      "pid": 11522,
+      "initialized": false,
+      "cleanup_ok": true,
+      "exit_code": 1
+    }
+  ],
+  "source_sha256": "ead64f5a63f39329a183a7270f64324564d6f42349bb373dc6ba75e0d5db3e27"
+}
