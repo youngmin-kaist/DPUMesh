@@ -69,16 +69,12 @@ channel_srcs = files(
 # registers the DPA app), linked into every DPU-side binary.
 program_name = 'dpa_kernel'
 dpacc_build_script = meson.project_source_root() / 'build_dpacc.sh'
-device_src = meson.project_source_root() / 'device' / 'dpa_kernel.c'
 dpacc_mcpu_flag = 'nv-dpa-bf3'
 doca_lib_dir = dependency('doca-dpa').get_variable(pkgconfig : 'libdir')
 
-run_command(dpacc_build_script, meson.project_build_root(), meson.project_source_root(), device_src,
-            program_name, dpacc_mcpu_flag, doca_lib_dir, check: true)
-
-device_build_dir = meson.project_build_root() / 'device'
-dpa_program_lib = meson.get_compiler('c').find_library(program_name, dirs: device_build_dir,
-                                                       static: true)
+# Kernel and argument-layout changes must rebuild the archive at build time,
+# not only during meson setup/reconfigure.
+subdir('device')
 
 dmesh_common = static_library('dmesh_common', common_srcs,
   dependencies : deps,

@@ -2431,7 +2431,9 @@ int dmesh_destroy_channel(dmesh_channel_t *s) {
         for (int i = 0; i < ctx->n_eqs; i++) if (ctx->eqs[i]) { live = 1; break; }
         pthread_mutex_unlock(&ctx->eq_lock);
         if (live) { errno = EBUSY; return -1; }
-        dpumesh_destroy(ctx);
+        if (cleanup_ctx(ctx) != 0)
+            return -1; /* exported memory and its channel handle remain owned */
+        s->ctx = NULL;
     }
     free(s);
     return 0;
@@ -3052,8 +3054,11 @@ static int dmesh_release_qp(dmesh_qp_t *c, int graceful) {
     }
     conn_free_rx(c);                                       /* return the held RX credit */
     tx_gate_release(psl);
-    if (c->role == DMESH_ROLE_CLIENT && c->seq == 0)
-        (void)dmesh_native_disconnect(ctx->transport, c->local_port);
+    if (c->role == DMESH_ROLE_CLIENT && c->seq == 0 &&
+        dmesh_native_disconnect(ctx->transport, c->local_port) != 0 && close_result == 0) {
+        close_result = -1;
+        close_errno = errno;
+    }
     if (c->local_port) dpumesh_free_port(ctx, c->local_port);
     if (c->eq) atomic_fetch_sub_explicit(&c->eq->nqp, 1, memory_order_release);
     free(c);

@@ -1,4 +1,4 @@
-/* Host carrier over the DPUMesh push transport: one Comch connection per QP.
+/* Host carrier over the DPUMesh push transport: one Comch session per channel; DMA rings remain per QP.
  * A client QP opens an INGRESS_PUSH flow to its service; a server channel
  * keeps a pool of BACKEND flows that the DPU claims one stream at a time.
  * The core keeps its custody, credit and accept semantics: forward
@@ -82,7 +82,7 @@ static int slot_open(struct dmesh_native_transport *t, struct slot *s, uint32_t 
     if (channel_dev_host_dpa(t->dev))
         mode = mode == CHANNEL_MODE_BACKEND_DPU_DMA ? CHANNEL_MODE_BACKEND_HOST_DPA : CHANNEL_MODE_CLIENT_HOST_DPA;
     struct channel_conn_config cfg = {
-        .server = t->server, .workload = t->workload,
+        .flow_id = (uint32_t)slot_index(t, s) + 1, .workload = t->workload,
         .src_ip = t->pod_ip, .dst_ip = svc->ipv4, .src_port = port, .dst_port = svc->port,
         .mode = mode, .tx = t->tx, .rx = t->rx,
         .rx_offset = (size_t)slot_index(t, s) * CHANNEL_WINDOW,
@@ -106,16 +106,18 @@ static int slot_open(struct dmesh_native_transport *t, struct slot *s, uint32_t 
     TRACE("slot %d open mode %u port %u peer %u service %d", slot_index(t, s), mode, port, s->peer, service_id);
     return 0;
 }
-static void slot_close(struct dmesh_native_transport *t, struct slot *s)
+static int slot_close(struct dmesh_native_transport *t, struct slot *s)
 {
     (void)t;
     if (s->conn) {
         int fds[CHANNEL_CONN_FDS], nfd = channel_conn_fds(s->conn, fds, CHANNEL_CONN_FDS);
+        if (channel_conn_close(s->conn) != 0) return -1;
+        s->conn = NULL;
         for (int i = 0; i < nfd; ++i) (void)epoll_ctl(s->epfd, EPOLL_CTL_DEL, fds[i], NULL);
-        channel_conn_close(s->conn); s->conn = NULL;
     }
     s->armed = 0;
     s->state = SLOT_CLOSED;
+    return 0;
 }
 static void slot_free(struct dmesh_native_transport *t, struct slot *s)
 {
@@ -188,6 +190,7 @@ int dmesh_native_open(struct dmesh_native_transport **out, struct dmesh_native_c
         t->service_id = svc->id;
     }
     if (channel_dev_open(pci, &t->dev) != 0) goto fail;
+    if (channel_session_open(t->dev, t->server) != 0) goto fail;
     if (channel_mem_alloc(t->dev, cfg->bytes, &t->tx) != 0) goto fail;
     if (channel_mem_alloc(t->dev, (size_t)SLOTS * CHANNEL_WINDOW, &t->rx) != 0) goto fail;
     if (t->service_id != DMESH_SVC_NONE) {
@@ -209,7 +212,12 @@ fail: {
 int dmesh_native_close(struct dmesh_native_transport *t)
 {
     if (!t) return 0;
-    for (int i = 0; i < SLOTS; ++i) if (t->slots[i].conn) slot_close(t, &t->slots[i]);
+    int saved = 0;
+    for (int i = 0; i < SLOTS; ++i)
+        if (t->slots[i].conn && slot_close(t, &t->slots[i]) != 0 && !saved) saved = errno;
+    if (!saved && channel_session_close(t->dev) != 0) saved = errno;
+    /* A missing CLOSED/quiescence fence leaves exported regions registered. */
+    if (saved) { errno = saved; return -1; }
     for (int i = 0; i < SLOTS; ++i) if (t->slots[i].epfd >= 0) close(t->slots[i].epfd);
     channel_mem_free(t->rx); channel_mem_free(t->tx);
     channel_dev_close(t->dev);
@@ -231,13 +239,14 @@ int dmesh_native_disconnect(struct dmesh_native_transport *t, uint16_t port)
 {
     pthread_mutex_lock(&t->lock);
     struct slot *s = slot_of_port(t, port);
+    int rc = 0;
     if (s && !s->backend) {
         pthread_mutex_lock(&s->lock);
-        if (s->state == SLOT_OPEN && s->t_head == s->t_tail) { slot_close(t, s); slot_free(t, s); }
+        if (s->state == SLOT_OPEN && s->t_head == s->t_tail) { rc = slot_close(t, s); if (rc == 0) slot_free(t, s); }
         pthread_mutex_unlock(&s->lock);
     }
     pthread_mutex_unlock(&t->lock);
-    return 0;
+    return rc;
 }
 int dmesh_native_submit(struct dmesh_native_transport *t, const sw_descriptor_t *d)
 {
@@ -248,8 +257,8 @@ int dmesh_native_submit(struct dmesh_native_transport *t, const sw_descriptor_t 
     TRACE("submit slot %d port %u seq %u len %u off %d state %d", slot_index(t, s), d->src_port, d->seq, d->body_len, d->body_buf_slot, s->state);
     if (d->body_len == 0) {
         /* FIN or reset: the stream ends with the connection. */
-        if (s->state == SLOT_OPEN) slot_close(t, s);
-        s->fin_pending = 1; s->fin_seq = d->seq;
+        if (s->state == SLOT_OPEN) rc = slot_close(t, s);
+        if (rc == 0) { s->fin_pending = 1; s->fin_seq = d->seq; }
     } else if (s->state != SLOT_OPEN) {
         errno = EPIPE; rc = -1;
     } else {
@@ -300,7 +309,12 @@ int dmesh_native_poll(struct dmesh_native_transport *t, int stripe, struct dmesh
             fill_ack(s, e, s->tickets[s->t_head % TICKETS].seq); s->t_head++; n = 1;
         } else if (gone && !s->peer_gone_reported) {
             s->peer_gone_reported = 1;
-            fill_rx(t, s, e, 0, 0); n = 1;                 /* zero-length: peer closed */
+            if (gone < 0) {
+                int saved = errno;
+                memset(e, 0, sizeof(*e));
+                e->kind = DMESH_NATIVE_ERROR; e->port = s->port; e->error = saved ? saved : EIO;
+            } else fill_rx(t, s, e, 0, 0);
+            n = 1;
         } else {
             uint64_t seq; uint32_t pos, len;
             int r = channel_conn_rx_next(s->conn, &seq, &pos, &len);
@@ -366,13 +380,14 @@ int dmesh_native_stripe_arm(struct dmesh_native_transport *t, int stripe)
      * that ran empty): only the polling question remains, answered from a
      * racy read that a concurrent poll can at worst make conservative. */
     if (s->state == SLOT_OPEN && s->armed)
-        return s->t_head != s->t_tail || !channel_dev_host_dpa(t->dev);
+        return 1; /* shared control PE has no stripe fd, including host-DPA */
     pthread_mutex_lock(&s->lock);
     int tick = 0;
     if (s->state == SLOT_OPEN) {
         if (!s->armed && channel_conn_arm(s->conn) == 0) s->armed = 1;
-        /* forward custody has no doorbell; neither do push-wire batches */
-        tick = s->t_head != s->t_tail || !channel_dev_host_dpa(t->dev);
+        /* The channel's shared control PE deliberately has no per-EQ fd.
+         * Poll it under the session mutex even when reverse DMA has a doorbell. */
+        tick = 1;
     } else {
         tick = s->t_head != s->t_tail || s->fin_pending;   /* retired by the next poll */
     }

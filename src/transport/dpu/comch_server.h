@@ -97,6 +97,9 @@ doca_error_t
 server_send_msg_conn(struct objects *objs, struct doca_comch_connection *connection,
 		     const char *msg, size_t len);
 
+struct dmesh_conn;
+doca_error_t server_send_flow_msg(struct dmesh_conn *, uint16_t, const void *, size_t, int32_t);
+
 doca_error_t
 export_dpa_comp_to_host(struct objects *objs);
 

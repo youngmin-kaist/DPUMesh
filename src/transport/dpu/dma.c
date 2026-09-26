@@ -22,6 +22,41 @@ DOCA_LOG_REGISTER(DMA);
 static void dmesh_dma_push_submit_desc(struct dmesh_conn *conn);
 static void dmesh_dma_push_desc_done(struct dmesh_conn *conn);
 
+#ifndef DMESH_DMA_STOP_MAX_POLLS
+#define DMESH_DMA_STOP_MAX_POLLS 100000u
+#endif
+
+static bool dma_admission_closed(const struct dmesh_conn *conn)
+{
+    return conn == NULL || conn->dma_closing || conn->state == DMESH_CONN_CLOSING;
+}
+
+/* Tasks do not own an extra doca_buf reference. Clear each attachment before
+ * returning its reference; restore a failed release so cleanup can retry. */
+static doca_error_t dma_release_task_buffers(struct doca_dma_task_memcpy *task)
+{
+    const struct doca_buf *src = doca_dma_task_memcpy_get_src(task);
+    struct doca_buf *dst = doca_dma_task_memcpy_get_dst(task);
+    doca_error_t result;
+    if (src != NULL) {
+        doca_dma_task_memcpy_set_src(task, NULL);
+        result = doca_buf_dec_refcount((struct doca_buf *)src, NULL);
+        if (result != DOCA_SUCCESS) {
+            doca_dma_task_memcpy_set_src(task, src);
+            return result;
+        }
+    }
+    if (dst != NULL) {
+        doca_dma_task_memcpy_set_dst(task, NULL);
+        result = doca_buf_dec_refcount(dst, NULL);
+        if (result != DOCA_SUCCESS) {
+            doca_dma_task_memcpy_set_dst(task, dst);
+            return result;
+        }
+    }
+    return DOCA_SUCCESS;
+}
+
 doca_error_t
 init_dma_resources(struct objects *objs)
 {
@@ -113,6 +148,8 @@ dmesh_dma_copy_to_rcvbuf(struct dmesh_conn *conn, uint32_t pos, uint32_t length)
     struct doca_buf *sbuf = NULL, *dbuf = NULL;
     doca_error_t result;
 
+    if (dma_admission_closed(conn))
+        return DOCA_ERROR_BAD_STATE;
     if (get_num_free_dma_tasks(conn) == 0)
         return DOCA_ERROR_AGAIN;
 
@@ -139,14 +176,11 @@ dmesh_dma_copy_to_rcvbuf(struct dmesh_conn *conn, uint32_t pos, uint32_t length)
     }
 
     result = submit_dma_task(conn, sbuf, dbuf);
-    if (result == DOCA_ERROR_AGAIN) {
-        /* bufs were never attached to a task; release them before retrying */
+    if (result != DOCA_SUCCESS) {
+        /* A failed submission leaves both references with this caller. */
         (void)doca_buf_dec_refcount(dbuf, NULL);
         (void)doca_buf_dec_refcount(sbuf, NULL);
-        return DOCA_ERROR_AGAIN;
     }
-    /* on other failures submit_dma_task already released the bufs via
-     * put_free_dma_task */
     return result;
 }
 
@@ -155,6 +189,8 @@ dmesh_dma_defer_copy(struct dmesh_conn *conn, uint32_t pos, uint32_t length)
 {
     int tail;
 
+    if (dma_admission_closed(conn))
+        return;
     if (conn->dma_pending == NULL || conn->dma_pending_cnt >= DMA_PENDING_MAX) {
         /* Sustained overload: inflow exceeds this connection's DMA throughput.
          * Counted silently; the throughput report surfaces pending/dropped. */
@@ -174,7 +210,9 @@ dmesh_dma_pending_drain(struct dmesh_conn *conn)
     struct dma_pending_copy *p;
     doca_error_t result;
 
-    if (conn->state != DMESH_CONN_RUNNING) {
+    if (conn == NULL)
+        return;
+    if (dma_admission_closed(conn) || conn->state != DMESH_CONN_RUNNING) {
         /* connection went away; discard its deferred copies */
         conn->dma_pending_cnt = 0;
         return;
@@ -215,6 +253,20 @@ static void dmesh_doca_dpa_dma_task_completed_cb(struct doca_dma_task_memcpy *dm
     if (result != DOCA_SUCCESS)
         DOCA_LOG_ERR("Failed to return completed DMA task to queue: %s",
                      doca_error_get_descr(result));
+
+    if (result != DOCA_SUCCESS) {
+        conn->dma_closing = true;
+        if (conn->state != DMESH_CONN_CLOSING) {
+            conn->state = DMESH_CONN_ERROR;
+            conn->error_status = EIO;
+        }
+    }
+    if (dma_admission_closed(conn)) {
+        conn->push_state = 0;
+        conn->cursor_state = 0;
+        conn->dma_pending_cnt = 0;
+        return;
+    }
 
     /* Backend push chaining (task submission is allowed inside a completion
      * callback): data landed -> publish its descriptor; descriptor landed ->
@@ -277,24 +329,20 @@ static void dmesh_doca_dpa_dma_task_error_cb(struct doca_dma_task_memcpy *dma_ta
         DOCA_LOG_ERR("Failed to return errored DMA task to queue: %s",
                      doca_error_get_descr(result));
 
-    DOCA_LOG_ERR("DMA task failed: %s", doca_error_get_descr(entry->result));
-
-    /* A failed backend-push stage drops the batch (the byte stream loses those
-     * bytes - the h2 connection will reset); just unblock the pusher. */
-    if (kind == DMESH_TASK_PUSH_DATA || kind == DMESH_TASK_PUSH_DESC) {
+    /* A flushed task has returned from the device, but other tasks may still
+     * be submitted. Only the checked cleanup loop may free the whole pool. */
+    if (!dma_admission_closed(conn)) {
+        DOCA_LOG_ERR("DMA task failed: %s", doca_error_get_descr(entry->result));
+        conn->state = DMESH_CONN_ERROR;
+        conn->error_status = EIO;
+    }
+    conn->dma_closing = true;
+    conn->dma_pending_cnt = 0;
+    if (kind == DMESH_TASK_PUSH_DATA || kind == DMESH_TASK_PUSH_DESC)
         conn->push_state = 0;
-        return;
-    }
-    if (kind == DMESH_TASK_PULL_CURSOR) {
-        conn->cursor_state = 0;         /* allow a fresh pull; cache stays */
-        return;
-    }
+    if (kind == DMESH_TASK_PULL_CURSOR)
+        conn->cursor_state = 0;
 
-    int i;
-    for (i = 0; i < conn->num_dma_tasks; i++) {
-        entry = &conn->dma_task_entries[i];
-        doca_task_free(doca_dma_task_memcpy_as_task(entry->task));
-    }
 }
 
 /**
@@ -541,6 +589,8 @@ submit_dma_task_kind(struct dmesh_conn *conn, const struct doca_buf *src, struct
 
     if (conn == NULL || src == NULL || dst == NULL)
         return DOCA_ERROR_INVALID_VALUE;
+    if (dma_admission_closed(conn))
+        return DOCA_ERROR_BAD_STATE;
 
     dma_task = get_free_dma_task(conn);
     if (dma_task == NULL)
@@ -558,6 +608,10 @@ submit_dma_task_kind(struct dmesh_conn *conn, const struct doca_buf *src, struct
         entry->in_flight = true;
     } else {
         entry->result = result;
+        /* Submission did not transfer ownership: let the caller release or
+         * retry its buffers, including SDK EAGAIN (not just an empty pool). */
+        doca_dma_task_memcpy_set_src(dma_task, NULL);
+        doca_dma_task_memcpy_set_dst(dma_task, NULL);
         if (put_free_dma_task(conn, dma_task) != DOCA_SUCCESS)
             DOCA_LOG_ERR("Failed to return unsubmitted DMA task to queue");
     }
@@ -588,7 +642,7 @@ dmesh_dma_pull_cursor(struct dmesh_conn *conn)
     struct doca_buf *sbuf = NULL, *dbuf = NULL;
     doca_error_t result;
 
-    if (conn->cursor_state != 0 || conn->tx_staging == NULL ||
+    if (dma_admission_closed(conn) || conn->cursor_state != 0 || conn->tx_staging == NULL ||
         conn->rcvbuf.mmap == NULL || conn->rcvbuf.buf == NULL)
         return;
     conn->cursor_shadow = (struct dmesh_push_cursor *)((uint8_t *)conn->tx_staging +
@@ -628,6 +682,8 @@ dmesh_dma_push_staged(struct dmesh_conn *conn, uint32_t src_pos, uint32_t len)
 
     if (conn == NULL)
         return -(int)DOCA_ERROR_INVALID_VALUE;
+    if (dma_admission_closed(conn))
+        return -(int)DOCA_ERROR_BAD_STATE;
     if (conn->tx_staging == NULL || conn->rcvbuf.mmap == NULL || conn->rcvbuf.buf == NULL)
         return -(int)DOCA_ERROR_BAD_STATE;
     if (conn->push_state != 0)
@@ -692,13 +748,11 @@ dmesh_dma_push_staged(struct dmesh_conn *conn, uint32_t src_pos, uint32_t len)
     }
 
     result = submit_dma_task_kind(conn, sbuf, dbuf, DMESH_TASK_PUSH_DATA);
-    if (result == DOCA_ERROR_AGAIN) {
+    if (result != DOCA_SUCCESS) {
         (void)doca_buf_dec_refcount(dbuf, NULL);
         (void)doca_buf_dec_refcount(sbuf, NULL);
-        return 0;                       /* task pool exhausted; retry later */
+        return result == DOCA_ERROR_AGAIN ? 0 : -(int)result;
     }
-    if (result != DOCA_SUCCESS)
-        return -(int)result;
 
     conn->push_len = (uint32_t)chunk;
     conn->push_state = 1;
@@ -716,6 +770,8 @@ dmesh_dma_push_submit_desc(struct dmesh_conn *conn)
     uint64_t next_seq = conn->push_seq + 1;
     doca_error_t result;
 
+    if (dma_admission_closed(conn))
+        return;
     conn->push_shadow = (struct dmesh_push_desc *)((uint8_t *)conn->tx_staging +
                                                    conn->tx_staging_len - 64);
     conn->push_shadow->seq = next_seq;
@@ -771,6 +827,8 @@ enqueue_dma_task(struct dmesh_conn *conn, const struct doca_buf *src, struct doc
 
     if (conn == NULL || src == NULL || dst == NULL)
         return DOCA_ERROR_INVALID_VALUE;
+    if (dma_admission_closed(conn))
+        return DOCA_ERROR_BAD_STATE;
 
     dma_task = get_free_dma_task(conn);
     if (dma_task == NULL)
@@ -780,8 +838,12 @@ enqueue_dma_task(struct dmesh_conn *conn, const struct doca_buf *src, struct doc
     doca_dma_task_memcpy_set_dst(dma_task, dst);
 
     result = put_submission_dma_task(conn, dma_task);
-    if (result != DOCA_SUCCESS && put_free_dma_task(conn, dma_task) != DOCA_SUCCESS)
-        DOCA_LOG_ERR("Failed to return DMA task after enqueue failure");
+    if (result != DOCA_SUCCESS) {
+        doca_dma_task_memcpy_set_src(dma_task, NULL);
+        doca_dma_task_memcpy_set_dst(dma_task, NULL);
+        if (put_free_dma_task(conn, dma_task) != DOCA_SUCCESS)
+            DOCA_LOG_ERR("Failed to return DMA task after enqueue failure");
+    }
 
     return result;
 }
@@ -799,6 +861,8 @@ progress_dma_submission_queue(struct dmesh_conn *conn, int max_tasks, int *num_s
 
     if (conn == NULL || max_tasks < 0)
         return DOCA_ERROR_INVALID_VALUE;
+    if (dma_admission_closed(conn))
+        return DOCA_ERROR_BAD_STATE;
 
     while (max_tasks == 0 || submitted < max_tasks) {
         dma_task = get_submission_dma_task(conn);
@@ -838,7 +902,7 @@ get_free_dma_task(struct dmesh_conn *conn)
 {
     struct dma_task_entry *entry;
 
-    if (conn == NULL)
+    if (dma_admission_closed(conn))
         return NULL;
 
     entry = TAILQ_FIRST(&conn->free_dma_tasks);
@@ -856,8 +920,7 @@ doca_error_t
 put_free_dma_task(struct dmesh_conn *conn, struct doca_dma_task_memcpy *dma_task)
 {
     struct dma_task_entry *entry;
-    const struct doca_buf *src;
-    struct doca_buf *dst;
+    doca_error_t result;
 
     if (conn == NULL || dma_task == NULL)
         return DOCA_ERROR_INVALID_VALUE;
@@ -867,15 +930,9 @@ put_free_dma_task(struct dmesh_conn *conn, struct doca_dma_task_memcpy *dma_task
         entry->in_free_queue || entry->in_submission_queue || entry->in_flight)
         return DOCA_ERROR_INVALID_VALUE;
 
-    src = doca_dma_task_memcpy_get_src(dma_task);
-    dst = doca_dma_task_memcpy_get_dst(dma_task);
-
-    doca_dma_task_memcpy_set_src(dma_task, NULL);
-    doca_dma_task_memcpy_set_dst(dma_task, NULL);
-    if (src != NULL)
-        (void)doca_buf_dec_refcount((struct doca_buf *)src, NULL);
-    if (dst != NULL)
-        (void)doca_buf_dec_refcount(dst, NULL);
+    result = dma_release_task_buffers(dma_task);
+    if (result != DOCA_SUCCESS)
+        return result;
 
     TAILQ_INSERT_TAIL(&conn->free_dma_tasks, entry, entries);
     entry->in_free_queue = true;
@@ -889,7 +946,7 @@ get_submission_dma_task(struct dmesh_conn *conn)
 {
     struct dma_task_entry *entry;
 
-    if (conn == NULL)
+    if (dma_admission_closed(conn))
         return NULL;
 
     entry = TAILQ_FIRST(&conn->submission_dma_tasks);
@@ -910,6 +967,9 @@ put_submission_dma_task(struct dmesh_conn *conn, struct doca_dma_task_memcpy *dm
 
     if (conn == NULL || dma_task == NULL)
         return DOCA_ERROR_INVALID_VALUE;
+
+    if (dma_admission_closed(conn))
+        return DOCA_ERROR_BAD_STATE;
 
     entry = doca_task_get_user_data(doca_dma_task_memcpy_as_task(dma_task)).ptr;
     if (entry == NULL || entry->owner != conn || entry->task != dma_task ||
@@ -937,51 +997,100 @@ get_num_submission_dma_tasks(const struct dmesh_conn *conn)
     return conn == NULL ? 0 : conn->num_submission_dma_tasks;
 }
 
-void
+/* Reap only tasks owned by the application. DOCA requires all allocated
+ * tasks freed before STOPPING can become IDLE, so this runs between progress
+ * calls instead of waiting for IDLE with the task pool still allocated. */
+static doca_error_t dma_reap_idle_tasks(struct dmesh_conn *conn, bool *in_flight)
+{
+    *in_flight = false;
+    if (conn->dma_task_entries == NULL)
+        return DOCA_SUCCESS;
+    for (int i = 0; i < conn->num_dma_tasks; ++i) {
+        struct dma_task_entry *entry = &conn->dma_task_entries[i];
+        if (entry->task == NULL)
+            continue;
+        if (entry->in_flight) {
+            *in_flight = true;
+            continue;
+        }
+        doca_error_t result = dma_release_task_buffers(entry->task);
+        if (result != DOCA_SUCCESS)
+            return result;
+        if (entry->in_free_queue) {
+            TAILQ_REMOVE(&conn->free_dma_tasks, entry, entries);
+            entry->in_free_queue = false;
+            --conn->num_free_dma_tasks;
+        }
+        if (entry->in_submission_queue) {
+            TAILQ_REMOVE(&conn->submission_dma_tasks, entry, entries);
+            entry->in_submission_queue = false;
+            --conn->num_submission_dma_tasks;
+        }
+        doca_task_free(doca_dma_task_memcpy_as_task(entry->task));
+        entry->task = NULL;
+    }
+    return DOCA_SUCCESS;
+}
+
+doca_error_t
 cleanup_dma_tasks(struct dmesh_conn *conn)
 {
-    struct objects *objs = conn->objs;
-    struct doca_ctx *dma_ctx;
-    enum doca_ctx_states state;
     doca_error_t result;
-    int i;
+    bool in_flight;
+    if (conn == NULL)
+        return DOCA_SUCCESS;
+    conn->dma_closing = true;
+    conn->dma_pending_cnt = 0;
 
-    if (conn == NULL || conn->dma_ctx == NULL)
-        return;
-
-    /* A DMA context will not leave STOPPING for IDLE until every task
-     * allocated from its pool is freed. Free the (idle) pool tasks FIRST, then
-     * stop and drain - otherwise the stop-progress loop below spins forever and
-     * the context is destroyed while still STOPPING (leak + later crash). No
-     * task is in flight here: the connection's host has disconnected and the
-     * DPA thread has already been quiesced. */
-    if (conn->dma_task_entries != NULL) {
-        for (i = 0; i < conn->num_dma_tasks; ++i) {
-            if (conn->dma_task_entries[i].task != NULL)
-                doca_task_free(doca_dma_task_memcpy_as_task(conn->dma_task_entries[i].task));
+    if (conn->dma_ctx != NULL) {
+        struct doca_ctx *ctx = doca_dma_as_ctx(conn->dma_ctx);
+        enum doca_ctx_states state;
+        result = doca_ctx_get_state(ctx, &state);
+        if (result != DOCA_SUCCESS)
+            return result;
+        if (state != DOCA_CTX_STATE_IDLE && state != DOCA_CTX_STATE_STOPPING) {
+            result = doca_ctx_stop(ctx);
+            if (result != DOCA_SUCCESS && result != DOCA_ERROR_IN_PROGRESS)
+                return result;
         }
+        for (unsigned poll = 0;; ++poll) {
+            result = dma_reap_idle_tasks(conn, &in_flight);
+            if (result != DOCA_SUCCESS)
+                return result;
+            result = doca_ctx_get_state(ctx, &state);
+            if (result != DOCA_SUCCESS)
+                return result;
+            if (state == DOCA_CTX_STATE_IDLE) {
+                if (in_flight)
+                    return DOCA_ERROR_BAD_STATE;
+                break;
+            }
+            if (poll == DMESH_DMA_STOP_MAX_POLLS)
+                return DOCA_ERROR_TIME_OUT;
+            if (conn->objs == NULL || conn->objs->consumer_pe == NULL)
+                return DOCA_ERROR_BAD_STATE;
+            (void)doca_pe_progress(conn->objs->consumer_pe);
+        }
+        result = doca_dma_destroy(conn->dma_ctx);
+        if (result != DOCA_SUCCESS)
+            return result;
+        conn->dma_ctx = NULL;
+    } else {
+        result = dma_reap_idle_tasks(conn, &in_flight);
+        if (result != DOCA_SUCCESS)
+            return result;
+        if (in_flight)
+            return DOCA_ERROR_BAD_STATE;
     }
 
-    dma_ctx = doca_dma_as_ctx(conn->dma_ctx);
-    if (doca_ctx_get_state(dma_ctx, &state) == DOCA_SUCCESS &&
-        state != DOCA_CTX_STATE_IDLE) {
-        result = doca_ctx_stop(dma_ctx);
-        /* doca_ctx_stop is asynchronous: it returns DOCA_ERROR_IN_PROGRESS while
-         * it settles. In both cases progress the PE until the context reaches
-         * IDLE - only then can it be destroyed. */
-        if (result == DOCA_SUCCESS || result == DOCA_ERROR_IN_PROGRESS) {
-            int spins = 0;
-            while (spins++ < 100000 &&
-                   doca_ctx_get_state(dma_ctx, &state) == DOCA_SUCCESS &&
-                   state != DOCA_CTX_STATE_IDLE)
-                doca_pe_progress(objs->consumer_pe); /* DMA ctx lives on the consumer PE */
-            if (state != DOCA_CTX_STATE_IDLE)
-                DOCA_LOG_ERR("DMA context did not reach IDLE (state=%d) within bound", state);
-        } else {
-            DOCA_LOG_ERR("Failed to stop DMA context: %s", doca_error_get_descr(result));
-        }
+    /* Inventory destruction implicitly stops it and fails with IN_USE while
+     * any reference remains. Preserve the handle on failure for a later retry. */
+    if (conn->buf_inv != NULL) {
+        result = doca_buf_inventory_destroy(conn->buf_inv);
+        if (result != DOCA_SUCCESS)
+            return result;
+        conn->buf_inv = NULL;
     }
-
     free(conn->dma_task_entries);
     conn->dma_task_entries = NULL;
     conn->num_dma_tasks = 0;
@@ -989,17 +1098,14 @@ cleanup_dma_tasks(struct dmesh_conn *conn)
     conn->num_submission_dma_tasks = 0;
     TAILQ_INIT(&conn->free_dma_tasks);
     TAILQ_INIT(&conn->submission_dma_tasks);
-
     free(conn->dma_pending);
     conn->dma_pending = NULL;
     conn->dma_pending_head = 0;
-    conn->dma_pending_cnt = 0;
-
     free(conn->recv_segs);
     conn->recv_segs = NULL;
     conn->recv_seg_head = 0;
     conn->recv_seg_cnt = 0;
-
-    doca_dma_destroy(conn->dma_ctx);
-    conn->dma_ctx = NULL;
+    conn->push_state = 0;
+    conn->cursor_state = 0;
+    return DOCA_SUCCESS;
 }

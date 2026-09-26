@@ -1,0 +1,202 @@
+#include <assert.h>
+#include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "src/transport/common/session_protocol.h"
+
+/* Check the public wire format independently of the encoder: a decoder and
+ * encoder with the same endian/layout mistake must not pass a round trip. */
+static void test_wire_layout(void)
+{
+    static const uint8_t golden[] = {
+        0x48, 0x53, 0x4d, 0x44, 0x01, 0x00, 0x03, 0x00,
+        0x03, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+        0x78, 0x56, 0x34, 0x12, 0x00, 0x00, 0x00, 0x00,
+        0xa5, 0x00, 0x7e,
+    };
+    uint8_t storage[sizeof(golden) + 2];
+    uint8_t *frame = storage + 1; /* Comch callback bytes need not be aligned. */
+    struct dmesh_session_header h;
+    const uint8_t *payload;
+
+    memset(storage, 0xcc, sizeof(storage));
+    assert(dmesh_session_encode(frame, sizeof(golden), DMESH_SESSION_OPEN,
+                                2, UINT32_C(0x12345678), 0,
+                                golden + 24, 3) == sizeof(golden));
+    assert(memcmp(frame, golden, sizeof(golden)) == 0);
+    assert(storage[0] == 0xcc && storage[sizeof(storage) - 1] == 0xcc);
+    assert(dmesh_session_decode(frame, sizeof(golden), &h, &payload) == 0);
+    assert(h.magic == DMESH_SESSION_MAGIC && h.version == 1);
+    assert(h.type == DMESH_SESSION_OPEN && h.flow_id == 2);
+    assert(h.generation == UINT32_C(0x12345678) && h.status == 0);
+    assert(h.payload_len == 3 && payload == frame + 24);
+    assert(memcmp(payload, golden + 24, 3) == 0);
+
+    for (size_t len = 0; len < sizeof(golden); ++len)
+        assert(dmesh_session_decode(frame, len, &h, &payload) == -1);
+    assert(dmesh_session_decode(frame, sizeof(golden) + 1, &h, &payload) == -1);
+    assert(dmesh_session_decode(NULL, sizeof(golden), &h, &payload) == -1);
+    assert(dmesh_session_decode(frame, sizeof(golden), NULL, &payload) == -1);
+    assert(dmesh_session_decode(frame, sizeof(golden), &h, NULL) == -1);
+}
+
+struct message_case {
+    uint16_t type;
+    uint32_t flow_id, generation;
+    int32_t status;
+    uint32_t payload_len;
+    int valid;
+};
+
+static void test_message_shapes(void)
+{
+    static const struct message_case cases[] = {
+        {DMESH_SESSION_HELLO,          0, 0, 0,      0, 1},
+        {DMESH_SESSION_HELLO_ACK,      0, 0, 0,      0, 1},
+        {DMESH_SESSION_HELLO_ACK,      0, 0, EPROTO, 0, 1},
+        {DMESH_SESSION_OPEN,           1, 1, 0,      1, 1},
+        {DMESH_SESSION_REVERSE_EXPORT, 2, 9, 0,      1, 1},
+        {DMESH_SESSION_READY,          1, 1, 0,      0, 1},
+        {DMESH_SESSION_CLOSE,          1, 1, 0,      0, 1},
+        {DMESH_SESSION_CLOSED,         1, 1, 0,      0, 1},
+        {DMESH_SESSION_CLOSED,         1, 1, EIO,    0, 1},
+        {DMESH_SESSION_ERROR,          1, 1, EIO,    0, 1},
+        {DMESH_SESSION_OPEN,          32, UINT32_MAX, 0, 1, 1},
+        {DMESH_SESSION_HELLO,          1, 0, 0,      0, 0},
+        {DMESH_SESSION_HELLO_ACK,      0, 1, 0,      0, 0},
+        {DMESH_SESSION_HELLO,          0, 0, 0,      1, 0},
+        {DMESH_SESSION_HELLO_ACK,      0, 0, 0,      1, 0},
+        {DMESH_SESSION_HELLO,          0, 0, EIO,    0, 0},
+        {DMESH_SESSION_OPEN,           0, 1, 0,      1, 0},
+        {DMESH_SESSION_OPEN,          33, 1, 0,      1, 0},
+        {DMESH_SESSION_OPEN,           1, 0, 0,      1, 0},
+        {DMESH_SESSION_OPEN,           1, 1, 0,      0, 0},
+        {DMESH_SESSION_OPEN,           1, 1, EIO,    1, 0},
+        {DMESH_SESSION_REVERSE_EXPORT, 1, 1, 0,      0, 0},
+        {DMESH_SESSION_REVERSE_EXPORT, 1, 1, EIO,    1, 0},
+        {DMESH_SESSION_READY,          1, 1, 0,      1, 0},
+        {DMESH_SESSION_READY,          1, 1, EIO,    0, 0},
+        {DMESH_SESSION_CLOSE,          1, 1, 0,      1, 0},
+        {DMESH_SESSION_CLOSE,          1, 1, EIO,    0, 0},
+        {DMESH_SESSION_CLOSED,         1, 1, 0,      1, 0},
+        {DMESH_SESSION_ERROR,          1, 1, 0,      0, 0},
+        {DMESH_SESSION_ERROR,          1, 1, EIO,    1, 0},
+        {DMESH_SESSION_ERROR,          1, 1, -1,     0, 0},
+        {0,                           1, 1, 0,      0, 0},
+        {UINT16_MAX,                  1, 1, 0,      0, 0},
+    };
+    uint8_t frame[DMESH_SESSION_HEADER_SIZE + 1];
+    uint8_t body = 0x5a;
+    struct dmesh_session_header h;
+    const uint8_t *payload;
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        const struct message_case *c = &cases[i];
+        size_t len = dmesh_session_encode(frame, sizeof(frame), c->type,
+                                          c->flow_id, c->generation, c->status,
+                                          &body, c->payload_len);
+        assert((len != 0) == c->valid);
+
+        /* Construct even rejected frames without passing through encode, so
+         * decode is independently exercised against malformed peer input. */
+        const uint8_t prefix[8] = {0x48, 0x53, 0x4d, 0x44, 1, 0, 0, 0};
+        memcpy(frame, prefix, sizeof(prefix));
+        frame[6] = (uint8_t)c->type;
+        frame[7] = (uint8_t)(c->type >> 8);
+        dmesh_session_put_u32(frame + 8, c->payload_len);
+        dmesh_session_put_u32(frame + 12, c->flow_id);
+        dmesh_session_put_u32(frame + 16, c->generation);
+        dmesh_session_put_u32(frame + 20, (uint32_t)c->status);
+        frame[24] = body;
+        int rc = dmesh_session_decode(frame, 24 + c->payload_len, &h, &payload);
+        assert((rc == 0) == c->valid);
+        if (rc == 0) {
+            assert(h.type == c->type && h.flow_id == c->flow_id);
+            assert(h.generation == c->generation && h.status == c->status);
+            assert(h.payload_len == c->payload_len);
+            if (h.payload_len) assert(*payload == body);
+        }
+    }
+}
+
+static void test_frame_limits(void)
+{
+    uint8_t body[DMESH_SESSION_MAX_PAYLOAD];
+    uint8_t frame[DMESH_SESSION_MAX_FRAME + 1];
+    struct dmesh_session_header h;
+    const uint8_t *payload;
+    for (size_t i = 0; i < sizeof(body); ++i) body[i] = (uint8_t)(i * 37u);
+    size_t len = dmesh_session_encode(frame, sizeof(frame), DMESH_SESSION_OPEN,
+                                      1, 1, 0, body, sizeof(body));
+    assert(len == DMESH_SESSION_MAX_FRAME);
+    assert(dmesh_session_decode(frame, len, &h, &payload) == 0);
+    assert(h.payload_len == sizeof(body) && memcmp(payload, body, sizeof(body)) == 0);
+    assert(dmesh_session_encode(frame, len - 1, DMESH_SESSION_OPEN,
+                                1, 1, 0, body, sizeof(body)) == 0);
+    assert(dmesh_session_encode(frame, sizeof(frame), DMESH_SESSION_OPEN,
+                                1, 1, 0, body, sizeof(body) + 1) == 0);
+    assert(dmesh_session_encode(frame, sizeof(frame), DMESH_SESSION_OPEN,
+                                1, 1, 0, body, SIZE_MAX) == 0);
+    assert(dmesh_session_encode(frame, sizeof(frame), DMESH_SESSION_OPEN,
+                                1, 1, 0, NULL, 1) == 0);
+    assert(dmesh_session_encode(NULL, sizeof(frame), DMESH_SESSION_OPEN,
+                                1, 1, 0, body, 1) == 0);
+
+    /* A peer cannot smuggle extra bytes, unsupported versions, or a length
+     * outside the protocol maximum into a callback's metadata parser. */
+    assert(dmesh_session_decode(frame, len + 1, &h, &payload) == -1);
+    frame[0] ^= 1;
+    assert(dmesh_session_decode(frame, len, &h, &payload) == -1);
+    frame[0] ^= 1;
+    frame[4] = 2;
+    assert(dmesh_session_decode(frame, len, &h, &payload) == -1);
+    frame[4] = 1;
+    dmesh_session_put_u32(frame + 8, DMESH_SESSION_MAX_PAYLOAD + 1);
+    assert(dmesh_session_decode(frame, sizeof(frame), &h, &payload) == -1);
+    dmesh_session_put_u32(frame + 8, UINT32_MAX);
+    assert(dmesh_session_decode(frame, len, &h, &payload) == -1);
+}
+
+static void test_interleaved_flow_tags(void)
+{
+    /* The single Comch connection may interleave opposite-direction metadata
+     * and generations. Tags must survive independently of payload contents. */
+    static const struct {
+        uint16_t type;
+        uint32_t flow, generation;
+        uint8_t body[4];
+    } messages[] = {
+        {DMESH_SESSION_OPEN,           1, 7, {0x11, 0, 0, 1}},
+        {DMESH_SESSION_OPEN,           2, 3, {0x22, 0, 0, 2}},
+        {DMESH_SESSION_REVERSE_EXPORT, 2, 3, {0xb2, 0, 0, 2}},
+        {DMESH_SESSION_REVERSE_EXPORT, 1, 7, {0xa1, 0, 0, 1}},
+        {DMESH_SESSION_OPEN,           1, 8, {0x31, 0, 0, 1}},
+        {DMESH_SESSION_REVERSE_EXPORT, 1, 7, {0xa1, 0, 0, 1}},
+    };
+    uint8_t frames[sizeof(messages) / sizeof(messages[0])][28];
+    for (size_t i = 0; i < sizeof(messages) / sizeof(messages[0]); ++i) {
+        assert(dmesh_session_encode(frames[i], sizeof(frames[i]), messages[i].type,
+                                    messages[i].flow, messages[i].generation, 0,
+                                    messages[i].body, sizeof(messages[i].body)) == 28);
+    }
+    for (size_t i = 0; i < sizeof(messages) / sizeof(messages[0]); ++i) {
+        struct dmesh_session_header h;
+        const uint8_t *payload;
+        assert(dmesh_session_decode(frames[i], sizeof(frames[i]), &h, &payload) == 0);
+        assert(h.type == messages[i].type && h.flow_id == messages[i].flow);
+        assert(h.generation == messages[i].generation);
+        assert(h.payload_len == 4 && memcmp(payload, messages[i].body, 4) == 0);
+    }
+}
+
+int main(void)
+{
+    test_wire_layout();
+    test_message_shapes();
+    test_frame_limits();
+    test_interleaved_flow_tags();
+    puts("session_protocol_test: PASS");
+    return 0;
+}

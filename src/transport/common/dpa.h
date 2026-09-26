@@ -1,6 +1,7 @@
 #ifndef DPA_H_
 #define DPA_H_
 
+#include <stdbool.h>
 #include <doca_dpa.h>
 #include <doca_ctx.h>
 #include <doca_pe.h>
@@ -18,9 +19,12 @@ struct objects;
 struct doca_comch_connection;
 
 /* DOCA DPA thread related objects */
+struct dmesh_conn;
+
 struct dmesh_doca_dpa_thread {
     struct doca_dpa *dpa;           /* DOCA DPA */
     struct doca_dpa_thread *thread; /* DPA thread */
+    bool running, quiesced;        /* run attempted; explicit DMA close fence completed */
     doca_dpa_dev_uintptr_t arg;     /* argument to be used by DPA thread */
     doca_dpa_dev_uintptr_t buf;     /* buffer to be used by DPA thread */
 	doca_dpa_dev_buf_arr_t dpa_buf_arr; /* DPA buffer array */
@@ -33,7 +37,7 @@ struct dmesh_dpa_thread_pool {
     struct doca_dpa *dpa;                          /* shared DPA instance */
     int size;                                      /* number of usable slots */
     struct dmesh_doca_dpa_thread threads[DPA_THREAD_POOL_SIZE];
-    struct doca_comch_connection *owner[DPA_THREAD_POOL_SIZE]; /* NULL = free */
+    struct dmesh_conn *owner[DPA_THREAD_POOL_SIZE]; /* NULL = free */
 };
 
 struct dmesh_doca_dpa_msgq {
@@ -41,6 +45,7 @@ struct dmesh_doca_dpa_msgq {
 	struct doca_comch_msgq *msgq;	      /**< The DOCA Comch MsgQ */
 	struct doca_comch_producer *producer; /**< The DOCA Comch Producer */
 	struct doca_comch_consumer *consumer; /**< The DOCA Comch Consumer */
+	bool started;                       /* MsgQ start succeeded; retained across cleanup retry */
 	bool is_send;			      /**< Indicates if MsgQ is used for sending from DPU to DPA */
 	
 	/* variables to measure latency of msgq */	
@@ -52,6 +57,9 @@ struct dmesh_doca_dpa_msgq {
 };
 
 struct dmesh_doca_dpa_comch {
+    uint64_t dma_completed;         /* one immediate message after each DMA copy */
+    bool completion_error, stopping;
+    bool producer_comp_started, consumer_comp_started;
 	struct dmesh_doca_dpa_msgq send;			      /**< MsgQ used to send message from DPU to DPA */
 	struct doca_dpa_completion *producer_comp;	      /**< The producer completion context used by DPA */
 	struct dmesh_doca_dpa_msgq recv;			      /**< MsgQ used to receive message DPA */
@@ -90,11 +98,11 @@ dmesh_dpa_thread_pool_init(struct objects *objs);
  * exhausted or not yet initialized. Pure memory operation - safe to call from
  * a DOCA event callback. */
 struct dmesh_doca_dpa_thread *
-dmesh_dpa_thread_pool_alloc(struct objects *objs, struct doca_comch_connection *conn);
+dmesh_dpa_thread_pool_alloc(struct objects *objs, struct dmesh_conn *conn);
 
 /* Return the thread owned by a connection back to the pool (no-op if none). */
 void
-dmesh_dpa_thread_pool_release(struct objects *objs, struct doca_comch_connection *conn);
+dmesh_dpa_thread_pool_release(struct objects *objs, struct dmesh_conn *conn);
 
 doca_error_t
 launch_dpa_kernel(struct dmesh_doca_dpa_thread *dpa_thread);
@@ -110,6 +118,13 @@ struct objects;
 struct dmesh_conn;
 doca_error_t
 dmesh_doca_dpa_comch_create(struct dmesh_conn *conn);
+
+/* Checked native-flow teardown. Quiesce verifies both kernel exit and receipt
+ * of every issued DMA completion before any mapping can be released. Each
+ * destroy preserves failed objects for retry; none releases a pool slot. */
+doca_error_t dmesh_doca_dpa_quiesce_checked(struct dmesh_conn *conn);
+doca_error_t dmesh_doca_dpa_comch_destroy_checked(struct dmesh_conn *conn);
+doca_error_t dmesh_doca_dpa_thread_destroy_checked(struct dmesh_doca_dpa_thread *thread);
 
 /* Teardown counterparts (per-connection reuse without a proxy restart) */
 void

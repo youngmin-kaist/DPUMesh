@@ -1,8 +1,8 @@
 # Host library over the DPUMesh transport
 
 The host library (`libdpumesh.so.5`) is the DPUmesh native API and core; the
-DPU is the unmodified DPUMesh data plane and its embedded Linkerd proxy. The two
-meet at DPUMesh's host wire: one Comch connection per stream, a forward
+DPU runs the DPUMesh transport and its embedded Linkerd proxy. The two
+meet at DPUMesh's host wire: one Comch control session per channel, a forward
 descriptor ring per connection and, back to the host, either the DPA-free push
 channel (`DPUMESH_REVERSE=dpu-dma`, the default) or the host-dpa reverse path
 (`DPUMESH_REVERSE=host-dpa`): a host-owned DPA thread per connection that mirrors the
@@ -22,9 +22,9 @@ exports rcv_ring + tx_staging instead of pushing).
 - `src/transport/host/channel.[ch]`: the channel layer, the only host-library
   files that include DOCA headers; they call the transport's host sources
   (`src/transport/{common,host}/*.c`) for device open, Comch client and
-  producer setup, ring setup and the export message. `src/core` includes only
+  session setup, ring setup and flow-tagged export messages. `src/core` includes only
   `channel.h`, which exposes no DOCA types.
-- `src/transport/host/host_stubs.c`: two server-only symbols the shared
+- `src/transport/host/host_stubs.c`: server-only symbols the shared
   transport sources reference but a host never executes.
 - `src/facade`: the native API and the POSIX preload shim.
 
@@ -32,14 +32,14 @@ exports rcv_ring + tx_staging instead of pushing).
 
 | API | Carrier |
 |---|---|
-| `dmesh_create_channel` | Opens the PCI device, registers one TX pool and one RX region (32 windows of 1 MiB), loads the registry. A server channel (`DPUMESH_SERVICE`) keeps `DPUMESH_BACKEND_POOL` unclaimed BACKEND flows open, each under a fresh upstream port, up to `DPUMESH_BACKEND_MAX` flows in total; a flow is replaced as soon as a stream claims it, so the DPU connector always finds a ready backend. |
-| `dmesh_create_qp` | Opens an `INGRESS_PUSH` flow: source `DPUMESH_POD_IP` and the QP port, destination the registry address of the service, `DPUMESH_WORKLOAD` as identity label. |
+| `dmesh_create_channel` | Opens the PCI device and one Comch client/PE, completes HELLO, registers one TX pool and one RX region (32 windows of 1 MiB), loads the registry. A server channel (`DPUMESH_SERVICE`) keeps `DPUMESH_BACKEND_POOL` unclaimed BACKEND flows open, each under a fresh upstream port, up to `DPUMESH_BACKEND_MAX` flows in total; a flow is replaced as soon as a stream claims it, so the DPU connector always finds a ready backend. |
+| `dmesh_create_qp` | Sends flow-tagged OPEN on the channel session and waits for READY. Opens an `INGRESS_PUSH` flow: source `DPUMESH_POD_IP` and the QP port, destination the registry address of the service, `DPUMESH_WORKLOAD` as identity label. |
 | inbound stream | The first push batch on a BACKEND flow enters the core's accept queue under that flow's upstream port. After the stream closes, the flow reopens under a new port. |
 | `dmesh_post_send` | The descriptor's TX-pool range is posted to the flow's forward ring as one or two DPUMesh descriptors (a multiple of 128 bytes plus a remainder of at most 128 bytes, each at most 8064 bytes). |
 | custody ACK | The DPA's `consumer_head` passing a descriptor's ticket. |
 | `dmesh_poll_eq` receive | One push batch `{seq, pos, len}` becomes one receive event pointing into the flow's data ring. No copy. |
 | `dmesh_release_rx_buffer` | Marks the batch released; the consumption cursor advances over the released prefix and the DPU pulls it for flow control. A long-held batch blocks only its own QP. |
-| `dmesh_destroy_qp`, `dmesh_abort_qp` | The zero-length close descriptor closes the flow; the DPU's disconnect arrives as a zero-length receive event. |
+| `dmesh_destroy_qp`, `dmesh_abort_qp` | Retain the current FIN behavior. Transport cleanup sends flow CLOSE after local reverse DMA stops; matching CLOSED permits resource release. A flow close leaves the channel's Comch session and siblings alive. |
 
 ### Readiness: no background thread
 
@@ -50,16 +50,18 @@ epoll set that wakes it: its eventfd (deliveries from other EQ threads,
 accepts), a one-shot timerfd programmed to the earliest retained-tail
 deadline, the doorbells of the stripes it owns, the doorbells of the spare
 backend flows, and a fallback tick. A stripe's doorbell is the
-carrier's per-slot epoll of the channel layer's progress-engine notification fds
-(Comch control path, producer, and on the host-dpa reverse path the reverse msgq
-completions); the core moves it from the spare set to the owning EQ at
-connect/accept and back at free.
+carrier's per-slot epoll of the private reverse MsgQ notification fd in host-dpa
+mode; the core moves it from the spare set to the owning EQ at connect/accept
+and back at free. The shared control PE is progressed under a channel mutex.
+Its fd is not registered in competing EQs; the existing fallback tick runs
+while a flow is open, including idle host-dpa flows. No control thread is added.
 
 Two things have no doorbell: custody ACKs (the DPU's DPA writes
 `consumer_head` into host memory) and push-wire batches (the DPU's DMA engine
 writes the window). While a sleeping EQ has either outstanding, a periodic
-timerfd (`DPUMESH_TICK_US`, default 50) polls for it; an idle pull-wire
-process runs no timer at all (measured 0.4% CPU for an idle server).
+timerfd (`DPUMESH_TICK_US`, default 50) polls for it. Open flows also need this
+tick for shared control progress. Historical performance figures below predate
+the per-channel Comch change and require remeasurement.
 
 An armed completion queue raises a hardware event per completion, so an EQ
 that runs empty first spins for `DPUMESH_SPIN_US` (default 1000): it signals
@@ -122,9 +124,52 @@ moves the DPA objects onto the pod's SF without a code change.
 ## Limits
 
 A DPU worker serves 32 flows (one DPA thread each), shared by client QPs and
-the backend pool. Opening a QP performs a Comch handshake and takes
-milliseconds. `dmesh_msg_max` is 8192; a descriptor larger than 8064 bytes is
+the backend pool. The channel establishes Comch once; opening a QP still waits
+synchronously for its own DMA setup and READY, bounded by a five-second control
+timeout. `dmesh_msg_max` is 8192; a descriptor larger than 8064 bytes is
 split by the channel layer and reassembled by the stream.
+
+## Channel session and shutdown
+
+The private Comch envelope carries a version, message type/length, flow ID,
+generation and status. HELLO/HELLO_ACK bind the session; OPEN/READY and
+REVERSE_EXPORT prepare individual flows; CLOSE/CLOSED release them; ERROR
+reports flow or session failure. Stale generations cannot mutate a reused slot.
+The host serializes control PE progress and callbacks with the channel mutex.
+The DPU keeps separate session and flow tables; its DPA pool keys ownership by
+logical flow, so sharing Comch never shares a DPA thread accidentally.
+
+A successful close requires more than kernel loop exit. The kernel publishes
+its issued-copy count before `stopped`, and the CPU checks that every copy has
+produced its DMA-completed message while continuing to progress the local
+MsgQ. These messages follow DMA completion ([DOCA Comch documentation](https://docs.nvidia.com/doca/sdk/doca-comch.pdf)).
+Pending CPU DMA tasks are drained or cancelled before task buffers, contexts,
+mappings or staging memory are released. Each cleanup step checks SDK errors
+and preserves remaining ownership for retry. Host reverse cleanup precedes
+CLOSE; DPU cleanup precedes CLOSED with status zero. The proxy also retires
+its Rust IO staging pointers under their mutex and acknowledges this to C before
+C may release any staging mappings; backend IO can live on another runtime.
+DPA threads, descriptor rings and local CPU/DPA MsgQs remain per flow.
+
+Native copies now carry FLUSH on each submission, retaining optimized completion
+reports. This avoids a shutdown deadlock in which the last flush needs a receive
+credit held by an unflushed operation. Doorbell batching performance must be
+remeasured on hardware; the separate microbenchmark still controls its own
+batching.
+
+`DMESH_NO_TEARDOWN` retains resource-owning flows and reports an unsuccessful
+close instead of bypassing its existing hardware workaround. On abnormal
+session loss, exported sources that may still have a host reverse reader are
+quarantined, consuming bounded flow/session capacity until process/device
+recovery. The proxy's void driver destructor retains a live device domain rather
+than freeing the owner underneath unfinished cleanup. A lost session is not proof that the remote DMA reader stopped.
+
+The public API and SONAME remain ABI 5; explicit listen and public async
+connect/close are later steps. The private Comch protocol and DPA argument
+layout changed: rebuild the host library, DPU transport/proxy and DPA kernel
+together. Mixed old/new peers are unsupported. Unit/fault tests and builds do
+not replace hardware validation of both reverse modes and close/reconnect
+under load.
 
 ## DPU worker mode
 

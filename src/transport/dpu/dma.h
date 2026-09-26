@@ -28,9 +28,15 @@ init_dma_resources(struct objects *objs);
 doca_error_t
 init_dma_tasks(struct dmesh_conn *conn, int num_tasks);
 
-void
+/* Permanently stop admission and drain this flow's CPU DMA tasks. Only
+ * unsubmitted/completed tasks are freed; remaining resources survive an error
+ * and the caller must retry before releasing any mapped backing memory.
+ * Serialized with submit/progress by the owning worker; safe on NULL. */
+doca_error_t
 cleanup_dma_tasks(struct dmesh_conn *conn);
 
+/* Successful submit/enqueue transfers the src/dst references to the task.
+ * On failure both references remain with the caller. */
 doca_error_t
 submit_dma_task(struct dmesh_conn *conn, const struct doca_buf *src, struct doca_buf *dst);
 

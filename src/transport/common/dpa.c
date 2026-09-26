@@ -53,9 +53,21 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
 	struct doca_task *task = doca_comch_consumer_task_post_recv_as_task(recv_task);
     
     msg = (struct comch_msg *)doca_comch_consumer_task_post_recv_get_imm_data(recv_task);
+    uint32_t imm_len = doca_comch_consumer_task_post_recv_get_imm_data_len(recv_task);
+    if (msg == NULL || imm_len < sizeof(enum comch_msg_type) ||
+        msg->type != COMCH_MSG_TYPE_DMA_COMPLETED || imm_len != sizeof(struct comch_dma_comp_msg)) {
+        if (conn->dpa_comch != NULL) conn->dpa_comch->completion_error = true;
+        goto repost;
+    }
 
     switch (msg->type) {
         case COMCH_MSG_TYPE_DMA_COMPLETED:
+            if (conn->dpa_comch != NULL) {
+                if (conn->dpa_comch->dma_completed == UINT64_MAX)
+                    conn->dpa_comch->completion_error = true;
+                else
+                    conn->dpa_comch->dma_completed++;
+            }
             // struct comch_dma_comp_msg *comp_msg = (struct comch_dma_comp_msg *)msg;
             // void *mmap_addr = NULL;
             // size_t mmap_len = 0;
@@ -126,6 +138,11 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
 
     objs->recv_msg_cnt++;
 
+repost:
+    if (conn->dpa_comch != NULL && conn->dpa_comch->stopping) {
+        doca_task_free(task);
+        return;
+    }
 	result = doca_task_submit(task);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("DPA MsgQ receive callback failed: Failed to resubmit receive task - %s",
@@ -146,7 +163,10 @@ static void dmesh_doca_dpa_msgq_recv_error_cb(struct doca_comch_consumer_task_po
 					     union doca_data ctx_user_data)
 {
 	(void)task_user_data;
-	(void)ctx_user_data;
+    struct dmesh_conn *conn = ctx_user_data.ptr;
+    if (conn != NULL && conn->dpa_comch != NULL && !conn->dpa_comch->stopping) {
+        conn->dpa_comch->completion_error = true;
+    }
 
 	struct doca_task *task = doca_comch_consumer_task_post_recv_as_task(recv_task);
 
@@ -230,12 +250,12 @@ void dmesh_doca_dpa_comch_msgq_ctx_state_changed_cb(const union doca_data user_d
 
 	switch (next_state) {
 	case DOCA_CTX_STATE_IDLE:
-        DOCA_LOG_ERR("DPA comch msgQ state is idle.");
+        DOCA_LOG_DBG("DPA comch msgQ state is idle.");
 		// nvmf_doca_dpa_comch_stop_continue(&io->comch);
 		break;
     case DOCA_CTX_STATE_STARTING:
     case DOCA_CTX_STATE_RUNNING:
-        DOCA_LOG_ERR("DPA comch msgQ state is running.");
+        DOCA_LOG_DBG("DPA comch msgQ state is running.");
 	case DOCA_CTX_STATE_STOPPING:
 	default:
 		break;
@@ -318,7 +338,7 @@ dmesh_dpa_thread_pool_init(struct objects *objs)
 }
 
 struct dmesh_doca_dpa_thread *
-dmesh_dpa_thread_pool_alloc(struct objects *objs, struct doca_comch_connection *conn)
+dmesh_dpa_thread_pool_alloc(struct objects *objs, struct dmesh_conn *conn)
 {
     struct dmesh_dpa_thread_pool *pool = objs->dpa_pool;
     int i;
@@ -354,7 +374,7 @@ dmesh_dpa_thread_pool_alloc(struct objects *objs, struct doca_comch_connection *
 }
 
 void
-dmesh_dpa_thread_pool_release(struct objects *objs, struct doca_comch_connection *conn)
+dmesh_dpa_thread_pool_release(struct objects *objs, struct dmesh_conn *conn)
 {
     struct dmesh_dpa_thread_pool *pool = objs->dpa_pool;
     int i;
@@ -495,6 +515,7 @@ dmesh_doca_dpa_msgq_create(const struct dmesh_doca_dpa_msgq_create_attr *attr,
         return result;
     }
     
+    msgq->started = true;
     result = doca_comch_msgq_consumer_create(msgq->msgq, &msgq->consumer);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to create msgq consumer - %s",
@@ -700,6 +721,7 @@ dmesh_doca_dpa_comch_create(struct dmesh_conn *conn)
         return result;
     }
 
+    comch->producer_comp_started = true;
     result = doca_comch_consumer_completion_create(&(comch->consumer_comp));
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to create consumer completion - %s",
@@ -737,6 +759,194 @@ dmesh_doca_dpa_comch_create(struct dmesh_conn *conn)
 		return result;
 	}
 
+    comch->consumer_comp_started = true;
+    return DOCA_SUCCESS;
+}
+
+/* Checked native-flow close. The kernel publishes its copy count before the
+ * stopped flag. DMA-copy immediate messages arrive only after the copy (DOCA
+ * producer_dma_copy contract), so every submitted copy must be observed here
+ * before any local or exported mapping can be released. Keep receive tasks
+ * posted until that fence; otherwise a credit-starved kernel cannot stop. */
+doca_error_t
+dmesh_doca_dpa_quiesce_checked(struct dmesh_conn *conn)
+{
+    struct dmesh_doca_dpa_thread *thread;
+    struct dmesh_doca_dpa_comch *comch;
+    doca_error_t result;
+    uint32_t one = 1, stopped = 0;
+    uint64_t submitted = 0;
+    unsigned spins;
+
+    if (conn == NULL || (thread = conn->dpa_thread) == NULL || !thread->running || thread->quiesced)
+        return DOCA_SUCCESS;
+    comch = conn->dpa_comch;
+    if (thread->arg == 0 || thread->thread == NULL || comch == NULL)
+        return DOCA_ERROR_BAD_STATE;
+    result = doca_dpa_h2d_memcpy(thread->dpa,
+        thread->arg + offsetof(struct dpa_thread_arg, stop), &one, sizeof(one));
+    if (result != DOCA_SUCCESS)
+        return result;
+    for (spins = 0; spins < 100000; ++spins) {
+        if (conn->objs != NULL && conn->objs->consumer_pe != NULL)
+            (void)doca_pe_progress(conn->objs->consumer_pe);
+        result = doca_dpa_d2h_memcpy(thread->dpa, &stopped,
+            thread->arg + offsetof(struct dpa_thread_arg, stopped), sizeof(stopped));
+        if (result != DOCA_SUCCESS)
+            return result;
+        if (stopped != 0)
+            break;
+    }
+    if (stopped == 0)
+        return DOCA_ERROR_TIME_OUT;
+    result = doca_dpa_d2h_memcpy(thread->dpa, &submitted,
+        thread->arg + offsetof(struct dpa_thread_arg, dma_submitted), sizeof(submitted));
+    if (result != DOCA_SUCCESS)
+        return result;
+    for (spins = 0; spins < 100000; ++spins) {
+        if (comch->completion_error || comch->dma_completed > submitted)
+            return DOCA_ERROR_IO_FAILED;
+        if (comch->dma_completed == submitted) {
+            thread->quiesced = true;
+            return DOCA_SUCCESS;
+        }
+        if (conn->objs != NULL && conn->objs->consumer_pe != NULL)
+            (void)doca_pe_progress(conn->objs->consumer_pe);
+    }
+    return DOCA_ERROR_TIME_OUT;
+}
+
+static doca_error_t
+stop_ctx_checked(struct doca_ctx *ctx, struct doca_pe *pe)
+{
+    enum doca_ctx_states state;
+    doca_error_t result;
+    if (ctx == NULL)
+        return DOCA_SUCCESS;
+    result = doca_ctx_get_state(ctx, &state);
+    if (result != DOCA_SUCCESS || state == DOCA_CTX_STATE_IDLE)
+        return result;
+    if (state != DOCA_CTX_STATE_STOPPING) {
+        result = doca_ctx_stop(ctx);
+        if (result != DOCA_SUCCESS && result != DOCA_ERROR_IN_PROGRESS)
+            return result;
+    }
+    for (unsigned spins = 0; spins < 100000; ++spins) {
+        result = doca_ctx_get_state(ctx, &state);
+        if (result != DOCA_SUCCESS || state == DOCA_CTX_STATE_IDLE)
+            return result;
+        if (pe != NULL)
+            (void)doca_pe_progress(pe);
+    }
+    return DOCA_ERROR_TIME_OUT;
+}
+
+static doca_error_t
+msgq_destroy_checked(struct dmesh_doca_dpa_msgq *msgq, struct doca_pe *pe)
+{
+    doca_error_t result;
+    if (msgq->producer != NULL) {
+        result = stop_ctx_checked(doca_comch_producer_as_ctx(msgq->producer), pe);
+        if (result != DOCA_SUCCESS)
+            return result;
+        result = doca_comch_producer_destroy(msgq->producer);
+        if (result != DOCA_SUCCESS)
+            return result;
+        msgq->producer = NULL;
+    }
+    if (msgq->consumer != NULL) {
+        result = stop_ctx_checked(doca_comch_consumer_as_ctx(msgq->consumer), pe);
+        if (result != DOCA_SUCCESS)
+            return result;
+        result = doca_comch_consumer_destroy(msgq->consumer);
+        if (result != DOCA_SUCCESS)
+            return result;
+        msgq->consumer = NULL;
+    }
+    if (msgq->msgq != NULL) {
+        if (msgq->started) {
+            result = doca_comch_msgq_stop(msgq->msgq);
+            if (result != DOCA_SUCCESS)
+                return result;
+            msgq->started = false;
+        }
+        result = doca_comch_msgq_destroy(msgq->msgq);
+        if (result != DOCA_SUCCESS)
+            return result;
+        msgq->msgq = NULL;
+    }
+    return DOCA_SUCCESS;
+}
+
+doca_error_t
+dmesh_doca_dpa_comch_destroy_checked(struct dmesh_conn *conn)
+{
+    struct dmesh_doca_dpa_comch *comch;
+    struct doca_pe *pe;
+    doca_error_t result;
+    if (conn == NULL || (comch = conn->dpa_comch) == NULL)
+        return DOCA_SUCCESS;
+    if (conn->dpa_thread != NULL && conn->dpa_thread->running && !conn->dpa_thread->quiesced)
+        return DOCA_ERROR_BAD_STATE;
+    pe = conn->objs != NULL ? conn->objs->consumer_pe : NULL;
+    comch->stopping = true;
+    result = msgq_destroy_checked(&comch->send, pe);
+    if (result != DOCA_SUCCESS)
+        return result;
+    result = msgq_destroy_checked(&comch->recv, pe);
+    if (result != DOCA_SUCCESS)
+        return result;
+    if (comch->consumer_comp != NULL) {
+        if (comch->consumer_comp_started) {
+            result = doca_comch_consumer_completion_stop(comch->consumer_comp);
+            if (result != DOCA_SUCCESS)
+                return result;
+            comch->consumer_comp_started = false;
+        }
+        result = doca_comch_consumer_completion_destroy(comch->consumer_comp);
+        if (result != DOCA_SUCCESS)
+            return result;
+        comch->consumer_comp = NULL;
+    }
+    if (comch->producer_comp != NULL) {
+        if (comch->producer_comp_started) {
+            result = doca_dpa_completion_stop(comch->producer_comp);
+            if (result != DOCA_SUCCESS)
+                return result;
+            comch->producer_comp_started = false;
+        }
+        result = doca_dpa_completion_destroy(comch->producer_comp);
+        if (result != DOCA_SUCCESS)
+            return result;
+        comch->producer_comp = NULL;
+    }
+    free(comch);
+    conn->dpa_comch = NULL;
+    return DOCA_SUCCESS;
+}
+
+doca_error_t
+dmesh_doca_dpa_thread_destroy_checked(struct dmesh_doca_dpa_thread *thread)
+{
+    doca_error_t result;
+    if (thread == NULL)
+        return DOCA_SUCCESS;
+    if (thread->running && !thread->quiesced)
+        return DOCA_ERROR_BAD_STATE;
+    if (thread->thread != NULL) {
+        result = doca_dpa_thread_destroy(thread->thread);
+        if (result != DOCA_SUCCESS)
+            return result;
+        thread->thread = NULL;
+        thread->running = false;
+    }
+    if (thread->arg != 0) {
+        result = doca_dpa_mem_free(thread->dpa, thread->arg);
+        if (result != DOCA_SUCCESS)
+            return result;
+        thread->arg = 0;
+    }
+    thread->quiesced = false;
     return DOCA_SUCCESS;
 }
 
@@ -1094,7 +1304,7 @@ dmesh_doca_run_dpa_thread(struct dmesh_conn *conn)
 
     if (rpc_ret != 0) {
         DOCA_LOG_ERR("Failed to init thread RPC");
-        return result;
+        return DOCA_ERROR_IO_FAILED;
     }
 
     result = doca_dpa_h2d_memcpy(dpa_thread->dpa, dpa_thread->arg, 
@@ -1105,6 +1315,8 @@ dmesh_doca_run_dpa_thread(struct dmesh_conn *conn)
 		return result;
 	}
 
+    dpa_thread->running = true;
+    dpa_thread->quiesced = false;
     result = doca_dpa_thread_run(dpa_thread->thread);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to run DPA thread - %s",

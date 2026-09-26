@@ -1,4 +1,5 @@
 #include "comch_common.h"
+#include "session_protocol.h"
 
 #include <doca_log.h>
 #include <doca_error.h>
@@ -15,74 +16,65 @@
 #include "dma.h"          /* BUFFER_SIZE */
 DOCA_LOG_REGISTER(COMCH_COMMON);
 
+_Static_assert(sizeof(struct dmesh_export_metadata_msg) <= DMESH_SESSION_MAX_PAYLOAD,
+               "OPEN metadata must fit a session frame");
+_Static_assert(sizeof(struct dmesh_export_rcv_ring_msg) <= DMESH_SESSION_MAX_PAYLOAD,
+               "reverse metadata must fit a session frame");
+
 /*
  * Export all host-side DMA metadata (ring + send buffer + receive buffer) to
  * the DPU in a single control-path message. Must be called after
  * setup_dma_ring() and both init_dmesh_buffer() calls.
  */
+static doca_error_t
+copy_export(struct doca_mmap *mmap, struct doca_dev *dev,
+            uint8_t *destination, size_t capacity, size_t *length)
+{
+    const void *data;
+    size_t len;
+    doca_error_t result = doca_mmap_export_pci(mmap, dev, &data, &len);
+    if (result != DOCA_SUCCESS)
+        return result;
+    if (len == 0 || len > capacity)
+        return DOCA_ERROR_INVALID_VALUE;
+    memcpy(destination, data, len);
+    *length = len;
+    return DOCA_SUCCESS;
+}
+
+doca_error_t
+build_dma_metadata(struct objects *objs, struct dmesh_export_metadata_msg *msg)
+{
+    if (!objs || !msg || !objs->dma_ring)
+        return DOCA_ERROR_INVALID_VALUE;
+    memset(msg, 0, sizeof(*msg));
+    msg->type = DMESH_MSG_EXPORT_METADATA;
+    msg->flow = objs->flow;
+    msg->ring_buf = objs->dma_ring->buffer;
+    msg->ring_buf_len = sizeof(struct dma_ring_ctrl) + objs->dma_ring->size * sizeof(struct dma_desc);
+    msg->sndbuf = objs->sndbuf.buf;
+    msg->sndbuf_len = objs->sndbuf.size;
+    msg->rcvbuf = objs->rcvbuf.buf;
+    msg->rcvbuf_len = objs->rcvbuf.size;
+    doca_error_t result = copy_export(objs->dma_ring->mmap, objs->dev,
+                                     msg->ring_desc, sizeof(msg->ring_desc), &msg->ring_desc_len);
+    if (result == DOCA_SUCCESS)
+        result = copy_export(objs->sndbuf.mmap, objs->dev,
+                             msg->snd_desc, sizeof(msg->snd_desc), &msg->snd_desc_len);
+    if (result == DOCA_SUCCESS)
+        result = copy_export(objs->rcvbuf.mmap, objs->dev,
+                             msg->rcv_desc, sizeof(msg->rcv_desc), &msg->rcv_desc_len);
+    return result;
+}
+
 doca_error_t
 export_dma_metadata(struct objects *objs)
 {
-    struct dmesh_buffer *sndbuf, *rcvbuf;
-    struct dmesh_export_metadata_msg *msg;
-    doca_error_t result;
-    const void *export_desc;
-    size_t export_desc_len;
-
-    sndbuf = &objs->sndbuf;
-    rcvbuf = &objs->rcvbuf;
-
-    msg = (struct dmesh_export_metadata_msg *)malloc(sizeof(struct dmesh_export_metadata_msg));
-    if (msg == NULL) {
-        DOCA_LOG_ERR("Failed to allocate memory for metadata export message");
-        return DOCA_ERROR_NO_MEMORY;
-    }
-
-    msg->type = DMESH_MSG_EXPORT_METADATA;
-    msg->flow = objs->flow;
-
-    /* DMA ring */
-    result = doca_mmap_export_pci(objs->dma_ring->mmap, objs->dev, &export_desc, &export_desc_len);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to export DMA ring mmap to DPU: %s", doca_error_get_descr(result));
-        free(msg);
+    struct dmesh_export_metadata_msg msg;
+    doca_error_t result = build_dma_metadata(objs, &msg);
+    if (result != DOCA_SUCCESS)
         return result;
-    }
-    msg->ring_buf = objs->dma_ring->buffer;
-    msg->ring_buf_len = sizeof(struct dma_ring_ctrl) + objs->dma_ring->size * sizeof(struct dma_desc);
-    msg->ring_desc_len = export_desc_len;
-    memcpy(msg->ring_desc, export_desc, export_desc_len);
-    DOCA_LOG_INFO("export mmap of DMA ring: descriptor length: %zu bytes", export_desc_len);
-
-    /* send buffer */
-    result = doca_mmap_export_pci(sndbuf->mmap, objs->dev, &export_desc, &export_desc_len);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to export send buffer mmap to DPU: %s", doca_error_get_descr(result));
-        free(msg);
-        return result;
-    }
-    msg->sndbuf = sndbuf->buf;
-    msg->sndbuf_len = sndbuf->size;
-    msg->snd_desc_len = export_desc_len;
-    memcpy(msg->snd_desc, export_desc, export_desc_len);
-    DOCA_LOG_INFO("export mmap of sndbuf: descriptor length: %zu bytes", export_desc_len);
-
-    /* receive buffer */
-    result = doca_mmap_export_pci(rcvbuf->mmap, objs->dev, &export_desc, &export_desc_len);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to export receive buffer mmap to DPU: %s", doca_error_get_descr(result));
-        free(msg);
-        return result;
-    }
-    msg->rcvbuf = rcvbuf->buf;
-    msg->rcvbuf_len = rcvbuf->size;
-    msg->rcv_desc_len = export_desc_len;
-    memcpy(msg->rcv_desc, export_desc, export_desc_len);
-    DOCA_LOG_INFO("export mmap of rcvbuf: descriptor length: %zu bytes", export_desc_len);
-
-    result = client_send_msg(objs, (const char *)msg, sizeof(struct dmesh_export_metadata_msg));
-    free(msg);
-    return result;
+    return client_send_msg(objs, (const char *)&msg, sizeof(msg));
 }
 
 /*
@@ -94,6 +86,18 @@ process_export_metadata_msg(struct dmesh_conn *conn, struct dmesh_export_metadat
 {
     struct objects *objs = conn->objs;
     doca_error_t result;
+
+    if (!metadata_msg || metadata_msg->type != DMESH_MSG_EXPORT_METADATA ||
+        metadata_msg->ring_desc_len == 0 || metadata_msg->ring_desc_len > sizeof(metadata_msg->ring_desc) ||
+        metadata_msg->snd_desc_len == 0 || metadata_msg->snd_desc_len > sizeof(metadata_msg->snd_desc) ||
+        metadata_msg->rcv_desc_len == 0 || metadata_msg->rcv_desc_len > sizeof(metadata_msg->rcv_desc) ||
+        !metadata_msg->ring_buf || !metadata_msg->sndbuf || !metadata_msg->rcvbuf ||
+        metadata_msg->ring_buf_len != sizeof(struct dma_ring_ctrl) + DMA_RING_SIZE * sizeof(struct dma_desc) ||
+        metadata_msg->sndbuf_len == 0 || metadata_msg->rcvbuf_len != BUFFER_SIZE ||
+        metadata_msg->flow.mode > DMESH_FLOW_MODE_BACKEND_PULL)
+        return DOCA_ERROR_INVALID_VALUE;
+    if (conn->ring_mmap || conn->sndbuf.mmap || conn->rcvbuf.mmap)
+        return DOCA_ERROR_BAD_STATE;
 
     conn->flow = metadata_msg->flow;
     conn->flow.src_workload[sizeof(conn->flow.src_workload) - 1] = '\0';
@@ -226,6 +230,10 @@ export_rcv_ring_metadata(struct dmesh_conn *conn)
     }
     msg->ring_buf = conn->rcv_ring->buffer;
     msg->ring_buf_len = sizeof(struct dma_ring_ctrl) + conn->rcv_ring->size * sizeof(struct dma_desc);
+    if (export_desc_len == 0 || export_desc_len > sizeof(msg->ring_desc)) {
+        free(msg);
+        return DOCA_ERROR_INVALID_VALUE;
+    }
     msg->ring_desc_len = export_desc_len;
     memcpy(msg->ring_desc, export_desc, export_desc_len);
 
@@ -238,10 +246,17 @@ export_rcv_ring_metadata(struct dmesh_conn *conn)
     }
     msg->tx_staging = conn->tx_staging;
     msg->tx_staging_len = conn->tx_staging_len;
+    if (export_desc_len == 0 || export_desc_len > sizeof(msg->tx_desc)) {
+        free(msg);
+        return DOCA_ERROR_INVALID_VALUE;
+    }
     msg->tx_desc_len = export_desc_len;
     memcpy(msg->tx_desc, export_desc, export_desc_len);
 
-    result = server_send_msg_conn(objs, conn->connection, (const char *)msg, sizeof(*msg));
+    if (conn->multiplexed)
+        result = server_send_flow_msg(conn, DMESH_SESSION_REVERSE_EXPORT, msg, sizeof(*msg), 0);
+    else
+        result = server_send_msg_conn(objs, conn->connection, (const char *)msg, sizeof(*msg));
     if (result != DOCA_SUCCESS) {
         free(msg);
         return result;
@@ -262,6 +277,13 @@ export_rcv_ring_metadata(struct dmesh_conn *conn)
 doca_error_t
 process_export_rcv_ring_msg(struct objects *objs, struct dmesh_export_rcv_ring_msg *msg)
 {
+    if (!msg || msg->type != DMESH_MSG_EXPORT_RCV_RING ||
+        msg->ring_desc_len == 0 || msg->ring_desc_len > sizeof(msg->ring_desc) ||
+        msg->tx_desc_len == 0 || msg->tx_desc_len > sizeof(msg->tx_desc) ||
+        !msg->ring_buf || !msg->tx_staging ||
+        msg->ring_buf_len != sizeof(struct dma_ring_ctrl) + DMA_RING_SIZE * sizeof(struct dma_desc) ||
+        msg->tx_staging_len != BUFFER_SIZE)
+        return DOCA_ERROR_INVALID_VALUE;
     objs->rev_msg = *msg;
     objs->reverse_ready = true;
     DOCA_LOG_INFO("Stashed reverse rcv_ring (%p, %zu) + tx_staging (%p, %zu) export from DPU",

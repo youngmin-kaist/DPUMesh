@@ -12,6 +12,81 @@
 DOCA_LOG_REGISTER(OBJECT);
 
 struct dmesh_conn *
+dmesh_flow_get(struct objects *objs, struct doca_comch_connection *connection,
+               uint32_t flow_id, uint32_t generation)
+{
+    if (objs == NULL || connection == NULL || flow_id == 0 ||
+        flow_id > DMESH_MAX_CONNECTIONS || generation == 0)
+        return NULL;
+    for (int i = 0; i < DMESH_MAX_CONNECTIONS; ++i) {
+        struct dmesh_conn *conn = &objs->conns[i];
+        if (conn->state != DMESH_CONN_FREE && conn->connection == connection &&
+            conn->flow_id == flow_id && conn->generation == generation)
+            return conn;
+    }
+    return NULL;
+}
+
+struct dmesh_conn *
+dmesh_flow_open(struct objects *objs, struct doca_comch_connection *connection,
+                uint32_t flow_id, uint32_t generation)
+{
+    struct dmesh_conn *conn = dmesh_flow_get(objs, connection, flow_id, generation);
+    if (conn != NULL)
+        return conn;
+    if (objs == NULL || connection == NULL || flow_id == 0 ||
+        flow_id > DMESH_MAX_CONNECTIONS || generation == 0)
+        return NULL;
+    for (int i = 0; i < DMESH_MAX_CONNECTIONS; ++i) {
+        conn = &objs->conns[i];
+        if (conn->state == DMESH_CONN_FREE) {
+            memset(conn, 0, sizeof(*conn));
+            conn->objs = objs;
+            conn->connection = connection;
+            conn->flow_id = flow_id;
+            conn->generation = generation;
+            conn->multiplexed = true;
+            conn->state = DMESH_CONN_NEW;
+            return conn;
+        }
+    }
+    return NULL;
+}
+
+void
+dmesh_flow_close_session(struct objects *objs, struct doca_comch_connection *connection)
+{
+    if (objs == NULL || connection == NULL)
+        return;
+    for (int i = 0; i < DMESH_MAX_CONNECTIONS; ++i)
+        if (objs->conns[i].state != DMESH_CONN_FREE &&
+            objs->conns[i].connection == connection)
+            objs->conns[i].state = DMESH_CONN_CLOSING;
+}
+
+doca_error_t
+dmesh_flow_readers_detached(struct objects *objs, int slot)
+{
+    if (objs == NULL || slot < 0 || slot >= DMESH_MAX_CONNECTIONS)
+        return DOCA_ERROR_INVALID_VALUE;
+    struct dmesh_conn *conn = &objs->conns[slot];
+    if (conn->state != DMESH_CONN_CLOSING)
+        return DOCA_ERROR_BAD_STATE;
+    conn->readers_detached = true;
+    return DOCA_SUCCESS;
+}
+
+bool
+dmesh_objects_have_live_flows(const struct objects *objs)
+{
+    if (objs != NULL)
+        for (int i = 0; i < DMESH_MAX_CONNECTIONS; ++i)
+            if (objs->conns[i].state != DMESH_CONN_FREE)
+                return true;
+    return false;
+}
+
+struct dmesh_conn *
 dmesh_conn_get(struct objects *objs, struct doca_comch_connection *connection)
 {
     int i;

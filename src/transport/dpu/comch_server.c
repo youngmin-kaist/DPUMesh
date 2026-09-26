@@ -2,6 +2,10 @@
 #include "comch_server.h"
 
 #include <time.h>
+#include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+#include "session_protocol.h"
 
 #include "common.h"
 #include "object.h"
@@ -21,86 +25,141 @@
 
 DOCA_LOG_REGISTER(COMCH_SERVER);
 
-static void server_send_task_completion_callback(struct doca_comch_task_send *task,
-						 union doca_data task_user_data,
-						 union doca_data ctx_user_data)
+struct session_send {
+    struct dmesh_session *session;
+    uint8_t bytes[];
+};
+
+static uint64_t session_now_ms(void);
+
+static struct dmesh_session *
+session_get(struct objects *objs, struct doca_comch_connection *connection, bool create)
 {
-	struct objects *objs;
+    struct dmesh_session *free_session = NULL;
+    if (connection == NULL)
+        return NULL;
+    for (int i = 0; i < DMESH_MAX_SESSIONS; ++i) {
+        struct dmesh_session *s = &objs->sessions[i];
+        if (s->occupied && s->connection == connection)
+            return s;
+        if (!s->occupied && free_session == NULL)
+            free_session = s;
+    }
+    if (create && free_session != NULL) {
+        memset(free_session, 0, sizeof(*free_session));
+        free_session->occupied = true;
+        free_session->connection = connection;
+        free_session->hello_deadline_ms = session_now_ms() + 5000u;
+        return free_session;
+    }
+    return NULL;
+}
 
-	(void)task_user_data;
+static void session_fail(struct objects *objs, struct dmesh_session *s)
+{
+    if (s == NULL)
+        return;
+    s->closing = true;
+    dmesh_flow_close_session(objs, s->connection);
+}
 
-	objs = (struct objects *)ctx_user_data.ptr;
-	(void)objs;
-	DOCA_LOG_INFO("Server task sent successfully");
-	doca_task_free(doca_comch_task_send_as_task(task));
+/* A successful disconnect event already retired the SDK peer. Drop every
+ * alias immediately: the SDK may reuse the address before deferred flow
+ * teardown completes. Session ownership survives while sends/flows remain. */
+static void session_peer_detached(struct objects *objs, struct dmesh_session *s)
+{
+    if (s == NULL)
+        return;
+    if (objs->connection == s->connection)
+        objs->connection = NULL;
+    for (int i = 0; i < DMESH_MAX_CONNECTIONS; ++i)
+        if (objs->conns[i].session == s)
+            objs->conns[i].connection = NULL;
+    s->connection = NULL;
+}
+
+static void server_send_task_completion_callback(struct doca_comch_task_send *task,
+                                                  union doca_data task_user_data,
+                                                  union doca_data ctx_user_data)
+{
+    struct session_send *send = task_user_data.ptr;
+    (void)ctx_user_data;
+    if (send != NULL && send->session != NULL)
+        --send->session->sends_pending;
+    doca_task_free(doca_comch_task_send_as_task(task));
+    free(send);
 }
 
 static void server_send_task_completion_err_callback(struct doca_comch_task_send *task,
-						     union doca_data task_user_data,
-						     union doca_data ctx_user_data)
+                                                      union doca_data task_user_data,
+                                                      union doca_data ctx_user_data)
 {
-	struct objects *objs;
-
-	(void)task_user_data;
-
-	objs = (struct objects *)ctx_user_data.ptr;
-	doca_task_free(doca_comch_task_send_as_task(task));
-	(void)doca_ctx_stop(doca_comch_server_as_ctx(objs->cc_server));
-}
-
-/**
- * Server sends a message to client
- *
- * @sample_objects [in]: The sample object to use
- * @msg [in]: The msg to send
- * @len [in]: The msg length
- * @return: DOCA_SUCCESS on success and DOCA_ERROR otherwise
- */
-doca_error_t 
-server_send_msg_conn(struct objects *objs, struct doca_comch_connection *connection,
-		     const char *msg, size_t len)
-{
-	doca_error_t result;
-	struct doca_comch_task_send *task;
-
-	result = doca_comch_server_task_send_alloc_init(objs->cc_server, connection,
-							(void *)msg, len, &task);
-	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to allocate server task with error = %s", doca_error_get_name(result));
-		return result;
-	}
-
-	result = doca_task_submit(doca_comch_task_send_as_task(task));
-	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to send server task with error = %s", doca_error_get_name(result));
-		doca_task_free(doca_comch_task_send_as_task(task));
-		return result;
-	}
-
-	return DOCA_SUCCESS;
+    struct session_send *send = task_user_data.ptr;
+    struct objects *objs = ctx_user_data.ptr;
+    if (send != NULL) {
+        session_fail(objs, send->session);
+        if (send->session != NULL)
+            --send->session->sends_pending;
+    }
+    doca_task_free(doca_comch_task_send_as_task(task));
+    free(send);
 }
 
 doca_error_t
-server_send_msg(struct objects *objs, const char *msg, size_t len)
+server_send_msg_conn(struct objects *objs, struct doca_comch_connection *connection,
+                     const char *msg, size_t len)
 {
-	doca_error_t result;
-	struct doca_comch_task_send *task;
+    struct doca_comch_task_send *task;
+    struct session_send *send;
+    doca_error_t result;
+    if (objs == NULL || connection == NULL || msg == NULL || len > UINT32_MAX)
+        return DOCA_ERROR_INVALID_VALUE;
+    send = malloc(sizeof(*send) + len);
+    if (send == NULL)
+        return DOCA_ERROR_NO_MEMORY;
+    send->session = session_get(objs, connection, false);
+    memcpy(send->bytes, msg, len);
+    result = doca_comch_server_task_send_alloc_init(objs->cc_server, connection,
+                                                   send->bytes, (uint32_t)len, &task);
+    if (result != DOCA_SUCCESS) {
+        free(send);
+        return result;
+    }
+    doca_task_set_user_data(doca_comch_task_send_as_task(task), (union doca_data){.ptr = send});
+    result = doca_task_submit(doca_comch_task_send_as_task(task));
+    if (result != DOCA_SUCCESS) {
+        doca_task_free(doca_comch_task_send_as_task(task));
+        free(send);
+        return result;
+    }
+    if (send->session != NULL)
+        ++send->session->sends_pending;
+    return DOCA_SUCCESS;
+}
 
-	result = doca_comch_server_task_send_alloc_init(objs->cc_server, objs->connection,
-							(void *)msg, len, &task);
-	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to allocate server task with error = %s", doca_error_get_name(result));
-		return result;
-	}
+doca_error_t server_send_msg(struct objects *objs, const char *msg, size_t len)
+{
+    return server_send_msg_conn(objs, objs->connection, msg, len);
+}
 
-	result = doca_task_submit(doca_comch_task_send_as_task(task));
-	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to send server task with error = %s", doca_error_get_name(result));
-		doca_task_free(doca_comch_task_send_as_task(task));
-		return result;
-	}
+static doca_error_t
+session_send_frame(struct objects *objs, struct dmesh_session *session, uint16_t type,
+                   uint32_t flow_id, uint32_t generation, const void *payload,
+                   size_t length, int32_t status)
+{
+    uint8_t frame[DMESH_SESSION_MAX_FRAME];
+    size_t len = dmesh_session_encode(frame, sizeof(frame), type, flow_id, generation,
+                                      status, payload, length);
+    if (len == 0 || session == NULL || session->connection == NULL || session->closing)
+        return DOCA_ERROR_INVALID_VALUE;
+    return server_send_msg_conn(objs, session->connection, (const char *)frame, len);
+}
 
-	return DOCA_SUCCESS;
+doca_error_t server_send_flow_msg(struct dmesh_conn *conn, uint16_t type,
+                                 const void *payload, size_t length, int32_t status)
+{
+    return session_send_frame(conn->objs, conn->session, type, conn->flow_id,
+                              conn->generation, payload, length, status);
 }
 
 /**
@@ -111,60 +170,125 @@ server_send_msg(struct objects *objs, const char *msg, size_t len)
  * @msg_len [in]: Message len
  * @comch_connection [in]: Connection the message was received on
  */
-static void server_message_recv_callback(struct doca_comch_event_msg_recv *event,
-					 uint8_t *recv_buffer,
-					 uint32_t msg_len,
-					 struct doca_comch_connection *comch_connection)
+static void session_flow_error(struct objects *objs, struct dmesh_session *s,
+                               const struct dmesh_session_header *h, int status)
 {
-	union doca_data user_data;
-	struct doca_comch_server *comch_server;
-	struct objects *objs;
-	doca_error_t result;
-	struct dmesh_comch_msg *comch_msg;
+    (void)session_send_frame(objs, s, DMESH_SESSION_ERROR, h->flow_id,
+                             h->generation, NULL, 0, status);
+}
 
-	(void)event;
-
-	// DOCA_LOG_INFO("Message received: '%.*s', size: %u", (int)msg_len, recv_buffer, msg_len);
-
-	comch_server = doca_comch_server_get_server_ctx(comch_connection);
-	result = doca_ctx_get_user_data(doca_comch_server_as_ctx(comch_server), &user_data);
-	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to get user data from ctx with error = %s", doca_error_get_name(result));
-		return;
-	}
-
-	objs = (struct objects *)user_data.ptr;
-	objs->connection = comch_connection;
-
-	comch_msg = (struct dmesh_comch_msg *)recv_buffer;
-
-	DOCA_LOG_INFO("Received message from client with type = %u", comch_msg->type);
-	switch (comch_msg->type) {
-	case DMESH_MSG_EXPORT_METADATA:
-		if (msg_len < sizeof(struct dmesh_export_metadata_msg)) {
-			DOCA_LOG_ERR("Received invalid METADATA message from client");
-			return;
-		}
-		{
-			struct dmesh_conn *conn = dmesh_conn_get(objs, comch_connection);
-
-			if (conn == NULL) {
-				/* Metadata can arrive before the connection event was
-				 * processed; bind the slot here. */
-				conn = dmesh_conn_open(objs, comch_connection);
-			}
-			if (conn == NULL) {
-				DOCA_LOG_ERR("No connection slot for metadata message");
-				return;
-			}
-			result = process_export_metadata_msg(conn, (struct dmesh_export_metadata_msg *)recv_buffer);
-		}
-		break;
-	default:
-
-		DOCA_LOG_ERR("Received unknown message type from client: %u", comch_msg->type);
-		break;
-	}
+static void server_message_recv_callback(struct doca_comch_event_msg_recv *event,
+                                          uint8_t *buffer, uint32_t len,
+                                          struct doca_comch_connection *connection)
+{
+    struct doca_comch_server *server = doca_comch_server_get_server_ctx(connection);
+    union doca_data data;
+    struct dmesh_session_header h;
+    const uint8_t *payload;
+    struct objects *objs;
+    struct dmesh_session *s;
+    struct dmesh_conn *conn;
+    unsigned idx;
+    (void)event;
+    if (doca_ctx_get_user_data(doca_comch_server_as_ctx(server), &data) != DOCA_SUCCESS)
+        return;
+    objs = data.ptr;
+    /* Only the connection callback admits a physical peer. In particular,
+     * a late receive after disconnect must not recreate a retired session. */
+    s = session_get(objs, connection, false);
+    if (s == NULL)
+        return;
+    if (dmesh_session_decode(buffer, len, &h, &payload) != 0) {
+        DOCA_LOG_WARN("Rejecting incompatible or malformed Comch session protocol");
+        session_fail(objs, s);
+        return;
+    }
+    if (s->closing)
+        return;
+    if (h.type == DMESH_SESSION_HELLO) {
+        s->negotiated = true;
+        s->hello_pending = true;
+        return;
+    }
+    if (!s->negotiated || h.flow_id == 0 || h.flow_id > DMESH_MAX_CONNECTIONS) {
+        session_fail(objs, s);
+        return;
+    }
+    idx = h.flow_id - 1;
+    conn = dmesh_flow_get(objs, connection, h.flow_id, h.generation);
+    if (h.type == DMESH_SESSION_OPEN) {
+        if (h.payload_len != sizeof(struct dmesh_export_metadata_msg)) {
+            session_flow_error(objs, s, &h, EINVAL);
+            return;
+        }
+        if (h.generation < s->generation[idx] ||
+            (h.generation == s->generation[idx] && s->closed[idx])) {
+            session_flow_error(objs, s, &h, ESTALE);
+            return;
+        }
+        if (conn != NULL) {
+            if (conn->ready_sent)
+                (void)server_send_flow_msg(conn, DMESH_SESSION_READY, NULL, 0, 0);
+            else if (conn->error_status)
+                session_flow_error(objs, s, &h, conn->error_status);
+            return;
+        }
+        for (int i = 0; i < DMESH_MAX_CONNECTIONS; ++i)
+            if (objs->conns[i].state != DMESH_CONN_FREE &&
+                objs->conns[i].session == s && objs->conns[i].flow_id == h.flow_id) {
+                session_flow_error(objs, s, &h, EBUSY);
+                return;
+            }
+        if (s->close_pending[idx]) {
+            session_flow_error(objs, s, &h, EBUSY);
+            return;
+        }
+        s->generation[idx] = h.generation;
+        s->closed[idx] = false;
+        s->close_status[idx] = 0;
+        conn = dmesh_flow_open(objs, connection, h.flow_id, h.generation);
+        if (conn == NULL) {
+            s->closed[idx] = true;
+            s->close_status[idx] = 0; /* no flow resources were acquired */
+            session_flow_error(objs, s, &h, ENOSPC);
+            return;
+        }
+        conn->session = s;
+        conn->pending_metadata = malloc(sizeof(*conn->pending_metadata));
+        if (conn->pending_metadata == NULL) {
+            conn->error_status = ENOMEM;
+            conn->state = DMESH_CONN_ERROR;
+        } else {
+            memcpy(conn->pending_metadata, payload, sizeof(*conn->pending_metadata));
+        }
+        return;
+    }
+    if (h.type == DMESH_SESSION_CLOSE) {
+        if (conn != NULL) {
+            conn->close_requested = true;
+            s->close_pending[idx] = false;
+            conn->state = DMESH_CONN_CLOSING;
+        } else if (h.generation == s->generation[idx] && s->closed[idx]) {
+            s->close_pending[idx] = true;
+        } else {
+            bool id_live = false;
+            for (int i = 0; i < DMESH_MAX_CONNECTIONS; ++i)
+                id_live |= objs->conns[i].state != DMESH_CONN_FREE &&
+                           objs->conns[i].session == s && objs->conns[i].flow_id == h.flow_id;
+            if (!id_live && h.generation >= s->generation[idx]) {
+                s->generation[idx] = h.generation;
+                s->closed[idx] = true;
+                s->close_status[idx] = 0;
+                s->close_pending[idx] = true;
+            } else {
+                /* A stale identity has no resources; never touch a newer flow. */
+                (void)session_send_frame(objs, s, DMESH_SESSION_CLOSED, h.flow_id,
+                                         h.generation, NULL, 0, 0);
+            }
+        }
+        return;
+    }
+    session_flow_error(objs, s, &h, EPROTO);
 }
 
 static void dmesh_doca_comch_server_conn_ev_cb(struct doca_comch_event_connection_status_changed *event,
@@ -250,18 +374,9 @@ static void server_connection_event_callback(struct doca_comch_event_connection_
 
 	DOCA_LOG_INFO("New connection established with client");
 
-	/* Bind a connection slot and assign a pre-created DPA thread to it. Both
-	 * are pure memory operations, so they are safe inside this event callback.
-	 * The pool may not exist yet if the client connects before the first
-	 * advance() runs; dmesh_doca_conn_advance retries the assignment then. */
-	struct dmesh_conn *conn = dmesh_conn_open(objs, comch_connection);
-	if (conn == NULL) {
-		DOCA_LOG_ERR("Connection rejected: no free connection slot");
-		return;
-	}
-	conn->dpa_thread = dmesh_dpa_thread_pool_alloc(objs, comch_connection);
-	if (conn->dpa_thread == NULL)
-		DOCA_LOG_WARN("No DPA thread assigned to new connection yet");
+	/* Physical Comch registration does not consume a data/DPA flow slot. */
+    if (session_get(objs, comch_connection, true) == NULL)
+        (void)doca_comch_server_disconnect(objs->cc_server, comch_connection);
 }
 
 /**
@@ -295,16 +410,11 @@ static void server_disconnection_event_callback(struct doca_comch_event_connecti
 
 	objs = (struct objects *)user_data.ptr;
 
-	/* Do NOT tear down DOCA resources here: this callback runs inside
-	 * doca_pe_progress(control PE), and teardown must progress the consumer PE
-	 * (re-entrancy is forbidden). Just mark the slot; dmesh_doca_ctrl_advance
-	 * performs the teardown from the driver loop. */
-	{
-		struct dmesh_conn *conn = dmesh_conn_get(objs, comch_connection);
-
-		if (conn != NULL && conn->state != DMESH_CONN_FREE)
-			conn->state = DMESH_CONN_CLOSING;
-	}
+	/* Every logical flow on this session closes; other channels survive. */
+    struct dmesh_session *session = session_get(objs, comch_connection, false);
+    session_fail(objs, session);
+    if (change_success != 0)
+        session_peer_detached(objs, session);
 }
 
 doca_error_t
@@ -790,7 +900,7 @@ dmesh_conn_teardown(struct dmesh_conn *conn)
     cleanup_dma_tasks(conn);
 
     /* Return the DPA pool thread and unbind the slot. */
-    dmesh_dpa_thread_pool_release(objs, conn->connection);
+    dmesh_dpa_thread_pool_release(objs, conn);
 
     /* Release the server-side comch connection object. Without this the
      * firmware channel resources of dead clients leak, and the NEXT client
@@ -826,6 +936,196 @@ dmesh_conn_teardown(struct dmesh_conn *conn)
     }
 }
 
+/* A successful close is a resource fence, not just a software state change. */
+static doca_error_t flow_mmap_destroy(struct doca_mmap **mmap)
+{
+    if (*mmap == NULL)
+        return DOCA_SUCCESS;
+    doca_error_t result = doca_mmap_destroy(*mmap);
+    if (result == DOCA_SUCCESS)
+        *mmap = NULL;
+    return result;
+}
+
+static doca_error_t flow_local_buffer_destroy(struct doca_mmap **mmap, void **buffer)
+{
+    if (*mmap == NULL)
+        return DOCA_SUCCESS;
+    doca_error_t result = flow_mmap_destroy(mmap);
+    if (result == DOCA_SUCCESS) {
+        free(*buffer);
+        *buffer = NULL;
+    }
+    return result;
+}
+
+static bool flow_has_resources(const struct dmesh_conn *conn)
+{
+    return conn->dpa_thread || conn->dpa_comch || conn->dma_ctx || conn->buf_arr ||
+           conn->ring_mmap || conn->sndbuf.mmap || conn->rcvbuf.mmap ||
+           conn->local_mmap || conn->rcv_ring || conn->tx_staging_mmap;
+}
+
+static doca_error_t dmesh_flow_teardown_checked(struct dmesh_conn *conn)
+{
+    doca_error_t result;
+    if (getenv("DMESH_NO_TEARDOWN") != NULL && flow_has_resources(conn))
+        return DOCA_ERROR_NOT_SUPPORTED;
+    conn->dma_closing = true;
+    result = dmesh_doca_dpa_quiesce_checked(conn);
+    if (result != DOCA_SUCCESS)
+        return result;
+    result = cleanup_dma_tasks(conn);
+    if (result != DOCA_SUCCESS)
+        return result;
+    result = dmesh_doca_dpa_comch_destroy_checked(conn);
+    if (result != DOCA_SUCCESS)
+        return result;
+    result = dmesh_doca_dpa_thread_destroy_checked(conn->dpa_thread);
+    if (result != DOCA_SUCCESS)
+        return result;
+    if (conn->buf_arr != NULL) {
+        result = doca_buf_arr_destroy(conn->buf_arr); /* also stops the array */
+        if (result != DOCA_SUCCESS)
+            return result;
+        conn->buf_arr = NULL;
+    }
+    if ((result = flow_mmap_destroy(&conn->ring_mmap)) != DOCA_SUCCESS ||
+        (result = flow_mmap_destroy(&conn->sndbuf.mmap)) != DOCA_SUCCESS ||
+        (result = flow_mmap_destroy(&conn->rcvbuf.mmap)) != DOCA_SUCCESS ||
+        (result = flow_local_buffer_destroy(&conn->local_mmap, &conn->dma_buffer)) != DOCA_SUCCESS)
+        return result;
+    if (conn->rcv_ring != NULL) {
+        result = flow_local_buffer_destroy(&conn->rcv_ring->mmap, &conn->rcv_ring->buffer);
+        if (result != DOCA_SUCCESS)
+            return result;
+        free(conn->rcv_ring);
+        conn->rcv_ring = NULL;
+    }
+    result = flow_local_buffer_destroy(&conn->tx_staging_mmap, &conn->tx_staging);
+    if (result != DOCA_SUCCESS)
+        return result;
+    dmesh_dpa_thread_pool_release(conn->objs, conn);
+    conn->dpa_thread = NULL;
+    free(conn->pending_metadata);
+    conn->pending_metadata = NULL;
+    conn->sndbuf.buf = conn->rcvbuf.buf = NULL;
+    return DOCA_SUCCESS;
+}
+
+static int flow_close_errno(doca_error_t result)
+{
+    if (result == DOCA_ERROR_NOT_SUPPORTED)
+        return EOPNOTSUPP;
+    if (result == DOCA_ERROR_TIME_OUT)
+        return ETIMEDOUT;
+    if (result == DOCA_ERROR_AGAIN || result == DOCA_ERROR_IN_PROGRESS || result == DOCA_ERROR_IN_USE)
+        return EBUSY;
+    return EIO;
+}
+
+static void dmesh_flow_close_advance(struct dmesh_conn *conn)
+{
+    struct dmesh_session *session = conn->session;
+    unsigned idx = conn->flow_id - 1;
+    /* SDK/DPA quiescence does not retire pointers held by proxy IO tasks.
+     * The driver clears those pointers under its IO mutex before this ACK. */
+    if (conn->objs->external_readers && !conn->readers_detached)
+        return;
+    if (!conn->close_requested && !session->closing) {
+        /* A proxy-side EOF first asks the host to stop its reverse reader. */
+        conn->error_status = ECONNRESET;
+        conn->error_sent = false;
+        conn->state = DMESH_CONN_ERROR;
+        return;
+    }
+    if (!conn->close_requested && session->closing && conn->reverse_exported &&
+        !DMESH_FLOW_USES_PUSH(conn->flow.mode)) {
+        /* Lost control transport cannot prove that the host DPA stopped
+         * reading exported DPU memory. Reserve this slot until recovery. */
+        conn->quarantined = true;
+        conn->dma_closing = true;
+        /* Stop this DPU's reader as far as possible, but its completion is
+         * not evidence that the remote host reader released our exports. */
+        (void)dmesh_doca_dpa_quiesce_checked(conn);
+        conn->error_status = ECONNRESET;
+        conn->error_sent = true;
+        conn->state = DMESH_CONN_ERROR;
+        return;
+    }
+    doca_error_t result = dmesh_flow_teardown_checked(conn);
+    if (result != DOCA_SUCCESS) {
+        conn->error_status = flow_close_errno(result);
+        conn->error_sent = true; /* report this attempt as CLOSED(error) */
+        conn->state = DMESH_CONN_ERROR;
+        if (!session->closing) {
+            session->close_status[idx] = conn->error_status;
+            session->close_pending[idx] = true;
+        } else {
+            conn->quarantined = true;
+        }
+        return;
+    }
+    session->closed[idx] = true;
+    session->close_status[idx] = 0;
+    session->close_pending[idx] = !session->closing && conn->close_requested;
+    conn->connection = NULL;
+    conn->state = DMESH_CONN_FREE;
+}
+
+static uint64_t session_now_ms(void)
+{
+    struct timespec now = {0};
+    (void)clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * 1000u + (uint64_t)now.tv_nsec / 1000000u;
+}
+
+/* The physical connection belongs to the channel session. Flow cleanup must
+ * never disconnect a sibling flow. Keep failed-session records occupied while
+ * quarantined exported buffers still belong to them. */
+static void sessions_advance(struct objects *objs)
+{
+    uint64_t now = session_now_ms();
+    for (int n = 0; n < DMESH_MAX_SESSIONS; ++n) {
+        struct dmesh_session *s = &objs->sessions[n];
+        bool live = false, closing_flow = false;
+        if (!s->occupied)
+            continue;
+        if (!s->negotiated && !s->closing && now >= s->hello_deadline_ms)
+            session_fail(objs, s);
+        if (!s->closing) {
+            if (s->hello_pending &&
+                session_send_frame(objs, s, DMESH_SESSION_HELLO_ACK, 0, 0, NULL, 0, 0) == DOCA_SUCCESS)
+                s->hello_pending = false;
+            for (unsigned i = 0; i < DMESH_MAX_CONNECTIONS; ++i)
+                if (s->close_pending[i] &&
+                    session_send_frame(objs, s, DMESH_SESSION_CLOSED, i + 1, s->generation[i],
+                                       NULL, 0, s->close_status[i]) == DOCA_SUCCESS)
+                    s->close_pending[i] = false;
+            continue;
+        }
+        for (int i = 0; i < DMESH_MAX_CONNECTIONS; ++i) {
+            struct dmesh_conn *conn = &objs->conns[i];
+            if (conn->state != DMESH_CONN_FREE && conn->session == s) {
+                live = true;
+                closing_flow |= conn->state == DMESH_CONN_CLOSING;
+            }
+        }
+        if (closing_flow || s->sends_pending != 0)
+            continue;
+        if (s->connection != NULL) {
+            doca_error_t result = doca_comch_server_disconnect(objs->cc_server, s->connection);
+            if (result != DOCA_SUCCESS && result != DOCA_ERROR_NOT_CONNECTED)
+                continue; /* including AGAIN: retry after the shared PE progresses */
+            /* A peer may have disconnected before its event was observed.
+             * NOT_CONNECTED is terminal, never a send-queue retry condition. */
+            session_peer_detached(objs, s);
+        }
+        if (!live)
+            memset(s, 0, sizeof(*s));
+    }
+}
+
 /* Advance one connection's setup state machine. A failure parks only this
  * connection (DMESH_CONN_ERROR); other connections keep running. */
 static void
@@ -836,10 +1136,19 @@ dmesh_doca_conn_advance(struct dmesh_conn *conn)
 
 	switch (conn->state) {
 	case DMESH_CONN_NEW:
+        if (conn->multiplexed && conn->pending_metadata != NULL) {
+            result = process_export_metadata_msg(conn, conn->pending_metadata);
+            free(conn->pending_metadata);
+            conn->pending_metadata = NULL;
+            if (result != DOCA_SUCCESS) {
+                conn->error_status = EINVAL;
+                goto error;
+            }
+        }
 		/* The connection callback normally assigns a pool thread; retry here
 		 * in case the client connected before the pool existed. */
 		if (conn->dpa_thread == NULL)
-			conn->dpa_thread = dmesh_dpa_thread_pool_alloc(objs, conn->connection);
+			conn->dpa_thread = dmesh_dpa_thread_pool_alloc(objs, conn);
 		if (conn->dpa_thread == NULL) {
 			DOCA_LOG_ERR("No DPA thread available for connection %p", (void *)conn->connection);
 			goto error;
@@ -855,19 +1164,21 @@ dmesh_doca_conn_advance(struct dmesh_conn *conn)
 			goto error;
 		}
 
+        if (!conn->multiplexed) {
 		result = init_comch_datapath_consumer(conn);
 		if (result != DOCA_SUCCESS) {
 			DOCA_LOG_ERR("Failed to init datapath consumer: %s", doca_error_get_name(result));
 			goto error;
 		}
 
+        }
 		result = init_comch_dpa_msgq(conn, objs->consumer_pe);
 		if (result != DOCA_SUCCESS) {
 			DOCA_LOG_ERR("Failed to init comch DPA msgq: %s", doca_error_get_name(result));
 			goto error;
 		}
 
-		conn->state = DMESH_CONN_CONSUMER_STARTING;
+		conn->state = conn->multiplexed ? DMESH_CONN_AWAIT_METADATA : DMESH_CONN_CONSUMER_STARTING;
 		break;
 
 	case DMESH_CONN_CONSUMER_STARTING: {
@@ -976,9 +1287,16 @@ dmesh_doca_conn_advance(struct dmesh_conn *conn)
 						     doca_error_get_name(result));
 			}
 		}
+        if (conn->multiplexed && conn->reverse_exported && !conn->ready_sent &&
+            server_send_flow_msg(conn, DMESH_SESSION_READY, NULL, 0, 0) == DOCA_SUCCESS)
+            conn->ready_sent = true;
 		break;
 
 	case DMESH_CONN_CLOSING:
+        if (conn->multiplexed) {
+            dmesh_flow_close_advance(conn);
+            break;
+        }
 		/* DMESH_NO_TEARDOWN=1: park the dead slot instead of tearing it
 		 * down. Teardown's DPA-thread destroy fails inside flexio in the
 		 * proxy process and wedges the whole comch function (every later
@@ -1047,8 +1365,15 @@ dmesh_doca_conn_advance(struct dmesh_conn *conn)
 		dmesh_conn_teardown(conn);
 		break;
 
-	case DMESH_CONN_FREE:
 	case DMESH_CONN_ERROR:
+        if (conn->multiplexed && !conn->error_sent) {
+            if (conn->error_status == 0)
+                conn->error_status = EIO;
+            if (server_send_flow_msg(conn, DMESH_SESSION_ERROR, NULL, 0, conn->error_status) == DOCA_SUCCESS)
+                conn->error_sent = true;
+        }
+        break;
+	case DMESH_CONN_FREE:
 	default:
 		break;
 	}
@@ -1100,11 +1425,15 @@ dmesh_doca_ctrl_advance(struct objects *objs, enum dmesh_doca_init_state *out_st
 		objs->phase = DMESH_DOCA_STATE_RUNNING;
 	}
 
+    sessions_advance(objs);
+
 	/* Serve every bound connection; each has its own state machine. */
 	for (i = 0; i < DMESH_MAX_CONNECTIONS; i++) {
 		if (objs->conns[i].state != DMESH_CONN_FREE)
 			dmesh_doca_conn_advance(&objs->conns[i]);
 	}
+
+    sessions_advance(objs);
 
 	*out_state = objs->phase;
 	return DOCA_SUCCESS;

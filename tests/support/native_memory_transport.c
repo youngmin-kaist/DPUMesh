@@ -22,6 +22,8 @@ struct dmesh_native_transport {
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static struct dmesh_native_transport *channels[CHANNELS];
 static int hold_acks;
+static int fail_close;
+void test_native_fail_close(int value) { fail_close = value; }
 static struct event_node *held[CHANNELS];
 static void push(struct dmesh_native_transport *t, struct dmesh_native_event e) {
     struct event_node *n = calloc(1, sizeof(*n)); assert(n);
@@ -63,6 +65,7 @@ int dmesh_native_open(struct dmesh_native_transport **out, struct dmesh_native_c
     return 0;
 }
 int dmesh_native_close(struct dmesh_native_transport *t) {
+    if (fail_close) { errno = EIO; return -1; }
     pthread_mutex_lock(&lock);
     for (size_t i = 0; i < t->slots; ++i) if (t->leased[i] == 1) {
         pthread_mutex_unlock(&lock); errno = EBUSY; return -1;

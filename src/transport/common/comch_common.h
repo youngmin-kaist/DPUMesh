@@ -157,6 +157,9 @@ struct dmesh_comch_msg {
 
 struct dmesh_conn;
 
+/* Build metadata without sending it; channel sessions add the flow envelope. */
+doca_error_t
+build_dma_metadata(struct objects *objs, struct dmesh_export_metadata_msg *msg);
 doca_error_t
 export_dma_metadata(struct objects *objs);
 doca_error_t

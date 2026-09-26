@@ -135,9 +135,20 @@ static void handle_msgs(struct dpa_thread_arg *thread_arg)
  * therefore only helps messages smaller than 8KB). */
 #define DMA_BATCH_MAX_DESCS 8
 #define DMA_BATCH_MAX_BYTES 8192
-/* Ring the doorbell only every N submissions (and at the end of a burst);
- * intermediate copies are enqueued without FLUSH. */
+/* The standalone throughput microbenchmark batches doorbells; native ring
+ * copies flush every submission to make bounded shutdown possible. */
 #define DMA_FLUSH_BATCH 32
+
+/* Every native copy is flushed when submitted, so stopping never needs an
+ * extra receive credit merely to flush previously queued DMA operations. */
+static void stop_desc_ring(struct dpa_thread_arg *arg, uint64_t submitted)
+{
+    arg->dma_submitted = submitted;
+    __dpa_thread_window_writeback();
+    arg->stopped = 1;
+    __dpa_thread_window_writeback();
+    doca_dpa_dev_thread_finish();
+}
 
 static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
 {
@@ -154,7 +165,7 @@ static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
     uint32_t ring_size = thread_arg->buf_arr_size;
     uint32_t ring_mask = ring_size - 1;
     uint32_t buf_size = thread_arg->buf_size;
-    uint32_t unflushed = 0;
+    uint64_t submitted = thread_arg->dma_submitted;
 
     DOCA_DPA_DEV_LOG_INFO("Polling descriptor ring with size %u, buf_size: %u\n", ring_size, buf_size);
     
@@ -172,16 +183,8 @@ static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
 
         __dpa_thread_window_read_inv();
 
-        /* Cooperative shutdown: the host set stop=1 while tearing this
-         * connection down. Acknowledge (stopped=1), mark the thread finished
-         * so flexio releases the EU and will not reschedule it, then return.
-         * doca_dpa_dev_thread_finish() (not a bare return) is what makes the
-         * thread quiescent enough for the host's doca_dpa_thread_stop to
-         * succeed - a thread that merely returns stays un-stoppable. */
         if (thread_arg->stop) {
-            thread_arg->stopped = 1;
-            __dpa_thread_window_writeback();
-            doca_dpa_dev_thread_finish();
+            stop_desc_ring(thread_arg, submitted);
             return;
         }
 
@@ -252,6 +255,11 @@ static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
 
             /* if consumer is empty, wait */
             while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, /*consumer_id=*/1) == 1) {
+                __dpa_thread_window_read_inv();
+                if (thread_arg->stop) {
+                    stop_desc_ring(thread_arg, submitted);
+                    return;
+                }
             }
 
             msg.type = COMCH_MSG_TYPE_DMA_COMPLETED;
@@ -259,17 +267,12 @@ static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
             msg.length = batch_len;
             msg.count = batch_cnt;
 
-            /* Batch doorbells: only every DMA_FLUSH_BATCH submissions - or on
-             * the last pending batch of this burst - carries FLUSH. */
+            /* Do not retain unflushed WQEs: when receive credits run out,
+             * a final flush marker would itself need an unavailable credit.
+             * Report coalescing is independent and remains enabled. */
             {
-                uint64_t submit_flags = DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS;
-
-                unflushed++;
-                if (unflushed >= DMA_FLUSH_BATCH ||
-                    consumer_head + batch_cnt >= producer_tail) {
-                    submit_flags |= DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH;
-                    unflushed = 0;
-                }
+                uint64_t submit_flags = DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS |
+                                        DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH;
 
                 doca_dpa_dev_comch_producer_dma_copy(producer,
                                             /*consumer_id=*/1,
@@ -281,6 +284,7 @@ static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
                                             (uint8_t *)&msg,
                                             sizeof(struct comch_dma_comp_msg),
                                             submit_flags);
+                submitted++;
             }
 
             thread_arg->pos += batch_len;
@@ -425,6 +429,7 @@ static void run_dma_copy_bench(struct dpa_thread_arg *a)
                                                  (uint8_t *)&msg,
                                                  sizeof(struct comch_dma_comp_msg),
                                                  flags);
+            a->dma_submitted++;
 
             dst_pos += size;
             if (dst_pos + size > a->buf_size)
@@ -461,6 +466,7 @@ static void run_dma_copy_bench(struct dpa_thread_arg *a)
                                                  (uint8_t *)&msg,
                                                  sizeof(struct comch_dma_comp_msg),
                                                  DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
+            a->dma_submitted++;
             while (doca_dpa_dev_get_completion(a->dpa_producer_comp, &comp) == 0) {
             }
             t1 = __dpa_thread_cycles();

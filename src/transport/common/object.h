@@ -45,6 +45,18 @@ typedef uint64_t doca_dpa_dev_buf_arr_t;
 /* Keep in sync with DPA_THREAD_POOL_SIZE (dpa.h): one DPA thread per connection.
  * This is the per-worker-thread limit; total = num_threads x this. */
 #define DMESH_MAX_CONNECTIONS 32
+#define DMESH_MAX_SESSIONS 64
+
+/* A Comch peer is a channel, independently of its logical data flows. */
+struct dmesh_session {
+    struct doca_comch_connection *connection;
+    bool occupied, negotiated, hello_pending, closing;
+    unsigned sends_pending;
+    uint64_t hello_deadline_ms;
+    uint32_t generation[DMESH_MAX_CONNECTIONS];
+    int32_t close_status[DMESH_MAX_CONNECTIONS];
+    bool closed[DMESH_MAX_CONNECTIONS], close_pending[DMESH_MAX_CONNECTIONS];
+};
 
 /* Per-connection init state, advanced by dmesh_doca_ctrl_advance() */
 enum dmesh_conn_state {
@@ -86,6 +98,12 @@ struct dmesh_conn {
     struct objects *objs;                     /* back pointer to shared state */
     struct doca_comch_connection *connection;
     enum dmesh_conn_state state;
+    struct dmesh_session *session;
+    uint32_t flow_id, generation;
+    bool multiplexed, ready_sent, error_sent, close_requested, quarantined;
+    bool readers_detached; /* proxy acknowledged local staging pointer retirement */
+    int32_t error_status;
+    struct dmesh_export_metadata_msg *pending_metadata;
 
     struct dmesh_doca_dpa_thread *dpa_thread; /* assigned from objs->dpa_pool */
     struct dmesh_doca_dpa_comch *dpa_comch;   /* msgqs bound to dpa_thread */
@@ -108,6 +126,7 @@ struct dmesh_conn {
 
     /* Per-connection DMA engine: own doca_dma ctx (own QP) + task pool +
      * buf inventory, so connections cannot starve each other's copies. */
+    bool dma_closing;              /* terminal admission latch during checked cleanup */
     struct doca_dma *dma_ctx;
     struct doca_buf_inventory *buf_inv;
     struct dma_task_entry *dma_task_entries;
@@ -191,6 +210,9 @@ struct objects {
      * server leaves the channel service object alive on the device, and the
      * next process then fails to create one (devx syndrome 0x64b4). */
     bool is_server;
+    /* Set by integrations that hand staging pointers to independent readers.
+     * Such integrations must acknowledge detachment before flow teardown. */
+    bool external_readers;
     /* Host side: set from the comch client ctx state-changed callback when the
      * DPU drops the connection (RUNNING -> STOPPING/IDLE). dmesh_chan_read /
      * write turn it into -1 (EOF) so the Go net.Conn - and gRPC's transport
@@ -198,6 +220,10 @@ struct objects {
      * forever on "no data yet" while its subconn stays READY. */
     int peer_gone;
     struct doca_comch_connection *connection;
+
+    /* Host channel callback, serialized by the session owner. */
+    void (*control_message_cb)(struct objects *, const uint8_t *, size_t);
+    void *control_message_data;
 
     /* DMesh application recv/send buffers */
     struct dmesh_buffer sndbuf;
@@ -276,6 +302,7 @@ struct objects {
 
     /* DPU multi-connection slots (see struct dmesh_conn) */
     struct dmesh_conn conns[DMESH_MAX_CONNECTIONS];
+    struct dmesh_session sessions[DMESH_MAX_SESSIONS];
 };
 
 void
@@ -289,6 +316,16 @@ dmesh_conn_open(struct objects *objs, struct doca_comch_connection *connection);
 /* Find the slot bound to a connection; NULL if none */
 struct dmesh_conn *
 dmesh_conn_get(struct objects *objs, struct doca_comch_connection *connection);
+
+struct dmesh_conn *dmesh_flow_get(struct objects *, struct doca_comch_connection *, uint32_t, uint32_t);
+struct dmesh_conn *dmesh_flow_open(struct objects *, struct doca_comch_connection *, uint32_t, uint32_t);
+
+void dmesh_flow_close_session(struct objects *, struct doca_comch_connection *);
+
+/* Call on the control owner thread after all external staging readers/writers
+ * for a CLOSING slot have detached under their own synchronization. */
+doca_error_t dmesh_flow_readers_detached(struct objects *, int slot);
+bool dmesh_objects_have_live_flows(const struct objects *);
 
 /* Unbind a connection's slot (DOCA resources are NOT torn down yet - TODO) */
 void

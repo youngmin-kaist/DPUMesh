@@ -10,6 +10,7 @@
 #include <time.h>
 #include <unistd.h>
 void test_native_hold_acks(int);
+void test_native_fail_close(int);
 
 static dmesh_event_t receive(dmesh_eq_t *eq, dmesh_event_type_t type) {
     dmesh_event_t ev;
@@ -70,5 +71,14 @@ int main(void) {
     assert(dmesh_destroy_qp(cq) == 0);
     assert(dmesh_destroy_eq(ce) == 0); assert(dmesh_destroy_eq(se) == 0);
     assert(dmesh_destroy_channel(client) == 0); assert(dmesh_destroy_channel(server) == 0);
+    /* A failed channel transport shutdown must not free the public handle.
+     * Retry uses the same context after the transport can quiesce again. */
+    dmesh_channel_t *retry = dmesh_create_channel(); assert(retry);
+    dpumesh_ctx_t *saved_ctx = retry->ctx;
+    test_native_fail_close(1);
+    assert(dmesh_destroy_channel(retry) == -1 && errno == EIO);
+    assert(retry->ctx == saved_ctx);
+    test_native_fail_close(0);
+    assert(dmesh_destroy_channel(retry) == 0);
     puts("native_core_transport_test: PASS");
 }

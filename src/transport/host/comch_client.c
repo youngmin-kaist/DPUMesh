@@ -2,6 +2,8 @@
 
 #include <time.h>
 #include <assert.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include <doca_comch.h>
 #include <doca_ctx.h>
@@ -31,13 +33,12 @@ static void client_send_task_completion_callback(struct doca_comch_task_send *ta
 {
 	struct objects *objs;
 
-	(void)task_user_data;
-
 	objs = (struct objects *)(ctx_user_data.ptr);
 	(void)objs;
 
 	DOCA_LOG_INFO("Client task sent successfully");
 	doca_task_free(doca_comch_task_send_as_task(task));
+	free(task_user_data.ptr);
 }
 
 /**
@@ -53,9 +54,8 @@ static void client_send_task_completion_err_callback(struct doca_comch_task_send
 {
 	struct objects *objs;
 
-	(void)task_user_data;
-
 	objs = (struct objects *)(ctx_user_data.ptr);
+	objs->peer_gone = 1;
 	{
 		doca_error_t st = doca_task_get_status(doca_comch_task_send_as_task(task));
 
@@ -66,6 +66,7 @@ static void client_send_task_completion_err_callback(struct doca_comch_task_send
 			      doca_error_get_name(st));
 	}
 	doca_task_free(doca_comch_task_send_as_task(task));
+	free(task_user_data.ptr);
 	(void)doca_ctx_stop(doca_comch_client_as_ctx(objs->cc_client));
 }
 
@@ -126,6 +127,11 @@ static void client_message_recv_callback(struct doca_comch_event_msg_recv *event
 	}
 
 	objs = (struct objects *)user_data.ptr;
+	if (objs->control_message_cb != NULL) {
+		objs->control_message_cb(objs, recv_buffer, msg_len);
+		return;
+	}
+	if (msg_len < sizeof(comch_msg->type)) return;
 
 	comch_msg = (struct dmesh_comch_msg *)recv_buffer;
 	switch (comch_msg->type)
@@ -169,25 +175,23 @@ doca_error_t client_send_msg(struct objects *objs, const char *msg, size_t len)
 {
 	doca_error_t result;
 	struct doca_comch_task_send *task;
-
+	union doca_data data;
+	if (msg == NULL || len == 0) return DOCA_ERROR_INVALID_VALUE;
+	/* DOCA retains the send source until task completion. Callers may pass a
+	 * stack frame or release an export message immediately after this call. */
+	data.ptr = malloc(len);
+	if (data.ptr == NULL) return DOCA_ERROR_NO_MEMORY;
+	memcpy(data.ptr, msg, len);
 	result = doca_comch_client_task_send_alloc_init(objs->cc_client,
-							objs->connection,
-							(void *)msg,
-							len,
-							&task);
-	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to allocate client task with error = %s", doca_error_get_name(result));
-		return result;
-	}
-
+		objs->connection, data.ptr, len, &task);
+	if (result != DOCA_SUCCESS) { free(data.ptr); return result; }
+	doca_task_set_user_data(doca_comch_task_send_as_task(task), data);
 	result = doca_task_submit(doca_comch_task_send_as_task(task));
 	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to send client task with error = %s", doca_error_get_name(result));
 		doca_task_free(doca_comch_task_send_as_task(task));
-		return result;
+		free(data.ptr);
 	}
-
-	return DOCA_SUCCESS;
+	return result;
 }
 
 doca_error_t init_comch_ctrl_path_client(const char *server_name,
@@ -296,11 +300,18 @@ doca_error_t init_comch_ctrl_path_client(const char *server_name,
 		goto destroy_client;
 	}
 
+	struct timespec start, now;
+	clock_gettime(CLOCK_MONOTONIC, &start);
 	(void)doca_ctx_get_state(ctx, &state);
 	while (state != DOCA_CTX_STATE_RUNNING) {
 		(void)doca_pe_progress(objs->pe);
 		nanosleep(&ts, &ts);
 		(void)doca_ctx_get_state(ctx, &state);
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		if (objs->peer_gone || now.tv_sec - start.tv_sec >= 5) {
+			result = objs->peer_gone ? DOCA_ERROR_CONNECTION_ABORTED : DOCA_ERROR_TIME_OUT;
+			goto destroy_client;
+		}
 	}
 
 	(void)doca_comch_client_get_connection(objs->cc_client, &objs->connection);
@@ -310,6 +321,15 @@ doca_error_t init_comch_ctrl_path_client(const char *server_name,
     return DOCA_SUCCESS;
 
 destroy_client:
+    (void)doca_ctx_stop(doca_comch_client_as_ctx(objs->cc_client));
+    for (int i = 0; i < 100000; ++i) {
+        if (doca_ctx_get_state(doca_comch_client_as_ctx(objs->cc_client), &state) != DOCA_SUCCESS ||
+            state == DOCA_CTX_STATE_IDLE) break;
+        (void)doca_pe_progress(objs->pe);
+    }
+    /* A still-running context must retain its callback objects and PE. */
+    if (doca_ctx_get_state(doca_comch_client_as_ctx(objs->cc_client), &state) != DOCA_SUCCESS ||
+        state != DOCA_CTX_STATE_IDLE) return result;
     doca_comch_client_destroy(objs->cc_client);
     objs->cc_client = NULL;    
 destroy_pe:

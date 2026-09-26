@@ -27,8 +27,8 @@
  *   DMESH_BUSY_POLL      1 = poll the progress engines, 0 = sleep in epoll (0)
  *   DMESH_BENCH_EXIT_OPS exit after this many forward completions (0 = never)
  *
- * Restart the process per benchmark run: tearing a live slot down is not
- * clean in any DPU-side process (see CLAUDE.md), so the end is _exit().
+ * Restart the process per benchmark run: process-wide benchmark shutdown
+ * still uses _exit(), while individual connections use checked teardown.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -56,6 +56,7 @@ int32_t dmesh_doca_data_arm(struct objects *objs);
 int32_t dmesh_doca_data_clear_and_drain(struct objects *objs, int fd, int budget, int *out_drained);
 int32_t dmesh_doca_max_conns(void);
 int32_t dmesh_doca_conn_state_get(struct objects *objs, int32_t slot);
+int32_t dmesh_doca_conn_readers_detached(struct objects *objs, int32_t slot);
 int32_t dmesh_doca_conn_mode_get(struct objects *objs, int32_t slot);
 int32_t dmesh_doca_conn_staging_base(struct objects *objs, int32_t slot, const uint8_t **out_base,
                                      size_t *out_len);
@@ -253,6 +254,16 @@ static int slots_poll(struct objects *objs, struct slot *slots, int max_conns, i
                 memset(s, 0, sizeof(*s));
             }
             s->state = st;
+        }
+        if (st == CONN_CLOSING) {
+            /* This thread owns every staging pointer and progresses both
+             * PEs only in driver_tick(). The transition above discarded all
+             * cached pointers and unpublished work before this ACK allows
+             * the next tick to release the connection's mapped buffers. */
+            int32_t rv = dmesh_doca_conn_readers_detached(objs, i);
+            if (rv != DOCA_SUCCESS)
+                fprintf(stderr, "slot %d: reader detach failed (%d), retrying\n", i, rv);
+            continue;
         }
         if (st != CONN_RUNNING) continue;
         slot_wire(objs, i, s);

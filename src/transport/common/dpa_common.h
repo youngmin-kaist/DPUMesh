@@ -30,11 +30,9 @@ struct dpa_thread_arg {
 	uint32_t bench_msg_size;    /* bytes per copy (max 8192 on this platform) */
 	uint32_t bench_num_ops;     /* copies per run */
 
-	/* Cooperative shutdown: the host sets stop=1 (h2d_memcpy) when tearing the
-	 * connection down; the kernel's poll loop observes it, writes stopped=1
-	 * back (window writeback) and returns WITHOUT rescheduling, so the DPA
-	 * thread goes idle and doca_dpa_thread_stop can quiesce it cleanly. A
-	 * hot-looping (never-rescheduling) thread cannot be stopped by flexio. */
+	/* Cooperative shutdown stops admission in the kernel and finishes the
+	 * polling thread. CPU cleanup must also compare dma_submitted with the
+	 * received DMA completion count before freeing any mapping. */
 	volatile uint32_t stop;     /* host -> DPA: leave the poll loop */
 	volatile uint32_t stopped;  /* DPA -> host: poll loop has exited */
 
@@ -51,6 +49,10 @@ struct dpa_thread_arg {
 	 * with doca_dpa_dev_device_set() before touching that device's objects
 	 * (the official extended-context flow). 0 = base context, no switch. */
 	uint64_t dpa_dev;
+
+	/* Published before stopped: number of copies requiring CPU DMA-completed
+	 * messages. Kernel exit alone does not retire producer DMA operations. */
+	volatile uint64_t dma_submitted;
 
 } __attribute__((__packed__, aligned(8)));
 
