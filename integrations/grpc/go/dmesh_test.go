@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -49,7 +50,7 @@ func TestReadDeadlineAndCloseWakeWaiters(t *testing.T) {
 			go func() { _, err := c.Read(make([]byte, 1)); done <- err }()
 			c.t.mu.Lock()
 			c.eof = true
-			c.t.notify()
+			c.notify()
 			c.t.mu.Unlock()
 			awaitError(t, done, io.EOF)
 		}
@@ -75,5 +76,81 @@ func TestWriteDeadlineAndListenerCancellation(t *testing.T) {
 	cancel()
 	if conn, err := DialContext(ctx, "invalid", -1); conn != nil || !errors.Is(err, context.Canceled) {
 		t.Fatalf("%v, %v", conn, err)
+	}
+}
+
+// A successful Write can leave a buffered native tail while the application is
+// computing rather than parked in Read. Shared Comch failures also need progress
+// during that interval. Exercise the production scheduler without a DOCA device.
+func TestLiveConnectionProgressWithoutWaiters(t *testing.T) {
+	tr := newTransport()
+	tr.conns[nil] = newConn(tr, nil, nil, nil)
+	progressed := make(chan struct{}, 4)
+	go tr.runPoll(-1, func() (int, int64) {
+		if tr.mu.TryLock() {
+			tr.mu.Unlock()
+			t.Error("native progress was not serialized")
+		}
+		select {
+		case progressed <- struct{}{}:
+		default:
+		}
+		return 0, -1
+	})
+	defer func() { close(tr.stop); <-tr.done }()
+	for i := 0; i < 3; i++ {
+		select {
+		case <-progressed:
+		case <-time.After(time.Second):
+			t.Fatal("live connection stopped progressing without parked readers/writers")
+		}
+	}
+}
+
+func TestIdlePollerWakesForNewConnection(t *testing.T) {
+	tr := newTransport()
+	progressed := make(chan struct{}, 1)
+	go tr.runPoll(-1, func() (int, int64) {
+		progressed <- struct{}{}
+		return -1, -1
+	})
+	select {
+	case <-progressed:
+		t.Fatal("empty transport unexpectedly polled")
+	case <-time.After(20 * time.Millisecond):
+	}
+	tr.mu.Lock()
+	tr.conns[nil] = newConn(tr, nil, nil, nil)
+	tr.wakePoller()
+	tr.mu.Unlock()
+	select {
+	case <-progressed:
+	case <-time.After(time.Second):
+		close(tr.stop)
+		t.Fatal("new connection did not wake the idle poller")
+	}
+	<-tr.done
+}
+
+func TestCloseTransportBusyKeepsConnectionUsable(t *testing.T) {
+	tr := newTransport()
+	conn := newConn(tr, nil, nil, nil)
+	tr.conns[nil] = conn
+	process.Lock()
+	if process.t != nil {
+		process.Unlock()
+		t.Fatal("another test left a process transport")
+	}
+	process.t = tr
+	process.Unlock()
+	defer func() { process.Lock(); process.t = nil; process.Unlock() }()
+	if err := CloseTransport(); !errors.Is(err, syscall.EBUSY) {
+		t.Fatalf("CloseTransport() = %v, want EBUSY", err)
+	}
+	if tr.err != nil || conn.closed {
+		t.Fatal("busy close invalidated the active connection")
+	}
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		t.Fatalf("connection after busy close: %v", err)
 	}
 }

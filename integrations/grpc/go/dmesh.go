@@ -84,7 +84,7 @@ type transport struct {
 	done     chan struct{}
 	err      error
 	parked   int           // goroutines waiting on an edge (under mu)
-	parkedCh chan struct{} // signalled when parked goes 0 -> 1
+	parkedCh chan struct{} // wakes an idle poller for a connection or waiter
 }
 
 // park registers the caller as a waiter so the sleeper polls on its behalf,
@@ -93,10 +93,7 @@ type transport struct {
 func (t *transport) park(ch <-chan struct{}, deadline time.Time) {
 	t.parked++
 	if t.parked == 1 {
-		select {
-		case t.parkedCh <- struct{}{}:
-		default:
-		}
+		t.wakePoller()
 	}
 	t.mu.Unlock()
 	_ = waitChange(ch, deadline)
@@ -117,24 +114,51 @@ var process struct {
 }
 
 func (t *transport) notify() { close(t.changed); t.changed = make(chan struct{}) }
+
+func newTransport() *transport {
+	return &transport{conns: make(map[*C.dmesh_qp_t]*Conn), changed: make(chan struct{}),
+		stop: make(chan struct{}), done: make(chan struct{}), parkedCh: make(chan struct{}, 1)}
+}
+
+func (t *transport) wakePoller() {
+	select {
+	case t.parkedCh <- struct{}{}:
+	default:
+	}
+}
 func openTransport() (*transport, error) {
 	process.Lock()
 	defer process.Unlock()
 	if process.t != nil {
 		return process.t, nil
 	}
+	t := newTransport()
+	t.events = C.dmesh_go_events_alloc()
+	if t.events == nil {
+		return nil, fmt.Errorf("dmesh: allocate EQ events: %w", syscall.ENOMEM)
+	}
 	ch, err := C.dmesh_create_channel()
 	if ch == nil {
+		C.free(unsafe.Pointer(t.events))
 		return nil, fmt.Errorf("dmesh: create channel: %w", err)
 	}
+	t.ch = ch
 	eq, err := C.dmesh_create_eq(ch)
 	if eq == nil {
-		C.dmesh_destroy_channel(ch)
-		return nil, fmt.Errorf("dmesh: create EQ: %w", err)
+		createErr := fmt.Errorf("dmesh: create EQ: %w", err)
+		if rc, closeErr := C.dmesh_destroy_channel(ch); rc != 0 {
+			// Shared Comch/DMA cleanup can fail without releasing its resources.
+			// Preserve the channel so CloseTransport can retry the cleanup.
+			t.err = errors.Join(createErr, fmt.Errorf("dmesh: close channel: %w", closeErr))
+			close(t.stop)
+			close(t.done)
+			process.t = t
+			return nil, t.err
+		}
+		C.free(unsafe.Pointer(t.events))
+		return nil, createErr
 	}
-	t := &transport{ch: ch, eq: eq, events: C.dmesh_go_events_alloc(), conns: make(map[*C.dmesh_qp_t]*Conn),
-		changed: make(chan struct{}), stop: make(chan struct{}), done: make(chan struct{}),
-		parkedCh: make(chan struct{}, 1)}
+	t.eq = eq
 	process.t = t
 	go t.poll()
 	return t, nil
@@ -212,15 +236,25 @@ func (t *transport) pollLocked() int {
 	return int(count)
 }
 
-// poll is the background sleeper. The data path polls in line from Read and
-// Write, so this goroutine only works while some goroutine is parked on an
-// edge (a reader with nothing to read, a writer out of credit, an Accept):
-// it then blocks on the EQ fd and runs one batch per wake. With nobody
-// parked it stays off the EQ, which keeps it from contending with the active
-// goroutines during the library's spin window.
+// poll advances the shared Comch session and buffered TX while any connection
+// exists, even when no Read/Write is parked. An idle channel sleeps until a
+// connection or waiter appears; active channels wait at most 1 ms between polls.
 func (t *transport) poll() {
+	fd := int(C.dmesh_eq_fd(t.eq))
+	t.runPoll(fd, func() (int, int64) {
+		count := t.pollLocked()
+		if count < 0 {
+			return count, -1
+		}
+		return count, int64(C.dmesh_eq_next_deadline_ns(t.eq))
+	})
+}
+
+// progress is called with t.mu held, like inline Read/Write polling. Keeping the
+// scheduler separate also lets tests exercise idle and active progress without
+// registering a hardware channel.
+func (t *transport) runPoll(fd int, progress func() (int, int64)) {
 	defer close(t.done)
-	fd := C.dmesh_eq_fd(t.eq)
 	for {
 		select {
 		case <-t.stop:
@@ -228,7 +262,7 @@ func (t *transport) poll() {
 		default:
 		}
 		t.mu.Lock()
-		if t.parked == 0 {
+		if t.parked == 0 && len(t.conns) == 0 {
 			t.mu.Unlock()
 			select {
 			case <-t.parkedCh:
@@ -237,11 +271,7 @@ func (t *transport) poll() {
 			}
 			continue
 		}
-		count := t.pollLocked()
-		var deadline C.int64_t = -1
-		if count >= 0 {
-			deadline = C.dmesh_eq_next_deadline_ns(t.eq)
-		}
+		count, deadline := progress()
 		t.mu.Unlock()
 		if count < 0 {
 			return
@@ -249,7 +279,7 @@ func (t *transport) poll() {
 		if count == C.DMESH_GO_EVENTS {
 			continue
 		}
-		C.dmesh_go_wait_fd(fd, deadline)
+		C.dmesh_go_wait_fd(C.int(fd), C.int64_t(deadline))
 	}
 }
 
@@ -466,6 +496,7 @@ func (c *Conn) closeLocked(abort bool) error {
 	} else {
 		rc, err = C.dmesh_destroy_qp(c.qp)
 	}
+	// ABI5 consumes the QP even on error; only channel teardown is retryable.
 	c.qp = nil
 	c.t.notify()
 	if rc != 0 {
@@ -564,6 +595,7 @@ func Dial(server, srcIP string, srcPort int, dstIP string, dstPort int, workload
 	c := newConn(t, qp, &net.TCPAddr{IP: net.ParseIP(envOr("DPUMESH_POD_IP", srcIP)), Port: int(qp.local_port)},
 		&net.TCPAddr{IP: net.ParseIP(dstIP), Port: dstPort})
 	t.conns[qp] = c
+	t.wakePoller()
 	return c, nil
 }
 
@@ -631,12 +663,13 @@ func (l *Listener) Close() error {
 	}
 	l.closed = true
 	l.t.listener = nil
+	var closeErr error
 	for _, c := range l.pending {
-		c.closeLocked(true)
+		closeErr = errors.Join(closeErr, c.closeLocked(true))
 	}
 	l.pending = nil
 	l.t.notify()
-	return nil
+	return closeErr
 }
 func (l *Listener) Addr() net.Addr { return l.addr }
 
